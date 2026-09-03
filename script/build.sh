@@ -21,6 +21,7 @@ BUILD_HCOM_WITH_RDMA=${9:-ON}
 BUILD_HCOM_WITH_UB=${10:-OFF}
 BUILD_ETCD_BACKEND=${11:-OFF}
 BUILD_TOOL=${12:-cmake}
+HCOM_LOCAL_PATH=${13:-}
 # 导出环境变量用于后续构建whl包
 export MF_BUILD_HCOM=${8:-OFF}
 export MF_BUILD_HCOM_WITH_RDMA=${9:-ON}
@@ -157,6 +158,10 @@ if [ "${BUILD_TOOL}" == "cmake" ]; then
         export MAKE_CMD=make
     fi
     mkdir build/
+    EXTRA_CMAKE_ARGS=()
+    if [ -n "${HCOM_LOCAL_PATH}" ] && [ "${BUILD_HCOM}" == "ON" ]; then
+        EXTRA_CMAKE_ARGS+=(-DFETCHCONTENT_SOURCE_DIR_HCOM="${HCOM_LOCAL_PATH}")
+    fi
     cmake \
         -G "$GENERATOR"  \
         -DCMAKE_BUILD_TYPE="${BUILD_MODE}" \
@@ -170,10 +175,14 @@ if [ "${BUILD_TOOL}" == "cmake" ]; then
         -DBUILD_WITH_RDMA="${BUILD_HCOM_WITH_RDMA}" \
         -DBUILD_WITH_UB="${BUILD_HCOM_WITH_UB}" \
         -DBUILD_ETCD_BACKEND="${BUILD_ETCD_BACKEND}" \
+        "${EXTRA_CMAKE_ARGS[@]}" \
         -S . \
         -B build/
     ${MAKE_CMD} install -j"${MF_BUILD_JOBS}" -C build/
 else
+    if [ -n "${HCOM_LOCAL_PATH}" ]; then
+        echo "Warning: --hcom_local_path is only supported with cmake build tool, ignored for bazel"
+    fi
     BAZEL_ARGS=()
 
     if [ "${BUILD_MODE}" == "DEBUG" ]; then
