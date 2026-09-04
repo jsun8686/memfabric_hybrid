@@ -124,6 +124,9 @@ check_contains_path()
 cd ${ROOT_PATH}/..
 PROJ_DIR=$(pwd)
 LIBBOUNDSCHECK_INSTALL_PATH="${PROJ_DIR}/build/_deps/hcom-src/dist/hcom_3rdparty/libboundscheck/lib/"
+if [ "${BUILD_HCOM}" == "ON" ] && [ -n "${HCOM_LOCAL_PATH}" ]; then
+    LIBBOUNDSCHECK_INSTALL_PATH="${HCOM_LOCAL_PATH}/dist/hcom_3rdparty/libboundscheck/lib/"
+fi
 
 if [ "${BUILD_PYTHON}" == "ON" ]; then
     readonly BACK_PATH_EVN=$PATH
