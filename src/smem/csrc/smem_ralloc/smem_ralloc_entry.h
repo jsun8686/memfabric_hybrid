@@ -20,6 +20,7 @@
 
 #include <atomic>
 #include <map>
+#include <vector>
 
 namespace ock {
 namespace smem {
@@ -72,6 +73,9 @@ public:
 
     /* slot base address of one rank, null if invalid */
     void *GetMemPtrByRank(uint32_t rank);
+
+    /* snapshot of the ranks currently in the dynamic group, includes self, empty if not joined */
+    std::vector<uint32_t> GetGroupRanks();
 
     smem_ralloc_role_t GetRole() const;
 

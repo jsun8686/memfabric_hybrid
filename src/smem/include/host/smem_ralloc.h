@@ -157,7 +157,27 @@ uint64_t smem_ralloc_get_mem_size_by_rank(smem_ralloc_t handle, uint32_t rank);
 void *smem_ralloc_get_mem_ptr_by_rank(smem_ralloc_t handle, uint32_t rank);
 
 /**
- * @brief Set event handler for group member change, join or leave
+ * @brief Get the ranks currently in the pool's dynamic group, which is a snapshot taken at the
+ * moment of the call and includes the local rank itself. The event stream is single-slot and can
+ * not be replayed, so members joined before the handler registration are only discoverable by
+ * this interface, use <i>smem_ralloc_set_group_event_handler</i> to track the increments after
+ * registration. The caller is expected to size the buffer to the world size known from init.
+ * Pair with <i>smem_ralloc_get_mem_size_by_rank</i>: a member rank with size 0 means it is in
+ * the group but has no committed block.
+ *
+ * @param handle           [in] ralloc object handle created by <i>smem_ralloc_create</i>
+ * @param rankIds          [in] buffer for rank ids, null with maxCount 0 makes a count-only call
+ * @param maxCount         [in] buffer capacity in element, world size is always enough
+ * @return actual member count, only min(count, maxCount) entries are written and ret > maxCount
+ *         means the buffer is too small, UINT32_MAX if failed
+ */
+uint32_t smem_ralloc_get_group_ranks(smem_ralloc_t handle, uint32_t *rankIds, uint32_t maxCount);
+
+/**
+ * @brief Set event handler for group member change, join or leave.
+ * Events fired after registration only: the underlying event stream is single-slot and can not
+ * be replayed, members joined before the registration (including the ones joined before the
+ * local rank) are not reported, query them by <i>smem_ralloc_get_group_ranks</i> instead.
  *
  * @param handle           [in] ralloc object handle created by <i>smem_ralloc_create</i>
  * @param cb               [in] callback function

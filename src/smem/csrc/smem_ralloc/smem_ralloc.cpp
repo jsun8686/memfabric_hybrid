@@ -435,6 +435,28 @@ SMEM_API void *smem_ralloc_get_mem_ptr_by_rank(smem_ralloc_t handle, uint32_t ra
     return entry->GetMemPtrByRank(rank);
 }
 
+SMEM_API uint32_t smem_ralloc_get_group_ranks(smem_ralloc_t handle, uint32_t *rankIds, uint32_t maxCount)
+{
+    SM_VALIDATE_RETURN(handle != nullptr, "invalid param, handle is NULL", UINT32_MAX);
+    SM_VALIDATE_RETURN(g_smemRallocInited, "smem ralloc not initialized yet", UINT32_MAX);
+    SM_VALIDATE_RETURN(rankIds != nullptr || maxCount == 0U, "invalid param, rankIds is NULL", UINT32_MAX);
+
+    SmemRallocEntryPtr entry = nullptr;
+    auto ret = SmemRallocEntryManager::Instance().GetEntryByPtr(reinterpret_cast<uintptr_t>(handle), entry);
+    if (ret != SM_OK || entry == nullptr) {
+        SM_LOG_AND_SET_LAST_ERROR("input handle is invalid, result: " << ret);
+        return UINT32_MAX;
+    }
+
+    auto ranks = entry->GetGroupRanks();
+    auto count = static_cast<uint32_t>(ranks.size());
+    if (rankIds != nullptr && count > 0U) {
+        auto copyCount = count < maxCount ? count : maxCount;
+        std::copy(ranks.begin(), ranks.begin() + copyCount, rankIds);
+    }
+    return count;
+}
+
 SMEM_API int32_t smem_ralloc_set_group_event_handler(smem_ralloc_t handle, smem_ralloc_group_event_cb cb,
                                                      void *context)
 {

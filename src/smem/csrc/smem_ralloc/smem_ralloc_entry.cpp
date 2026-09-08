@@ -556,6 +556,16 @@ void *SmemRallocEntry::GetMemPtrByRank(uint32_t rank)
     return static_cast<char *>(hostGva_) + static_cast<uint64_t>(rank) * coreOptions_.maxDRAMSize;
 }
 
+std::vector<uint32_t> SmemRallocEntry::GetGroupRanks()
+{
+    std::vector<uint32_t> ranks;
+    if (!inited_ || globalGroup_ == nullptr) {
+        return ranks;
+    }
+    globalGroup_->GetMemberRanks(ranks);
+    return ranks;
+}
+
 Result SmemRallocEntry::DataCopy(const void *src, void *dest, uint64_t size, uint32_t flags)
 {
     SM_VALIDATE_RETURN(src != nullptr, "invalid param, src is NULL", SM_INVALID_PARAM);
