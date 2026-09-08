@@ -56,18 +56,20 @@ SmemRallocEntryManager::~SmemRallocEntryManager()
 Result SmemRallocEntryManager::Initialize(const std::string &storeURL, uint32_t worldSize, uint16_t deviceId,
                                           const smem_ralloc_config_t &config)
 {
-    std::lock_guard<std::mutex> guard(entryMutex_);
-    if (inited_) {
-        SM_LOG_WARN("smem ralloc manager has already initialized");
-        return SM_OK;
+    {
+        std::lock_guard<std::mutex> guard(entryMutex_);
+        if (inited_) {
+            SM_LOG_WARN("smem ralloc manager has already initialized");
+            return SM_OK;
+        }
+
+        SM_VALIDATE_RETURN(worldSize != 0, "invalid param, worldSize is 0", SM_INVALID_PARAM);
+
+        storeURL_ = storeURL;
+        worldSize_ = worldSize;
+        deviceId_ = deviceId;
+        config_ = config;
     }
-
-    SM_VALIDATE_RETURN(worldSize != 0, "invalid param, worldSize is 0", SM_INVALID_PARAM);
-
-    storeURL_ = storeURL;
-    worldSize_ = worldSize;
-    deviceId_ = deviceId;
-    config_ = config;
 
     auto ret = PrepareStore();
     SM_LOG_ERROR_RETURN_IT_IF_NOT_OK(ret, "prepare store failed: " << ret);
@@ -80,7 +82,14 @@ Result SmemRallocEntryManager::Initialize(const std::string &storeURL, uint32_t 
     ret = StartControlPlane();
     SM_LOG_ERROR_RETURN_IT_IF_NOT_OK(ret, "start control plane failed: " << ret);
 
-    inited_ = true;
+    if (config_.role == SMEM_RALLOC_ROLE_FAR && !isStoreServer_) {
+        (void)ReportCommittedBytes(SMEMRA_CANDIDATE_REGISTER_RETRY);
+    }
+
+    {
+        std::lock_guard<std::mutex> guard(entryMutex_);
+        inited_ = true;
+    }
     SM_LOG_INFO("initialize store(" << storeURL << ") world size(" << worldSize << ") device(" << deviceId
                                     << ") rank(" << config_.rankId << ") OK.");
     return SM_OK;
@@ -331,7 +340,7 @@ Result SmemRallocEntryManager::StartControlPlane()
         masterWatchId_ = UINT32_MAX;
     }
 
-    ReportCommittedBytes(SMEMRA_CANDIDATE_REGISTER_RETRY); /* initial register with retries */
+
     return SM_OK;
 }
 
