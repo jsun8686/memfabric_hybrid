@@ -79,7 +79,7 @@ def _run_near(head_node_ip: str) -> None:
         except KeyboardInterrupt:
             print("[near] interrupted, destroying pool", flush=True)
 
-        assert handle.destroy() == 0, "destroy pool"
+        handle.destroy()  # C API returns void; failures surface via logs/events, not a return code
         assert mf.get_last_err_msg() == "", mf.get_last_err_msg()
     finally:
         if ralloc_inited:

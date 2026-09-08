@@ -53,7 +53,7 @@ struct SmemRallocRpcMsg {
     uint32_t dataOpType;   /* smem_ralloc_data_op_type bits */
     uint32_t flags;
     uint32_t memType;      /* smem_ralloc_mem_type of the requested block, HOST only in current phase */
-    uint32_t result;       /* [resp] SM_* result code */
+    int32_t result;        /* [resp] SM_* result code, signed: SM_* codes are negative */
     uint32_t nodeRank;     /* [resp][register] endpoint rank */
     uint32_t nodePort;     /* [resp][register] endpoint port */
     uint32_t reserved1;
