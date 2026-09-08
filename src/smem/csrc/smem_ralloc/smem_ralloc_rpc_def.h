@@ -24,7 +24,7 @@ namespace smem {
  * fields marked [register] are meaningful in SMEMRA_RPC_OP_REGISTER request only. */
 constexpr uint16_t SMEMRA_RPC_MAGIC = 0x524AU;      /* 'R','A' */
 constexpr uint16_t SMEMRA_RPC_MSG_VERSION = 1U;
-constexpr int16_t SMEMRA_RPC_MSG_TYPE = 0x5241;     /* msgType registered on acc_tcp */
+constexpr int16_t SMEMRA_RPC_MSG_TYPE = 1; /* acc_tcp route tag, valid range [MIN_MSG_TYPE, MAX_MSG_TYPE) = [0,48), 0 is taken by the tcp store */
 constexpr uint32_t SMEMRA_RPC_MASTER_KEY_MAX_LEN = 46U;
 
 enum SmemRallocRpcOp : uint16_t {
