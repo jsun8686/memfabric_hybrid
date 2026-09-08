@@ -51,6 +51,7 @@ typedef void *hybm_mem_slice_t;
 #define BM_UNDER_API_UNLOAD                 (-8)
 #define BM_NOT_INITIALIZED                  (-9)
 #define BM_NOT_SUPPORT_FUNC                 (-10)
+#define BM_BUFFER_TOO_SMALL                 (-11)
 #define BM_NOT_SUPPORTED                    (-100)
 #define BM_NOT_CONNECTED                    (-101)
 
@@ -104,6 +105,14 @@ typedef struct {
     uint8_t desc[1024L];
     uint32_t descLen;
 } hybm_exchange_info;
+
+typedef struct {
+    uint64_t gva;            /* global virtual address of the allocated range */
+    uint64_t size;           /* size in byte of the allocated range */
+    hybm_mem_type memType;   /* memory type of the allocated range */
+    uint32_t ownerRank;      /* rank which contributes the memory of the range */
+} hybm_va_range;
+typedef hybm_va_range hybm_va_range_t;
 
 typedef struct {
     bool tlsEnable;

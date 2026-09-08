@@ -1445,6 +1445,19 @@ Result SmemNetGroupEngine::GroupLeave()
     return (ret | ret2) == SM_OK ? SM_OK : SM_ERROR;
 }
 
+void SmemNetGroupEngine::GetMemberRanks(std::vector<uint32_t> &rankIds) const
+{
+    rankIds.clear();
+    std::shared_lock<std::shared_mutex> lock{groupInfoMutex_};
+    for (uint32_t rk = 0; rk < MAX_RANK_COUNT; rk++) {
+        auto index = rk / BITS_COUNT_IN_U64;
+        auto shift = rk % BITS_COUNT_IN_U64;
+        if ((groupInfo_.joinedRanksBitmap[index] & (1UL << shift)) != 0UL) {
+            rankIds.push_back(rk);
+        }
+    }
+}
+
 void SmemNetGroupEngine::GetAllRanksFromBitMap(std::vector<uint32_t> &rankIds)
 {
     rankIds.clear();

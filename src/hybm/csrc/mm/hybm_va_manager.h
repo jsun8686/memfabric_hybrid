@@ -174,6 +174,9 @@ public:
     uint64_t TransformVa(uint64_t va, uint32_t inputType, uint32_t outputType);
     std::pair<AllocatedGvaInfo, bool> FindAllocByVa(uint64_t va, uint32_t type = HVM_GVA) const;
 
+    // Collects all allocated ranges within [gvaBegin, gvaEnd) of the GVA space, sorted by gva ascending.
+    std::vector<AllocatedGvaInfo> QueryAllocRanges(uint64_t gvaBegin, uint64_t gvaEnd) const;
+
     hybm_mem_type GetGvaMemType(uint64_t gva); // Supports both LVA and GVA
     std::pair<uint32_t, bool> GetRank(uint64_t gva);
     // Checks if 'va' is within any AllocatedGvaInfo range (either LVA or GVA).

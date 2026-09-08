@@ -18,6 +18,7 @@
 #include <atomic>
 #include <list>
 #include <queue>
+#include <vector>
 #include "smem.h"
 #include "smem_common_includes.h"
 #include "smem_config_store.h"
@@ -147,6 +148,9 @@ public:
     uint32_t GetLocalRank() const;
 
     uint32_t GetRankSize() const;
+
+    /* snapshot of the ranks currently in the group according to the member bitmap */
+    void GetMemberRanks(std::vector<uint32_t> &rankIds) const;
 
     void GroupSnClean();
 
