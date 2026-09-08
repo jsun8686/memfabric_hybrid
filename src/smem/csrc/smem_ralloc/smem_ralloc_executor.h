@@ -12,6 +12,8 @@
 #ifndef MEMFABRIC_HYBRID_SMEM_RALLOC_EXECUTOR_H
 #define MEMFABRIC_HYBRID_SMEM_RALLOC_EXECUTOR_H
 
+#include "smem_ralloc_rpc_def.h"
+
 namespace ock {
 namespace smem {
 /*

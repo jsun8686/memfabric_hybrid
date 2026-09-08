@@ -82,7 +82,7 @@ public:
         return resultOpType;
     }
 
-    static inline void TransHybmTlsOption(const smem_ralloc_tls_config &src, hybm_tls_option &dst)
+    static inline void TransHybmTlsOption(const smem_ralloc_tls_config &src, hybm_tls_config &dst)
     {
         dst.tlsEnable = src.tlsEnable;
         std::copy_n(src.caPath, SMEM_RALLOC_TLS_PATH_SIZE, dst.caPath);

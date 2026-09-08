@@ -48,15 +48,16 @@ public:
 
     bool IsRunning() const;
 
+    /* rpc dispatch entries, invoked by the rpc service lambdas on every node */
+    Result OnRegister(SmemRallocRpcMsg &msg);
+
+    Result OnPlacement(SmemRallocRpcMsg &msg);
+
 private:
     struct Candidate {
         SmemRallocRpcEndpoint ep{};
         uint64_t committedBytes = 0;
     };
-
-    Result OnRegister(SmemRallocRpcMsg &msg);
-
-    Result OnPlacement(SmemRallocRpcMsg &msg);
 
     std::mutex mutex_;
     std::map<uint32_t, Candidate> candidates_;

@@ -74,13 +74,13 @@ Result SmemRallocRpcService::Start(const SmemRallocRpcEndpoint &localEp, const s
         m.result = SM_OK;
         return SM_OK;
     });
-    RegisterHandler(SMEMRA_RPC_OP_REGISTER, [](SmemRallocRpcMsg &m) {
+    RegisterHandler(SMEMRA_RPC_OP_REGISTER, [](SmemRallocRpcMsg &m) -> Result {
         if (!SmemRallocMasterService::Instance().IsRunning()) {
             return SM_NOT_STARTED;
         }
         return SmemRallocMasterService::Instance().OnRegister(m);
     });
-    RegisterHandler(SMEMRA_RPC_OP_PLACEMENT, [](SmemRallocRpcMsg &m) {
+    RegisterHandler(SMEMRA_RPC_OP_PLACEMENT, [](SmemRallocRpcMsg &m) -> Result {
         if (!SmemRallocMasterService::Instance().IsRunning()) {
             return SM_NOT_STARTED;
         }

@@ -18,8 +18,10 @@
 #include "hybm_big_mem.h"
 #include "hybm_data_op.h"
 #include "mf_env_util.h"
+#include "mf_monotonic_time.h"
 #include "smem_store_factory.h"
 #include "mf_fault_injection_point.h"
+#include "smem_ralloc_rpc_def.h"
 
 namespace ock {
 namespace smem {

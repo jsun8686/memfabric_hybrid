@@ -64,7 +64,7 @@ struct SmemRallocRpcMsg {
     uint8_t pad[10];
 };
 static_assert(sizeof(SmemRallocRpcMsg) == 128U, "smem ralloc rpc msg size must be 128");
-static_assert(sizeof(SmemRallocRpcEndpoint) == 54U, "smem ralloc rpc endpoint size must be 54");
+static_assert(sizeof(SmemRallocRpcEndpoint) == 56U, "smem ralloc rpc endpoint size must be 56 (54 bytes + 2 tail padding)");
 
 /* master endpoint published under the RA_ prefixed store, value is POD SmemRallocRpcEndpoint */
 constexpr const char *SMEMRA_RPC_MASTER_STORE_KEY = "MASTER";

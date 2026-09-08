@@ -390,7 +390,10 @@ SMEM_API int32_t smem_ralloc_extend_remote_mem(smem_ralloc_t handle, smem_ralloc
         SM_LOG_AND_SET_LAST_ERROR_CODE(ret != SM_OK ? ret : allocMsg.result,
             "remote join alloc failed, ret: " << ret << " result: " << allocMsg.result
                                               << " gva: " << allocMsg.gva);
-        return ret != SM_OK ? ret : (allocMsg.result != SM_OK ? allocMsg.result : SM_ERROR);
+        if (ret != SM_OK) {
+            return ret;
+        }
+        return allocMsg.result != SM_OK ? static_cast<Result>(allocMsg.result) : static_cast<Result>(SM_ERROR);
     }
 
     /* 3. deliver the block info, gva is usable at once: the contributor replies strictly after
