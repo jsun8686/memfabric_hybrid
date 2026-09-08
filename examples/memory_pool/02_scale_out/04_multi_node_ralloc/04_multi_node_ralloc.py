@@ -36,6 +36,7 @@ def _run_near(head_node_ip: str) -> None:
     try:
         cfg = ralloc.RallocConfig()
         cfg.rank_id = 0
+        cfg.auto_ranking = False  # fixed identities: head is rank 0, node B is rank 1
         cfg.role = ralloc.RallocRole.NEAR
         cfg.start_store = True  # head hosts the store; master service runs in this process
         cfg.set_nic("tcp://127.0.0.1:10005")
@@ -95,6 +96,7 @@ def _run_far(head_node_ip: str) -> None:
     try:
         cfg = ralloc.RallocConfig()
         cfg.rank_id = 1
+        cfg.auto_ranking = False  # fixed identities: head is rank 0, node B is rank 1
         cfg.role = ralloc.RallocRole.FAR
         cfg.start_store = False
         cfg.set_nic("tcp://127.0.0.1:10005")

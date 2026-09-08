@@ -29,12 +29,13 @@ RANK_FAR = 1
 
 
 def _near_main(sync: mp.Barrier):
-    mf.set_log_level(3)
+    mf.set_log_level(1)
     assert mf.initialize() == 0, "mf.initialize failed"
     ralloc_inited = False
     try:
         cfg = ralloc.RallocConfig()
         cfg.rank_id = RANK_NEAR
+        cfg.auto_ranking = False
         cfg.role = ralloc.RallocRole.NEAR
         cfg.start_store = True  # NEAR hosts the store; master service runs in this process
         cfg.set_nic("tcp://127.0.0.1:10005")
@@ -46,7 +47,7 @@ def _near_main(sync: mp.Barrier):
         handle = ralloc.create(
             id=0,
             max_dram_size=ONE_GIB,
-            data_op_type=ralloc.RallocDataOpType.HOST_RDMA,
+            data_op_type=ralloc.RallocDataOpType.HOST_TCP,
         )
         print(f"[rank {RANK_NEAR}] (2/5) pool created (pure alignment, no local commit)", flush=True)
 
@@ -89,12 +90,13 @@ def _near_main(sync: mp.Barrier):
 
 
 def _far_main(sync: mp.Barrier):
-    mf.set_log_level(3)
+    mf.set_log_level(1)
     assert mf.initialize() == 0, "mf.initialize failed"
     ralloc_inited = False
     try:
         cfg = ralloc.RallocConfig()
         cfg.rank_id = RANK_FAR
+        cfg.auto_ranking = False
         cfg.role = ralloc.RallocRole.FAR
         cfg.start_store = False
         cfg.set_nic("tcp://127.0.0.1:10005")

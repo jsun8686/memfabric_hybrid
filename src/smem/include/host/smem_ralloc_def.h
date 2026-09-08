@@ -90,7 +90,7 @@ typedef struct {
     bool startConfigStoreOnly;        /* only start the config store */
     bool dynamicWorldSize;            /* member cannot join dynamically */
     bool unifiedAddressSpace;         /* unified address with SVM */
-    bool autoRanking;                 /* automatically allocate rank IDs, default is false. */
+    bool autoRanking;                 /* automatically allocate rank IDs, default is true. */
     uint32_t rankId;                  /* user specified rank ID, valid for autoRanking is False */
     uint32_t flags;                   /* other flag, default 0 */
     smem_ralloc_role_t role;          /* node role, default SMEM_RALLOC_ROLE_FAR */
