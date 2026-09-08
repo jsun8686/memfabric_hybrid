@@ -70,6 +70,7 @@ Result SmemRallocExecutor::OnJoinAlloc(SmemRallocRpcMsg &msg)
         msg.ownerRank = manager.GetRankId();
         SM_LOG_INFO("join alloc extend success, pool: " << msg.poolId << " requester: " << msg.reqRank
                                                         << " size: " << msg.size << " gva: " << info.gva);
+        manager.PokeReporter(); /* refresh master LB view without waiting a full period */
         return SM_OK;
     }
 
@@ -147,6 +148,7 @@ Result SmemRallocExecutor::OnJoinAlloc(SmemRallocRpcMsg &msg)
     msg.ownerRank = manager.GetRankId();
     SM_LOG_INFO("join alloc success, pool: " << msg.poolId << " requester: " << msg.reqRank
                                              << " size: " << msg.size << " gva: " << info.gva);
+    manager.PokeReporter(); /* refresh master LB view without waiting a full period */
     return SM_OK;
 }
 } // namespace smem

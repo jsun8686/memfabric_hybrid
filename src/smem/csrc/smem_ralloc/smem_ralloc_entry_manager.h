@@ -98,6 +98,9 @@ public:
     /* re-read the master endpoint from the store, self-heal after master restart/failover */
     void RefreshMasterEndpoint();
 
+    /* wake the reporter for an immediate committed-bytes report (master change / join alloc / reap) */
+    void PokeReporter();
+
     /* this process hosts the config store server (and then the ralloc master service) */
     inline bool IsStoreServer() const
     {

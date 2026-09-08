@@ -353,6 +353,11 @@ void SmemRallocEntryManager::OnMasterKeyChanged(int result, const std::vector<ui
     }
     SM_LOG_INFO("master endpoint changed, rank: " << ep.rankId << " endpoint: " << ep.ip << ":" << ep.port);
     /* only poke the reporter here, never do rpc on the store watch thread */
+    PokeReporter();
+}
+
+void SmemRallocEntryManager::PokeReporter()
+{
     {
         std::lock_guard<std::mutex> guard(reporterMutex_);
         reporterPoke_ = true;
