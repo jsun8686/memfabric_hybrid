@@ -13,6 +13,7 @@
 #define MEMFABRIC_HYBRID_SMEM_RALLOC_ENTRY_MANAGER_H
 
 #include <atomic>
+#include <condition_variable>
 #include <string>
 #include <thread>
 #include "smem_net_common.h"
@@ -94,6 +95,9 @@ public:
         return masterEp_.rankId != SMEM_RALLOC_INVALID_RANK && masterEp_.ip[0] != '\0';
     }
 
+    /* re-read the master endpoint from the store, self-heal after master restart/failover */
+    void RefreshMasterEndpoint();
+
     /* this process hosts the config store server (and then the ralloc master service) */
     inline bool IsStoreServer() const
     {
@@ -110,7 +114,8 @@ private:
      * pool-empty executor entries after the grace period */
     void StartReporter();
     void ReporterLoop();
-    void ReportCommittedBytes(uint32_t retry);
+    void OnMasterKeyChanged(int result, const std::vector<uint8_t> &value);
+    bool ReportCommittedBytes(uint32_t retry);
     void ReapEmptyPools();
 
 private:
@@ -127,6 +132,10 @@ private:
     std::atomic<bool> reporterStop_{false};
     uint32_t reportIntervalSec_ = 30U;
     uint32_t poolGraceSec_ = 5U;
+    std::mutex reporterMutex_;
+    std::condition_variable reporterCv_;
+    bool reporterPoke_ = false;
+    uint32_t masterWatchId_ = UINT32_MAX;
     mutable std::mutex masterMutex_;
     SmemRallocRpcEndpoint masterEp_{};
     UrlExtraction storeUrlExtraction_;

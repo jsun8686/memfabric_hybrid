@@ -9,6 +9,7 @@
  * MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
  * See the Mulan PSL v2 for more details.
  */
+#include <chrono>
 #include <thread>
 #include <algorithm>
 #include <cstring>
@@ -30,6 +31,7 @@ namespace smem {
 namespace {
 constexpr int64_t SMEMRA_MASTER_DISCOVER_TIMEOUT_MS = 10000; /* 10s */
 constexpr uint32_t SMEMRA_CANDIDATE_REGISTER_RETRY = 3U;
+constexpr uint32_t SMEMRA_MASTER_CHANGE_THROTTLE_SEC = 2U; /* min gap between poke-triggered reports */
 }
 
 SmemRallocEntryManager &SmemRallocEntryManager::Instance()
@@ -313,8 +315,73 @@ Result SmemRallocEntryManager::StartControlPlane()
     }
 
     StartReporter();
+
+    /* watch the master key: a master change (restart/failover re-publishes the key) wakes the
+     * reporter for an immediate re-register, failover converges in seconds instead of a period */
+    ret = confStore_->Watch(
+        SMEMRA_RPC_MASTER_STORE_KEY,
+        [this](int result, const std::string &key, const std::vector<uint8_t> &value) {
+            (void)key;
+            OnMasterKeyChanged(result, value);
+        },
+        masterWatchId_);
+    if (ret != SM_OK || masterWatchId_ == UINT32_MAX) {
+        /* non-fatal: periodic reporting still refreshes the master view every interval */
+        SM_LOG_WARN("watch master key failed, failover re-register falls back to periodic, ret: " << ret);
+        masterWatchId_ = UINT32_MAX;
+    }
+
     ReportCommittedBytes(SMEMRA_CANDIDATE_REGISTER_RETRY); /* initial register with retries */
     return SM_OK;
+}
+
+void SmemRallocEntryManager::OnMasterKeyChanged(int result, const std::vector<uint8_t> &value)
+{
+    if (result != SM_OK || value.size() != sizeof(SmemRallocRpcEndpoint)) {
+        SM_LOG_WARN("master key watch fired with invalid payload, ret: " << result << " size: " << value.size());
+        return;
+    }
+    SmemRallocRpcEndpoint ep{};
+    (void)memcpy(&ep, value.data(), sizeof(SmemRallocRpcEndpoint));
+    {
+        std::lock_guard<std::mutex> guard(masterMutex_);
+        if (ep.rankId == masterEp_.rankId && ep.port == masterEp_.port &&
+            strncmp(ep.ip, masterEp_.ip, sizeof(ep.ip)) == 0) {
+            return; /* same master, nothing to do */
+        }
+        masterEp_ = ep;
+    }
+    SM_LOG_INFO("master endpoint changed, rank: " << ep.rankId << " endpoint: " << ep.ip << ":" << ep.port);
+    /* only poke the reporter here, never do rpc on the store watch thread */
+    {
+        std::lock_guard<std::mutex> guard(reporterMutex_);
+        reporterPoke_ = true;
+    }
+    reporterCv_.notify_one();
+}
+
+void SmemRallocEntryManager::RefreshMasterEndpoint()
+{
+    if (isStoreServer_) {
+        return; /* self hosts the store and the master, nothing to refresh */
+    }
+    std::vector<uint8_t> epData;
+    auto ret = confStore_->Get(SMEMRA_RPC_MASTER_STORE_KEY, epData, SMEMRA_MASTER_DISCOVER_TIMEOUT_MS);
+    if (ret != SM_OK || epData.size() != sizeof(SmemRallocRpcEndpoint)) {
+        SM_LOG_WARN("refresh master endpoint failed, ret: " << ret);
+        return;
+    }
+    SmemRallocRpcEndpoint ep{};
+    (void)memcpy(&ep, epData.data(), sizeof(SmemRallocRpcEndpoint));
+    {
+        std::lock_guard<std::mutex> guard(masterMutex_);
+        if (ep.rankId == masterEp_.rankId && ep.port == masterEp_.port &&
+            strncmp(ep.ip, masterEp_.ip, sizeof(ep.ip)) == 0) {
+            return;
+        }
+        masterEp_ = ep;
+    }
+    SM_LOG_INFO("master endpoint refreshed, rank: " << ep.rankId << " endpoint: " << ep.ip << ":" << ep.port);
 }
 
 void SmemRallocEntryManager::StartReporter()
@@ -326,8 +393,17 @@ void SmemRallocEntryManager::StartReporter()
 
 void SmemRallocEntryManager::StopControlPlane()
 {
+    if (masterWatchId_ != UINT32_MAX && confStore_ != nullptr) {
+        (void)confStore_->Unwatch(masterWatchId_);
+        masterWatchId_ = UINT32_MAX;
+    }
     if (reporterThread_.joinable()) {
         reporterStop_.store(true);
+        {
+            std::lock_guard<std::mutex> guard(reporterMutex_);
+            reporterPoke_ = true;
+        }
+        reporterCv_.notify_all();
         reporterThread_.join();
     }
     SmemRallocMasterService::Instance().Stop();
@@ -341,23 +417,50 @@ void SmemRallocEntryManager::StopControlPlane()
 void SmemRallocEntryManager::ReporterLoop()
 {
     SM_LOG_INFO("ralloc reporter started, interval: " << reportIntervalSec_ << "s grace: " << poolGraceSec_ << "s");
+    auto lastReport = std::chrono::steady_clock::now();
     while (!reporterStop_.load()) {
-        for (uint32_t slept = 0; slept < reportIntervalSec_ && !reporterStop_.load(); slept++) {
-            sleep(1U);
+        bool poked = false;
+        {
+            std::unique_lock<std::mutex> lock(reporterMutex_);
+            reporterCv_.wait_for(lock, std::chrono::seconds(reportIntervalSec_),
+                                 [this]() { return reporterPoke_ || reporterStop_.load(); });
+            poked = reporterPoke_;
+            reporterPoke_ = false;
         }
         if (reporterStop_.load()) {
             break;
         }
-        ReportCommittedBytes(0U);
+        if (poked) {
+            /* absorb master flapping: keep a min gap between poke-triggered reports */
+            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now() - lastReport).count();
+            if (elapsed < static_cast<int64_t>(SMEMRA_MASTER_CHANGE_THROTTLE_SEC)) {
+                sleep(SMEMRA_MASTER_CHANGE_THROTTLE_SEC - static_cast<uint32_t>(elapsed));
+                if (reporterStop_.load()) {
+                    break;
+                }
+            }
+        }
+        auto reported = ReportCommittedBytes(0U);
+        lastReport = std::chrono::steady_clock::now();
+        if (!reported && poked) {
+            /* the new master may not be activated yet when the watch fires, one bounded retry */
+            sleep(SMEMRA_MASTER_CHANGE_THROTTLE_SEC);
+            if (reporterStop_.load()) {
+                break;
+            }
+            (void)ReportCommittedBytes(0U);
+            lastReport = std::chrono::steady_clock::now();
+        }
         ReapEmptyPools();
     }
     SM_LOG_INFO("ralloc reporter stopped");
 }
 
-void SmemRallocEntryManager::ReportCommittedBytes(uint32_t retry)
+bool SmemRallocEntryManager::ReportCommittedBytes(uint32_t retry)
 {
     if (!HasMaster()) {
-        return;
+        return false;
     }
     uint64_t total = 0;
     {
@@ -380,13 +483,17 @@ void SmemRallocEntryManager::ReportCommittedBytes(uint32_t retry)
         auto ret = rpc.SyncCall(GetMasterEndpoint(), msg);
         if (ret == SM_OK && msg.result == SM_OK) {
             SM_LOG_DEBUG("report committed bytes ok, total: " << total);
-            return;
+            return true;
         }
         SM_LOG_WARN("report committed bytes failed, ret: " << ret << " result: " << msg.result << " retry: " << i);
         if (i < retry) {
             sleep(1U);
         }
     }
+    /* the cached endpoint may point to a dead master (restart/failover), refresh it so the
+     * next cycle or the master-key watch converges to the new master */
+    RefreshMasterEndpoint();
+    return false;
 }
 
 void SmemRallocEntryManager::ReapEmptyPools()

@@ -358,6 +358,11 @@ SMEM_API int32_t smem_ralloc_extend_remote_mem(smem_ralloc_t handle, smem_ralloc
     placeMsg.size = size;
     auto masterEp = manager.GetMasterEndpoint();
     ret = rpc.SyncCall(masterEp, placeMsg);
+    if (ret == SM_NOT_CONNECTED) {
+        /* cached master endpoint may be stale (restart/failover), refresh and retry once */
+        manager.RefreshMasterEndpoint();
+        ret = rpc.SyncCall(manager.GetMasterEndpoint(), placeMsg);
+    }
     if (ret != SM_OK || placeMsg.result != SM_OK) {
         SM_LOG_AND_SET_LAST_ERROR_CODE(ret != SM_OK ? ret : placeMsg.result,
             "placement failed, ret: " << ret << " result: " << placeMsg.result);
