@@ -69,7 +69,6 @@ def _run_near(head_node_ip: str) -> None:
         got = torch.empty(COPY_BYTES // 4, dtype=torch.int32)
         assert handle.copy_data(gva, got.data_ptr(), COPY_BYTES, 0) == 0, "G2H from far slot"
         assert torch.equal(got, src), "round-trip via far block"
-        assert handle.wait() == 0, "wait"
         assert handle.get_group_ranks() == [0, 1], "group ranks"
         assert handle.get_mem_size_by_rank(1) >= EXTEND_REMOTE_BYTES, "far slot size"
         print("[near] round-trip via FAR block OK — sleeping until Ctrl+C", flush=True)

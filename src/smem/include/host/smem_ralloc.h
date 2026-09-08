@@ -102,8 +102,11 @@ int32_t smem_ralloc_copy(smem_ralloc_t handle, const void *src, void *dest, uint
 /**
  * @brief Wait all asynchronous copy finished
  *
+ * Applies to the SDMA asynchronous path only: HOST data paths (HOST_RDMA etc.) complete
+ * synchronously inside <i>smem_ralloc_copy</i> and need no wait.
+ *
  * @param handle           [in] ralloc object handle created by <i>smem_ralloc_create</i>
- * @return 0 if successful
+ * @return 0 if successful; an error when the entity has no SDMA data operator
  */
 int32_t smem_ralloc_wait(smem_ralloc_t handle);
 

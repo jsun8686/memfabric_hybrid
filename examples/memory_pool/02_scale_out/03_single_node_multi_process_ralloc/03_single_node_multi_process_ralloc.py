@@ -72,7 +72,6 @@ def _near_main(sync: mp.Barrier):
         got = torch.empty(COPY_BYTES // 4, dtype=torch.int32)
         assert handle.copy_data(gva_remote, got.data_ptr(), COPY_BYTES, 0) == 0, "G2H from far slot"
         assert torch.equal(got, src), "round-trip via far block"
-        assert handle.wait() == 0, "wait"
         print(f"[rank {RANK_NEAR}] (4/5) extend_remote_mem + round-trip OK (contributor rank {RANK_FAR})", flush=True)
 
         # Phase 3: second remote acquire hits the executor extend branch, LB accounting refreshed
