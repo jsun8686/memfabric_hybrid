@@ -53,7 +53,7 @@ def _near_main(sync: mp.Barrier):
         cfg.auto_ranking = False
         cfg.role = ralloc.RallocRole.NEAR
         cfg.start_store = False  # FAR (rank 0) hosts the store and the master service
-        cfg.set_nic("tcp://127.0.0.1:10005")
+        cfg.set_nic("tcp://174.111.50.202:10005")
         _wait_for_store()  # master discovery inside initialize needs the FAR-hosted store
         assert ralloc.initialize(STORE_URL, WORLD_SIZE, DEVICE_ID, cfg) == 0, "ralloc.initialize failed"
         ralloc_inited = True
@@ -63,7 +63,7 @@ def _near_main(sync: mp.Barrier):
         handle = ralloc.create(
             id=0,
             max_dram_size=ONE_GIB,
-            data_op_type=ralloc.RallocDataOpType.HOST_TCP,
+            data_op_type=ralloc.RallocDataOpType.HOST_RDMA,
         )
         print(f"[rank {RANK_NEAR}] (2/5) pool created (pure alignment, no local commit)", flush=True)
 
@@ -115,7 +115,7 @@ def _far_main(sync: mp.Barrier):
         cfg.auto_ranking = False
         cfg.role = ralloc.RallocRole.FAR
         cfg.start_store = True  # rank 0 hosts the store; master seeds itself, loopback accounting
-        cfg.set_nic("tcp://127.0.0.1:10005")
+        cfg.set_nic("tcp://174.111.50.202:10005")
         assert ralloc.initialize(STORE_URL, WORLD_SIZE, DEVICE_ID, cfg) == 0, "ralloc.initialize failed"
         ralloc_inited = True
         print(f"[rank {RANK_FAR}] ralloc initialized (FAR: store host + master + contributor)", flush=True)
