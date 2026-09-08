@@ -61,6 +61,7 @@ def _run_near(head_node_ip: str) -> None:
             print("[near] no FAR candidate yet (start rank 1 on node B), retrying ...", flush=True)
             time.sleep(FAR_WAIT_RETRY_SEC)
         assert info["rank_id"] == 1 and info["gva"] != 0, f"extend_remote_mem: {ret} {info}"
+        mf.get_and_clear_last_err_msg()
         gva = info["gva"]
         print(f"[near] remote block acquired from rank {info['rank_id']} (gva=0x{gva:x})", flush=True)
 
@@ -78,7 +79,7 @@ def _run_near(head_node_ip: str) -> None:
         except KeyboardInterrupt:
             print("[near] interrupted, destroying pool", flush=True)
 
-        handle.destroy()
+        assert handle.destroy() == 0, "destroy pool"
         assert mf.get_last_err_msg() == "", mf.get_last_err_msg()
     finally:
         if ralloc_inited:

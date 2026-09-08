@@ -10,7 +10,7 @@ join 融合）→ {rankId, gva} 交付 → 跨节点 copy_data AUTO 往返校验
 
 ## 使用能力
 `ralloc.initialize / create / extend_remote_mem / get_group_ranks / get_mem_size_by_rank /
-copy_data / wait / destroy`。
+copy_data / destroy`。
 
 ## 规模建议
 - 每节点 1 进程（worldSize=2），每 rank 窗槽 1GiB（仅 VA 预留），远端块 64MB，拷贝载荷 4MB。
