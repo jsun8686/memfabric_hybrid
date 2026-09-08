@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "acc_tcp_shared_buf.h"
+#include "mf_ipv4_validator.h"
 #include "mf_tls_util.h"
 #include "smem_logger.h"
 #include "smem_ralloc_master.h"
@@ -46,6 +47,13 @@ Result SmemRallocRpcService::Start(const SmemRallocRpcEndpoint &localEp, const s
 
     if (tlsConfig_.tlsEnable && PrepareTls(server_) != SM_OK) {
         SM_LOG_ERROR("failed to prepare tls for ralloc rpc server");
+        server_ = nullptr;
+        return SM_ERROR;
+    }
+
+    if (mf::SocketAddressParserMgr::getInstance().CreateParser(
+            "tcp://" + std::string(localEp_.ip) + ":" + std::to_string(localEp_.port)) == nullptr) {
+        SM_LOG_ERROR("create socket parser failed for ralloc rpc port: " << localEp_.port);
         server_ = nullptr;
         return SM_ERROR;
     }
@@ -235,6 +243,11 @@ Result SmemRallocRpcService::EnsureClient(const SmemRallocRpcEndpoint &remote, s
             it->second.client->Stop();
         }
         clients_.erase(it);
+    }
+
+    if (mf::SocketAddressParserMgr::getInstance().CreateParser("tcp://" + key) == nullptr) {
+        SM_LOG_ERROR("create socket parser failed for remote rpc: " << key);
+        return SM_ERROR;
     }
 
     auto client = acc::AccTcpServer::Create();
