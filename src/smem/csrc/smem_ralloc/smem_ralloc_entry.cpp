@@ -515,11 +515,10 @@ uint64_t SmemRallocEntry::GetMemSizeByRank(uint32_t rank)
     if (rank >= coreOptions_.rankCount || hostGva_ == nullptr) {
         return 0;
     }
-    /* hostGva_ is the window base (rank0 slot base), window base of this process view
-     * = hostGva_ - ownRank * maxDRAMSize, slots are woven as base + rank * maxDRAMSize */
-    auto windowBase = reinterpret_cast<uint64_t>(hostGva_) -
-                      static_cast<uint64_t>(options_.rank) * coreOptions_.maxDRAMSize;
-    auto slotBase = windowBase + static_cast<uint64_t>(rank) * coreOptions_.maxDRAMSize;
+    /* hostGva_ is the window base (the rank0 slot base, identical in every process view),
+     * slot of rank r spans [hostGva_ + r * maxDRAMSize, +maxDRAMSize), same as GetMemPtrByRank */
+    auto slotBase = reinterpret_cast<uint64_t>(hostGva_) +
+                    static_cast<uint64_t>(rank) * coreOptions_.maxDRAMSize;
     auto slotEnd = slotBase + coreOptions_.maxDRAMSize;
 
     uint32_t count = 0;
