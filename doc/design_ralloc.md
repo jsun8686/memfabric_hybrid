@@ -1,4 +1,4 @@
-# smem_ralloc 设计文档（v9 定稿，P2 收尾：watch 切主收敛+组成员快照查询）
+# smem_ralloc 设计文档
 
 > 定位：`src/smem` 下第四个平级入口（与 smem_bm / smem_shm / smem_trans 同型同构），**allocation-native 远端内存获取**；
 > hybm 引擎仅新增只读区间查询接口（`hybm_query_alloc_ranges`），核心语义零改动；本文档为后续开发需求跟踪基线（需求清单见第 7 节）。
@@ -63,7 +63,7 @@ rankId：**三角色统一由 init 分配**（`autoRanking` 从 store 原子取�
 | master 候选表 | 内存表：`{rankId → endpoint, committedBytes}`；**覆盖式记账**：FAR 上报权威值（Σ entry 提交量），30s 周期 `MF_RALLOC_REPORT_INTERVAL_SEC` + 三类事件即时触发（master 变更 watch poke / JOIN_ALLOC 成功 poke / 组空自毁后），无乐观累加 |
 | TLS | 复用 acc_tcp_ssl_helper，与 store 开关对齐 |
 
-## 5. 主链路时序（定稿）
+## 5. 主链路时序
 
 ```mermaid
 sequenceDiagram
@@ -109,7 +109,7 @@ sequenceDiagram
     end
 ```
 
-### 5.1 逐 API 多进程交互时序（P2+watch+v9 落盘态）
+### 5.1 逐 API 多进程交互时序
 
 **约定**：`A`=NEAR 发起者，`B`=NEAR 迟到者，`X`=FAR 贡献者，`M`=master（store 宿主），`S`=配置中心
 （承载单槽事件流 `SMEM_GROUP_LISTEN_EVENT_KEY`、MASTER 键、RA_ROLE_ 键）。事件流每条记录 =
@@ -146,7 +146,7 @@ sequenceDiagram
     end
 ```
 
-**图 3：`smem_ralloc_create`（A 首建；B 迟到同路）**
+**图 3：`smem_ralloc_create`**
 
 ```mermaid
 sequenceDiagram
@@ -228,7 +228,7 @@ sequenceDiagram
     end
 ```
 
-**图 7：`smem_ralloc_set_group_event_handler`（事件来源视角）**
+**图 7：`smem_ralloc_set_group_event_handler`**
 
 ```mermaid
 sequenceDiagram
@@ -244,7 +244,7 @@ sequenceDiagram
     Note over App: 仅注册后增量，不可回放（前提14）
 ```
 
-**图 8：`smem_ralloc_destroy`（A/B 主动）+ FAR 组空自毁支线**
+**图 8：`smem_ralloc_destroy`**
 
 ```mermaid
 sequenceDiagram
@@ -307,7 +307,7 @@ sequenceDiagram
 import+mmap 完毕；executor 回执严格后置于 barrier 返回，因此**获取接口返回后 gva 即查即用**，无需等待环。
 `get_mem_size_by_rank` 为当前导入快照（并发中的第三方扩展按 eventual consistency 呈现）。
 
-### 6.5 FAR entry 组空自毁（生命周期闭环）
+### 6.5 FAR entry 组空自毁
 
 ```
 每个 entry 维护 memberRoles_（rank→角色）：
@@ -343,7 +343,7 @@ reaper（manager 周期线程，FAR 节点）：FAR entry 且标记超过宽限�
 | R12 | 故障场景（X 掉线/重连、master 降级/切主自动重竞速、LinkDown 时延打磨；hybm allocatedSize_ 失败不回滚） | LeaveHandle/LinkDown 机制 | 复用+打磨 | P3 | 待启动（handler 全员化+**watch 触发即时重注册**已消解切主 30s 收敛窗；FAR 周期 REGISTER 天然重建候选表；切主检测/重竞速本身仍待做） |
 | R13 | FAR entry 生命周期闭环（组空自毁） | 角色键 RA_ROLE_+memberRoles_+reaper | 新增 | P2 | 已交付（§6.5；宽限 5s/env；FAR 禁 create 免属主标记） |
 
-## 8. 已代码验证的设计前提（证据锚点）
+## 8. 已代码验证的设计前提
 
 1. groupSize 动态（构造起 0，随 join±1）→ A+X 两人起步合法（smem_net_group_engine.h:99-107，
    smem_net_group_engine.cpp:1198/:1168）
@@ -375,7 +375,7 @@ reaper（manager 周期线程，FAR 节点）：FAR entry 且标记超过宽限�
     回放**；注册回调前的存量成员（含迟到 B 视角全员）只能经 `get_group_ranks` 枚举发现（bm 同引擎同缺口，
     记备注不动 bm 代码）
 
-## 9. 文件布局（P1 落位）
+## 9. 文件布局
 
 ```
 src/smem/csrc/smem_ralloc/
@@ -391,7 +391,7 @@ src/hybm/
   hybm_def.h / hybm_big_mem.h / hybm_big_mem_entry.cpp / mm/hybm_va_manager.{h,cpp}   # 增量：区间查询
 ```
 
-## 10. 作废设计存档（避免回潮）
+## 10. 作废设计存档
 
 | 作废项 | 原因 |
 |---|---|

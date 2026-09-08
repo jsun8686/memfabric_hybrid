@@ -25,6 +25,7 @@
 #include "smem.h"
 #include "smem_shm.h"
 #include "smem_bm.h"
+#include "smem_ralloc.h"
 #include "smem_version.h"
 
 namespace py = pybind11;
@@ -351,6 +352,150 @@ private:
 };
 
 uint32_t BigMemory::worldSize_;
+
+class RallocPool {
+public:
+    explicit RallocPool(smem_ralloc_t hd) noexcept : handle_{hd} {}
+    virtual ~RallocPool() noexcept
+    {
+        if (handle_ != nullptr) {
+            smem_ralloc_destroy(handle_);
+            handle_ = nullptr;
+        }
+    }
+
+    static int32_t Initialize(const std::string &storeURL, uint32_t worldSize, uint16_t deviceId,
+                              const smem_ralloc_config_t &config) noexcept
+    {
+        return smem_ralloc_init(storeURL.c_str(), worldSize, deviceId, &config);
+    }
+
+    static void UnInitialize(uint32_t flags) noexcept
+    {
+        smem_ralloc_uninit(flags);
+    }
+
+    static uint32_t GetRankId() noexcept
+    {
+        return smem_ralloc_get_rank_id();
+    }
+
+    static RallocPool *Create(uint32_t id, uint64_t maxDramSize, uint64_t maxHbmSize,
+                              smem_ralloc_data_op_type dataOpType, bool enable56BitsGva, uint32_t flags)
+    {
+        smem_ralloc_create_option_t option{};
+        option.maxDramSize = maxDramSize;
+        option.maxHbmSize = maxHbmSize;
+        option.dataOpType = dataOpType;
+        option.enable56BitsGva = enable56BitsGva;
+        option.flags = flags;
+
+        auto hd = smem_ralloc_create(id, &option);
+        if (hd == nullptr) {
+            throw std::runtime_error(std::string("create ralloc handle failed."));
+        }
+
+        return new (std::nothrow) RallocPool{hd};
+    }
+
+    py::tuple ExtendLocalMem(smem_ralloc_mem_type memType, uint64_t size)
+    {
+        smem_ralloc_mem_info_t info{};
+        auto ret = smem_ralloc_extend_local_mem(handle_, memType, size, &info);
+        py::gil_scoped_acquire acquire;
+        return py::make_tuple(ret, MakeInfoDict(info));
+    }
+
+    py::tuple ExtendRemoteMem(smem_ralloc_mem_type memType, uint64_t size)
+    {
+        smem_ralloc_mem_info_t info{};
+        auto ret = smem_ralloc_extend_remote_mem(handle_, memType, size, &info);
+        py::gil_scoped_acquire acquire;
+        return py::make_tuple(ret, MakeInfoDict(info));
+    }
+
+    int32_t CopyData(uint64_t src, uint64_t dest, uint64_t size, uint32_t flags)
+    {
+        return smem_ralloc_copy(handle_, reinterpret_cast<const void *>(src), reinterpret_cast<void *>(dest),
+                                size, flags);
+    }
+
+    int32_t Wait()
+    {
+        return smem_ralloc_wait(handle_);
+    }
+
+    uint64_t GetMemSizeByRank(uint32_t rank)
+    {
+        return smem_ralloc_get_mem_size_by_rank(handle_, rank);
+    }
+
+    uint64_t GetMemPtrByRank(uint32_t rank)
+    {
+        auto ptr = smem_ralloc_get_mem_ptr_by_rank(handle_, rank);
+        return ptr == nullptr ? 0 : (uint64_t)(ptrdiff_t)ptr;
+    }
+
+    std::vector<uint32_t> GetGroupRanks()
+    {
+        auto count = smem_ralloc_get_group_ranks(handle_, nullptr, 0);
+        if (count == UINT32_MAX || count == 0) {
+            return {};
+        }
+        std::vector<uint32_t> ranks(count);
+        auto written = smem_ralloc_get_group_ranks(handle_, ranks.data(), count);
+        if (written == UINT32_MAX) {
+            throw std::runtime_error(std::string("get group ranks failed."));
+        }
+        ranks.resize(written);
+        return ranks;
+    }
+
+    int32_t SetGroupEventHandler(const std::function<void(uint32_t, smem_ralloc_group_event_t)> &cb)
+    {
+        if (cb == nullptr) {
+            return SMEM_INVALID_PARAM;
+        }
+
+        eventCb_ = cb;
+        return smem_ralloc_set_group_event_handler(handle_, GroupChangeEventCallback, &eventCb_);
+    }
+
+    void Destroy()
+    {
+        smem_ralloc_destroy(handle_);
+        handle_ = nullptr;
+    }
+
+private:
+    static py::dict MakeInfoDict(const smem_ralloc_mem_info_t &info)
+    {
+        py::dict dict;
+        dict["rank_id"] = info.rankId;
+        dict["gva"] = (uint64_t)(ptrdiff_t)info.gva;
+        return dict;
+    }
+
+    static void GroupChangeEventCallback(smem_ralloc_t handle, uint32_t rankId, smem_ralloc_group_event_t event,
+                                         void *ctx)
+    {
+        if (ctx == nullptr) {
+            return;
+        }
+        auto func = reinterpret_cast<std::function<void(uint32_t, smem_ralloc_group_event_t)> *>(ctx);
+        try {
+            (*func)(rankId, event);
+        } catch (const std::exception &e) {
+            std::cerr << "invoke python callback for ralloc event:" << event << ", rank_id:" << rankId
+                      << " exception caught:" << e.what() << std::endl;
+        }
+    }
+
+private:
+    smem_ralloc_t handle_;
+    std::function<void(uint32_t, smem_ralloc_group_event_t)> eventCb_ = nullptr;
+};
+
 struct LoggerState {
     static std::mutex mutex;
     static std::shared_ptr<py::function> py_logger;
@@ -835,6 +980,177 @@ Returns:
         .def("wait", &BigMemory::Wait, py::call_guard<py::gil_scoped_release>(), R"(
 Wait all issued async copy(s) finish.)");
 }
+
+void DefineRallocConfig(py::module_ &m)
+{
+    py::enum_<smem_ralloc_role>(m, "RallocRole")
+        .value("NEAR", SMEM_RALLOC_ROLE_NEAR, "requester/accessor node, creates pools and holds handles")
+        .value("FAR", SMEM_RALLOC_ROLE_FAR, "resident contributor node, contributes on JOIN_ALLOC requests");
+
+    py::enum_<smem_ralloc_mem_type>(m, "RallocMemType")
+        .value("LOCAL_DEVICE", SMEM_RALLOC_MEM_TYPE_LOCAL_DEVICE, "memory type is on local DEVICE side.")
+        .value("LOCAL_HOST", SMEM_RALLOC_MEM_TYPE_LOCAL_HOST, "memory type is on local HOST side.")
+        .value("DEVICE", SMEM_RALLOC_MEM_TYPE_DEVICE, "memory type is on global DEVICE side.")
+        .value("HOST", SMEM_RALLOC_MEM_TYPE_HOST, "memory type is on global HOST side.");
+
+    py::enum_<smem_ralloc_data_op_type>(m, "RallocDataOpType")
+        .value("SDMA", SMEMRA_DATA_OP_SDMA, "data operation done by device SDMA")
+        .value("HOST_RDMA", SMEMRA_DATA_OP_HOST_RDMA, "data operation done by host RDMA")
+        .value("HOST_TCP", SMEMRA_DATA_OP_HOST_TCP, "data operation done by host TCP")
+        .value("DEVICE_RDMA", SMEMRA_DATA_OP_DEVICE_RDMA, "data operation done by device RDMA")
+        .value("HOST_URMA", SMEMRA_DATA_OP_HOST_URMA, "data operation done by host URMA")
+        .value("HOST_SHM", SMEMRA_DATA_OP_HOST_SHM, "same-node host shared memory (no network transport)");
+
+    py::enum_<smem_ralloc_group_event_t>(m, "RallocGroupEvent")
+        .value("JOIN_EVENT", SMEM_RALLOC_GROUP_EVENT_JOIN, "join event")
+        .value("LEAVE_EVENT", SMEM_RALLOC_GROUP_EVENT_LEAVE, "leave event");
+
+    py::class_<smem_ralloc_config_t>(m, "RallocConfig")
+        .def(py::init([]() {
+                 auto config = new (std::nothrow) smem_ralloc_config_t;
+                 smem_ralloc_config_init(config);
+                 return config;
+             }),
+             py::call_guard<py::gil_scoped_release>())
+        .def_readwrite("init_timeout", &smem_ralloc_config_t::initTimeout, R"(
+func smem_ralloc_init timeout, default 120 second)")
+        .def_readwrite("create_timeout", &smem_ralloc_config_t::createTimeout, R"(
+func smem_ralloc_create timeout, default 120 second)")
+        .def_readwrite("operation_timeout", &smem_ralloc_config_t::controlOperationTimeout, R"(
+control operation timeout, default 120 second)")
+        .def_readwrite("start_store", &smem_ralloc_config_t::startConfigStoreServer, R"(
+whether to start config store, default true)")
+        .def_readwrite("start_store_only", &smem_ralloc_config_t::startConfigStoreOnly, "only start the config store")
+        .def_readwrite("dynamic_world_size", &smem_ralloc_config_t::dynamicWorldSize, "member cannot join dynamically")
+        .def_readwrite("unified_address_space", &smem_ralloc_config_t::unifiedAddressSpace, "unified address with SVM")
+        .def_readwrite("auto_ranking", &smem_ralloc_config_t::autoRanking, R"(
+automatically allocate rank IDs, default is false)")
+        .def_readwrite("rank_id", &smem_ralloc_config_t::rankId, "user specified rank ID, valid for autoRanking is False")
+        .def_readwrite("flags", &smem_ralloc_config_t::flags, "other flags, default 0")
+        .def_readwrite("role", &smem_ralloc_config_t::role, "node role (RallocRole), default RallocRole.FAR")
+        .def_readwrite("rpc_port_base", &smem_ralloc_config_t::rpcPortBase,
+                       "control rpc port base, default 11100 (port = base + rank_id)")
+        .def(
+            "set_nic",
+            [](smem_ralloc_config_t &config, const std::string &nic) {
+                strncpy(config.hcomUrl, nic.c_str(), sizeof(config.hcomUrl) - 1);
+                config.hcomUrl[sizeof(config.hcomUrl) - 1] = '\0';
+            },
+            py::call_guard<py::gil_scoped_release>(), py::arg("nic"));
+}
+
+void DefineRallocClass(py::module_ &m)
+{
+    // module method
+    m.def("initialize", &RallocPool::Initialize, py::call_guard<py::gil_scoped_release>(), py::arg("store_url"),
+          py::arg("world_size"), py::arg("device_id"), py::arg("config"), R"(
+Initialize smem ralloc library.
+
+Arguments:
+    store_url(str):       configure store url for control, e.g. tcp://ip:port
+    world_size(int):      max number of guys participating (window rank count)
+    device_id(int):       device id
+    config(RallocConfig): extract config
+Returns:
+    0 if successful)");
+
+    m.def("uninitialize", &RallocPool::UnInitialize, py::call_guard<py::gil_scoped_release>(), py::arg("flags") = 0,
+          R"(
+Un-initialize the smem ralloc library.
+
+Arguments:
+    flags(int): optional flags, not used yet)");
+
+    m.def("get_rank_id", &RallocPool::GetRankId, py::call_guard<py::gil_scoped_release>(), R"(
+Get the rank id, assigned during initialize.
+Returns:
+    rank id if successful, UINT32_MAX is returned if failed.)");
+
+    m.def("create", &RallocPool::Create, py::call_guard<py::gil_scoped_release>(), py::arg("id"),
+          py::arg("max_dram_size"), py::arg("max_hbm_size") = 0,
+          py::arg("data_op_type") = SMEMRA_DATA_OP_HOST_RDMA, py::arg("enable_56bits_gva") = false,
+          py::arg("flags") = 0, R"(
+Create a ralloc pool on a NEAR role node after initialized. Pure alignment: the window is
+reserved and the dynamic group is joined, no local memory is committed by create itself.
+
+Arguments:
+    id(int):                       identity of the ralloc pool, different pools need different ids
+    max_dram_size(int):            the max size of one rank DRAM slot reserved in the window, 2M aligned
+    max_hbm_size(int):             reserved for the future HBM window slot, default 0
+    data_op_type(RallocDataOpType): data operation type of the pool, default HOST_RDMA
+    enable_56bits_gva(bool):       explicitly enable 56-bit GVA, default false
+    flags(int):                    optional flags, default 0
+Returns:
+    RallocPool if successful)");
+
+    // ralloc pool class
+    py::class_<RallocPool>(m, "RallocPool")
+        .def("extend_local_mem", &RallocPool::ExtendLocalMem, py::call_guard<py::gil_scoped_release>(),
+             py::arg("mem_type") = SMEM_RALLOC_MEM_TYPE_HOST, py::arg("size"), R"(
+Extend one memory block on the local slot.
+
+Arguments:
+    mem_type(RallocMemType): memory type, only HOST is supported, default HOST
+    size(int):               block size in byte, must be 2M aligned
+Returns:
+    tuple: (ret, {"rank_id": int, "gva": int}) — rank_id is the contributor rank (local rank),
+           gva is the global virtual address of the new block, 0 if no block is acquired)")
+        .def("extend_remote_mem", &RallocPool::ExtendRemoteMem, py::call_guard<py::gil_scoped_release>(),
+             py::arg("mem_type") = SMEM_RALLOC_MEM_TYPE_HOST, py::arg("size"), R"(
+Acquire one memory block from a remote contributor node selected by the master
+(least loaded candidate, never the requester itself).
+
+Arguments:
+    mem_type(RallocMemType): memory type, only HOST is supported, default HOST
+    size(int):               block size in byte, must be 2M aligned
+Returns:
+    tuple: (ret, {"rank_id": int, "gva": int}) — rank_id is the contributor rank,
+           gva is the global virtual address of the acquired block, 0 if no block is acquired)")
+        .def("copy_data", &RallocPool::CopyData, py::call_guard<py::gil_scoped_release>(), py::arg("src_ptr"),
+             py::arg("dst_ptr"), py::arg("size"), py::arg("flags") = 0, R"(
+Data copy with direction automatically selected by address (local or global).
+
+Arguments:
+    src_ptr(int): source address, local or global
+    dst_ptr(int): destination address, local or global
+    size(int):    size of data to be copied
+    flags(int):   optional flags, e.g. ASYNC_COPY_FLAG
+Returns:
+    0 if successful)")
+        .def("wait", &RallocPool::Wait, py::call_guard<py::gil_scoped_release>(), R"(
+Wait all issued async copy(s) finish.)")
+        .def("destroy", &RallocPool::Destroy, py::call_guard<py::gil_scoped_release>(), R"(
+Destroy the ralloc pool handle, all local memory of the entry is released with it.)")
+        .def("get_mem_size_by_rank", &RallocPool::GetMemSizeByRank, py::call_guard<py::gil_scoped_release>(),
+             py::arg("rank"), R"(
+Get the current committed size of one rank's slot, a snapshot of the local imported state.
+
+Arguments:
+    rank(int): rank id of the slot
+Returns:
+    committed size in byte, 0 if the rank is invalid or has no imported block)")
+        .def("get_mem_ptr_by_rank", &RallocPool::GetMemPtrByRank, py::call_guard<py::gil_scoped_release>(),
+             py::arg("rank"), R"(
+Get slot base address of one rank, paired with get_mem_size_by_rank.
+
+Arguments:
+    rank(int): rank id of the slot
+Returns:
+    slot base address, 0 if failed)")
+        .def("get_group_ranks", &RallocPool::GetGroupRanks, py::call_guard<py::gil_scoped_release>(), R"(
+Get the ranks currently in the pool's dynamic group, a snapshot including the local rank.
+Members joined before the event handler registration are only discoverable this way.
+
+Returns:
+    list[int]: member rank ids)")
+        .def("set_group_event_handler", &RallocPool::SetGroupEventHandler,
+             py::call_guard<py::gil_scoped_release>(), py::arg("cb"), R"(
+Set group member change(join/leave) notification function. Events fired after registration
+only, query existing members by get_group_ranks.
+
+Arguments:
+    cb(function): notification function. cb(rank_id: int, event: RallocGroupEvent).)");
+}
 } // namespace
 
 PYBIND11_MODULE(_pymf_hybrid, m)
@@ -843,12 +1159,16 @@ PYBIND11_MODULE(_pymf_hybrid, m)
 
     auto shm = m.def_submodule("shm", "Share Memory Module.");
     auto bm = m.def_submodule("bm", "Big Memory Module.");
+    auto ralloc = m.def_submodule("ralloc", "Remote Allocation Memory Module.");
 
     DefineShmConfig(shm);
     DefineShmClass(shm);
 
     DefineBmConfig(bm);
     DefineBmClass(bm);
+
+    DefineRallocConfig(ralloc);
+    DefineRallocClass(ralloc);
 }
 
 #pragma GCC diagnostic pop

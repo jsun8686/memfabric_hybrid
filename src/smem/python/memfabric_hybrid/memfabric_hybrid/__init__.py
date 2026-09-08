@@ -42,6 +42,7 @@ from _pymf_transfer import (
 from _pymf_hybrid import (
     bm,
     shm,
+    ralloc,
     initialize,
     uninitialize,
     set_log_level,
@@ -58,6 +59,7 @@ __all__ = [
     'create_config_store',
     'bm',
     'shm',
+    'ralloc',
     'initialize',
     'uninitialize',
     'set_log_level',

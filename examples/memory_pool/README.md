@@ -4,7 +4,7 @@
 
 ## 目录分层
 - 01_basic：单机单卡最小闭环与基础池类型（DRAM/HBM）
-- 02_scale_out：单机多卡与多机多卡扩展
+- 02_scale_out：单机多卡与多机多卡扩展（含 ralloc 远端内存获取：单机多进程/多机）
 - 03_optimization：内存注册、批量拷贝与 device_sdma 协议性能对比
 - 04_features：特性开关类最小样例（先放 unified address space）
 - 05_observability：观测体系设计（Prometheus + Grafana）
@@ -17,13 +17,15 @@
 5. 01_basic/05_no_xpu_host_urma_dram_pool
 6. 02_scale_out/01_single_node_multi_device_dram
 7. 02_scale_out/02_multi_node_multi_device_dram
-8. 03_optimization/01_copy_data_batch
-9. 03_optimization/02_register
-10. 03_optimization/03_device_sdma
-11. 04_features/01_enable_unified_address_space
-12. 05_observability/01_prometheus_grafana
-13. 05_observability/02_opentelemetry
-14. 05_observability/03_dashboards
+8. 02_scale_out/03_single_node_multi_process_ralloc
+9. 02_scale_out/04_multi_node_ralloc
+10. 03_optimization/01_copy_data_batch
+11. 03_optimization/02_register
+12. 03_optimization/03_device_sdma
+13. 04_features/01_enable_unified_address_space
+14. 05_observability/01_prometheus_grafana
+15. 05_observability/02_opentelemetry
+16. 05_observability/03_dashboards
 
 ## 统一约束
 - 所有样例仅使用内存池接口。
