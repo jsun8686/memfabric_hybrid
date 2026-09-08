@@ -262,8 +262,7 @@ Result SmemRallocRpcService::EnsureClient(const SmemRallocRpcEndpoint &remote, s
     client->RegisterLinkBrokenHandler([this, key](const acc::AccTcpLinkComplexPtr &l) {
         SM_LOG_WARN("rpc client link broken, remote: " << key << " linkId: " << l->Id());
         FailPendingByKey(key);
-        std::lock_guard<std::mutex> guard(clientMutex_);
-        clients_.erase(key);
+
         return SM_OK;
     });
 
