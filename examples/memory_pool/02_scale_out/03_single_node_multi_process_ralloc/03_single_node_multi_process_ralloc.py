@@ -64,7 +64,8 @@ def _near_main(sync: mp.Barrier):
         assert handle.get_group_ranks() == [RANK_NEAR, RANK_FAR], "group ranks"
         assert handle.get_mem_size_by_rank(RANK_FAR) >= EXTEND_REMOTE_BYTES, "far slot size"
         slot_base = handle.get_mem_ptr_by_rank(RANK_FAR)
-        assert slot_base != 0 and slot_base < gva_remote < slot_base + ONE_GIB, "gva outside far slot"
+        assert slot_base != 0 and slot_base <= gva_remote < slot_base + ONE_GIB, \
+            f"gva outside far slot: base=0x{slot_base:x} gva=0x{gva_remote:x}"
 
         src = torch.arange(COPY_BYTES // 4, dtype=torch.int32).contiguous()
         assert handle.copy_data(src.data_ptr(), gva_remote, COPY_BYTES, 0) == 0, "H2G into far slot"
