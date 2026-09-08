@@ -24,12 +24,27 @@ COPY_BYTES = 4 * 1024 * 1024  # 4MB int32 payload
 STORE_URL = "tcp://127.0.0.1:8572"
 WORLD_SIZE = 2
 
-RANK_NEAR, DEVICE_ID = 0, 0
-RANK_FAR = 1
+RANK_FAR, DEVICE_ID = 0, 0
+RANK_NEAR = 1
+
+
+def _wait_for_store(timeout_sec=60.0):
+    """NEAR needs the FAR-hosted store (and its master key) before ralloc.initialize."""
+    import socket
+    import time
+
+    host, port = STORE_URL.split("://", 1)[1].rsplit(":", 1)
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        with socket.socket() as s:
+            if s.connect_ex((host, int(port))) == 0:
+                return
+        time.sleep(0.5)
+    raise RuntimeError(f"config store not reachable within {timeout_sec}s: {STORE_URL}")
 
 
 def _near_main(sync: mp.Barrier):
-    mf.set_log_level(1)
+    mf.set_log_level(3)
     assert mf.initialize() == 0, "mf.initialize failed"
     ralloc_inited = False
     try:
@@ -37,13 +52,14 @@ def _near_main(sync: mp.Barrier):
         cfg.rank_id = RANK_NEAR
         cfg.auto_ranking = False
         cfg.role = ralloc.RallocRole.NEAR
-        cfg.start_store = True  # NEAR hosts the store; master service runs in this process
+        cfg.start_store = False  # FAR (rank 0) hosts the store and the master service
         cfg.set_nic("tcp://127.0.0.1:10005")
+        _wait_for_store()  # master discovery inside initialize needs the FAR-hosted store
         assert ralloc.initialize(STORE_URL, WORLD_SIZE, DEVICE_ID, cfg) == 0, "ralloc.initialize failed"
         ralloc_inited = True
         print(f"[rank {RANK_NEAR}] ralloc initialized (NEAR, store={STORE_URL})", flush=True)
 
-        sync.wait()  # (1/5) FAR candidate REGISTER must land before PLACEMENT
+        sync.wait()  # (1/5) both sides initialized; the store-host master seeded itself already
         handle = ralloc.create(
             id=0,
             max_dram_size=ONE_GIB,
@@ -61,7 +77,7 @@ def _near_main(sync: mp.Barrier):
         ret, info = handle.extend_remote_mem(ralloc.RallocMemType.HOST, EXTEND_REMOTE_BYTES)
         assert ret == 0 and info["rank_id"] == RANK_FAR and info["gva"] != 0, f"extend_remote_mem: {ret} {info}"
         gva_remote = info["gva"]
-        assert handle.get_group_ranks() == [RANK_NEAR, RANK_FAR], "group ranks"
+        assert sorted(handle.get_group_ranks()) == sorted([RANK_NEAR, RANK_FAR]), "group ranks"
         assert handle.get_mem_size_by_rank(RANK_FAR) >= EXTEND_REMOTE_BYTES, "far slot size"
         slot_base = handle.get_mem_ptr_by_rank(RANK_FAR)
         assert slot_base != 0 and slot_base <= gva_remote < slot_base + ONE_GIB, \
@@ -90,7 +106,7 @@ def _near_main(sync: mp.Barrier):
 
 
 def _far_main(sync: mp.Barrier):
-    mf.set_log_level(1)
+    mf.set_log_level(3)
     assert mf.initialize() == 0, "mf.initialize failed"
     ralloc_inited = False
     try:
@@ -98,13 +114,13 @@ def _far_main(sync: mp.Barrier):
         cfg.rank_id = RANK_FAR
         cfg.auto_ranking = False
         cfg.role = ralloc.RallocRole.FAR
-        cfg.start_store = False
+        cfg.start_store = True  # rank 0 hosts the store; master seeds itself, loopback accounting
         cfg.set_nic("tcp://127.0.0.1:10005")
         assert ralloc.initialize(STORE_URL, WORLD_SIZE, DEVICE_ID, cfg) == 0, "ralloc.initialize failed"
         ralloc_inited = True
-        print(f"[rank {RANK_FAR}] ralloc initialized (FAR contributor, executor passive)", flush=True)
+        print(f"[rank {RANK_FAR}] ralloc initialized (FAR: store host + master + contributor)", flush=True)
 
-        sync.wait()  # candidate registered, NEAR may start PLACEMENT now
+        sync.wait()  # master seeded itself as candidate, NEAR may start PLACEMENT now
         sync.wait()  # stay alive while the NEAR side runs its phases
         sync.wait()  # leave events settled, then tear down
         assert mf.get_last_err_msg() == "", mf.get_last_err_msg()
