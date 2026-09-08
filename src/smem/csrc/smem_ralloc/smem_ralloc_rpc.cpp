@@ -53,6 +53,19 @@ Result SmemRallocRpcService::Start(const SmemRallocRpcEndpoint &localEp, const s
     server_->RegisterNewRequestHandler(
         SMEMRA_RPC_MSG_TYPE, [this](const acc::AccTcpRequestContext &ctx) { return OnRequest(ctx); });
 
+    server_->RegisterNewLinkHandler(
+        [](const acc::AccConnReq &req, const acc::AccTcpLinkComplexPtr &) {
+            (void)req;
+            return SM_OK;
+        });
+
+    server_->RegisterLinkBrokenHandler([](const acc::AccTcpLinkComplexPtr &link) {
+        if (link != nullptr) {
+            SM_LOG_INFO("ralloc rpc server link broken, linkId: " << link->Id());
+        }
+        return SM_OK;
+    });
+
     acc::AccTcpServerOptions opt;
     opt.enableListener = true;
     opt.listenIp = localEp_.ip;
@@ -233,6 +246,14 @@ Result SmemRallocRpcService::EnsureClient(const SmemRallocRpcEndpoint &remote, s
     client->RegisterNewRequestHandler(
         SMEMRA_RPC_MSG_TYPE, [this](const acc::AccTcpRequestContext &ctx) { return OnResponse(ctx); });
 
+    client->RegisterLinkBrokenHandler([this, key](const acc::AccTcpLinkComplexPtr &l) {
+        SM_LOG_WARN("rpc client link broken, remote: " << key << " linkId: " << l->Id());
+        FailPendingByKey(key);
+        std::lock_guard<std::mutex> guard(clientMutex_);
+        clients_.erase(key);
+        return SM_OK;
+    });
+
     acc::AccTcpServerOptions opt; /* enableListener is false by default, client mode */
     opt.linkSendQueueSize = acc::UNO_48;
     auto ret = client->Start(opt, TransTlsOption());
@@ -251,13 +272,6 @@ Result SmemRallocRpcService::EnsureClient(const SmemRallocRpcEndpoint &remote, s
         client->Stop();
         return ret != SM_OK ? ret : SM_NOT_CONNECTED;
     }
-    client->RegisterLinkBrokenHandler([this, key](const acc::AccTcpLinkComplexPtr &l) {
-        SM_LOG_WARN("rpc client link broken, remote: " << key << " linkId: " << l->Id());
-        FailPendingByKey(key);
-        std::lock_guard<std::mutex> guard(clientMutex_);
-        clients_.erase(key);
-        return SM_OK;
-    });
 
     ClientEntry entry{client, link};
     clients_.emplace(key, entry);
