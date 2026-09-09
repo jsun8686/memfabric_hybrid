@@ -108,7 +108,6 @@ Result SmemRallocExecutor::OnJoinAlloc(SmemRallocRpcMsg &msg)
     options.maxHBMSize = msg.maxHbmSize;
     options.maxDRAMSize = msg.maxDramSize;
     /* X commits the initial block of the requested media, the other window stays reserved-only */
-    const bool deviceMedia = msg.memType == SMEM_RALLOC_MEM_TYPE_DEVICE;
     options.deviceVASpace = deviceMedia ? msg.size : 0;
     options.hostVASpace = deviceMedia ? 0 : msg.size;
     options.role = HYBM_ROLE_PEER;

@@ -464,7 +464,7 @@ Result SmemRallocEntry::ExtendLocalMem(smem_ralloc_mem_type_t memType, uint64_t 
     SM_ASSERT_RETURN(size % SMEM_RALLOC_SIZE_ALIGNMENT == 0, SM_INVALID_PARAM);
     const bool deviceMedia = memType == SMEM_RALLOC_MEM_TYPE_DEVICE;
     SM_ASSERT_RETURN(deviceMedia ? (coreOptions_.maxHBMSize > 0) : (coreOptions_.maxDRAMSize > 0),
-        "extend on a media whose window is not reserved by create", SM_NOT_SUPPORTED);
+        SM_NOT_SUPPORTED);
     const auto hybmMemType = deviceMedia ? HYBM_MEM_TYPE_DEVICE : HYBM_MEM_TYPE_HOST;
     std::lock_guard<std::mutex> lock(mutex_);
     // 1.alloc slice
