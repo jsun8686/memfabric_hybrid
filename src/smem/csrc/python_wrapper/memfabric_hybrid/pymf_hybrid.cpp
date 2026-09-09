@@ -1083,7 +1083,7 @@ Returns:
 
     m.def("create", &RallocPool::CreateFlexible, py::arg("id"),
           py::arg("max_dram_size"), py::arg("max_hbm_size") = 0,
-          py::arg("data_op_type") = py::int_(SMEMRA_DATA_OP_HOST_RDMA), py::arg("enable_56bits_gva") = false,
+          py::arg("data_op_type") = static_cast<uint32_t>(SMEMRA_DATA_OP_HOST_RDMA), py::arg("enable_56bits_gva") = false,
           py::arg("flags") = 0, R"(
 Create a ralloc pool on a NEAR role node after initialized. Pure alignment: the window is
 reserved and the dynamic group is joined, no local memory is committed by create itself.
