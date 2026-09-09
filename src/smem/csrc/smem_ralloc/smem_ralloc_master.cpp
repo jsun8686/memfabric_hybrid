@@ -94,6 +94,7 @@ Result SmemRallocMasterService::OnRegister(SmemRallocRpcMsg &msg)
         Candidate candidate{};
         candidate.ep = ep;
         candidate.committedBytes = msg.size;
+        candidate.deviceCommittedBytes = msg.deviceCommittedBytes;
         auto it = candidates_.find(msg.nodeRank);
         if (it != candidates_.end()) {
             it->second = candidate;
@@ -103,27 +104,32 @@ Result SmemRallocMasterService::OnRegister(SmemRallocRpcMsg &msg)
     }
 
     SM_LOG_INFO("candidate registered, rank: " << msg.nodeRank << " endpoint: " << msg.nodeIp << ":"
-                                                << msg.nodePort << " committed: " << msg.size);
+                                                << msg.nodePort << " committed: " << msg.size
+                                                << " deviceCommitted: " << msg.deviceCommittedBytes);
     return SM_OK;
 }
 
 Result SmemRallocMasterService::OnPlacement(SmemRallocRpcMsg &msg)
 {
     SM_VALIDATE_RETURN(msg.size != 0, "placement size is 0", SM_INVALID_PARAM);
+    SM_VALIDATE_RETURN(msg.memType == SMEM_RALLOC_MEM_TYPE_HOST || msg.memType == SMEM_RALLOC_MEM_TYPE_DEVICE,
+        "placement with invalid mem type", SM_INVALID_PARAM);
 
     {
         std::lock_guard<std::mutex> guard(mutex_);
-        /* pick the least committed candidate (last reported value), never place on the
-         * requester itself; accounting is overwrite-style, no optimistic add here */
+        /* pick the least committed candidate of the requested media (last reported value), never
+         * place on the requester itself; accounting is overwrite-style, no optimistic add here */
+        const bool deviceMedia = msg.memType == SMEM_RALLOC_MEM_TYPE_DEVICE;
         uint32_t chosen = SMEM_RALLOC_INVALID_RANK;
         uint64_t chosenLoad = UINT64_MAX;
         for (auto &it : candidates_) {
             if (it.first == msg.reqRank) {
                 continue;
             }
-            if (it.second.committedBytes < chosenLoad) {
+            auto load = deviceMedia ? it.second.deviceCommittedBytes : it.second.committedBytes;
+            if (load < chosenLoad) {
                 chosen = it.first;
-                chosenLoad = it.second.committedBytes;
+                chosenLoad = load;
             }
         }
         if (chosen == SMEM_RALLOC_INVALID_RANK) {
@@ -138,7 +144,8 @@ Result SmemRallocMasterService::OnPlacement(SmemRallocRpcMsg &msg)
         (void)strncpy(msg.nodeIp, it->second.ep.ip, sizeof(msg.nodeIp) - 1);
     }
 
-    SM_LOG_INFO("placement granted, requester: " << msg.reqRank << " size: " << msg.size << " -> rank: "
+    SM_LOG_INFO("placement granted, requester: " << msg.reqRank << " memType: " << msg.memType
+                                                 << " size: " << msg.size << " -> rank: "
                                                  << msg.nodeRank << " endpoint: " << msg.nodeIp << ":"
                                                  << msg.nodePort);
     return SM_OK;

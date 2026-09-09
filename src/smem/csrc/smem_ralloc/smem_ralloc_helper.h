@@ -22,6 +22,20 @@ namespace ock {
 namespace smem {
 class SmemRallocHelper {
 public:
+    /* mirrors SmemHybmHelper::TransHybmMemType: window presence decides the media bits */
+    static inline hybm_mem_type TransHybmMemType(uint64_t maxDramSize, uint64_t maxHbmSize)
+    {
+        uint32_t resultMemType = 0;
+        if (maxDramSize > 0) {
+            resultMemType |= HYBM_MEM_TYPE_HOST;
+        }
+        if (maxHbmSize > 0) {
+            resultMemType |= HYBM_MEM_TYPE_DEVICE;
+        }
+
+        return static_cast<hybm_mem_type>(resultMemType);
+    }
+
     static inline hybm_data_op_type TransHybmDataOpType(smem_ralloc_data_op_type smemRallocDataOpType)
     {
         uint32_t resultOpType = 0;

@@ -73,6 +73,24 @@ int32_t SmemRallocEntry::Initialize(const hybm_options &options)
             sliceInfos_.push_back(dramSliceInfo);
         }
 
+        hybm_exchange_info deviceSliceInfo{};
+        if (options.maxHBMSize > 0 && options.deviceVASpace > 0) {
+            slice = hybm_alloc_local_memory(entity, HYBM_MEM_TYPE_DEVICE, options.deviceVASpace, flags);
+            if (slice == nullptr) {
+                SM_LOG_ERROR("alloc local device mem failed, size: " << options.deviceVASpace);
+                ret = SM_ERROR;
+                break;
+            }
+            slices_.push_back(slice);
+
+            ret = hybm_export(entity, slice, flags, &deviceSliceInfo);
+            if (ret != 0) {
+                SM_LOG_ERROR("hybm export device slice failed, result: " << ret);
+                break;
+            }
+            sliceInfos_.push_back(deviceSliceInfo);
+        }
+
         bzero(&entityInfo_, sizeof(hybm_exchange_info));
         ret = hybm_export(entity, nullptr, HYBM_FLAG_EXPORT_ENTITY, &entityInfo_);
         if (ret != 0) {
@@ -89,7 +107,9 @@ int32_t SmemRallocEntry::Initialize(const hybm_options &options)
 
     coreOptions_ = options;
     hostGva_ = hybm_get_memory_ptr(entity, HYBM_MEM_TYPE_HOST);
+    deviceGva_ = hybm_get_memory_ptr(entity, HYBM_MEM_TYPE_DEVICE);
     committedBytes_.store(options.hostVASpace);
+    deviceCommittedBytes_.store(options.deviceVASpace);
     inited_ = true;
     return 0;
 }
@@ -124,7 +144,9 @@ void SmemRallocEntry::UnInitialize()
     hybm_destroy_entity(entity_, flags);
     entity_ = nullptr;
     hostGva_ = nullptr;
+    deviceGva_ = nullptr;
     committedBytes_.store(0);
+    deviceCommittedBytes_.store(0);
     poolEmptySinceUs_.store(0);
     inited_ = false;
 }
@@ -436,21 +458,27 @@ Result SmemRallocEntry::Join(uint32_t flags)
 Result SmemRallocEntry::ExtendLocalMem(smem_ralloc_mem_type_t memType, uint64_t size, smem_ralloc_mem_info_t *info)
 {
     SM_ASSERT_RETURN(inited_, SM_NOT_INITIALIZED);
-    SM_ASSERT_RETURN(memType == SMEM_RALLOC_MEM_TYPE_HOST, SM_NOT_SUPPORTED);
+    SM_ASSERT_RETURN(memType == SMEM_RALLOC_MEM_TYPE_HOST || memType == SMEM_RALLOC_MEM_TYPE_DEVICE,
+        SM_NOT_SUPPORTED);
     SM_ASSERT_RETURN(size > 0, SM_INVALID_PARAM);
     SM_ASSERT_RETURN(size % SMEM_RALLOC_SIZE_ALIGNMENT == 0, SM_INVALID_PARAM);
+    const bool deviceMedia = memType == SMEM_RALLOC_MEM_TYPE_DEVICE;
+    SM_ASSERT_RETURN(deviceMedia ? (coreOptions_.maxHBMSize > 0) : (coreOptions_.maxDRAMSize > 0),
+        "extend on a media whose window is not reserved by create", SM_NOT_SUPPORTED);
+    const auto hybmMemType = deviceMedia ? HYBM_MEM_TYPE_DEVICE : HYBM_MEM_TYPE_HOST;
     std::lock_guard<std::mutex> lock(mutex_);
     // 1.alloc slice
-    auto slice = hybm_alloc_local_memory(entity_, HYBM_MEM_TYPE_HOST, size, 0);
+    auto slice = hybm_alloc_local_memory(entity_, hybmMemType, size, 0);
     if (slice == nullptr) {
-        SM_LOG_ERROR("Failed to alloc memory, memType:host size:" << size);
+        SM_LOG_ERROR("Failed to alloc memory, memType:" << (deviceMedia ? "device" : "host") << " size:" << size);
         return SM_ERROR;
     }
     // 2.export slice
     hybm_exchange_info sliceInfo{};
     auto ret = hybm_export(entity_, slice, 0, &sliceInfo);
     if (ret != 0) {
-        SM_LOG_ERROR("Failed to export slice:" << slice << " memType:host size:" << size);
+        SM_LOG_ERROR("Failed to export slice:" << slice << " memType:" << (deviceMedia ? "device" : "host")
+                                               << " size:" << size);
         hybm_free_local_memory(entity_, slice, 1, 0);
         return ret;
     }
@@ -471,12 +499,17 @@ Result SmemRallocEntry::ExtendLocalMem(smem_ralloc_mem_type_t memType, uint64_t 
             SM_LOG_ERROR("Failed to get slice va, slice:" << slice);
             return SM_ERROR;
         }
-        committedBytes_.fetch_add(size);
+        if (deviceMedia) {
+            deviceCommittedBytes_.fetch_add(size);
+        } else {
+            committedBytes_.fetch_add(size);
+        }
         if (info != nullptr) {
             info->rankId = options_.rank;
             info->gva = newGva;
         }
-        SM_LOG_INFO("extend local mem ok, rank: " << options_.rank << " gva: " << newGva << " size: " << size);
+        SM_LOG_INFO("extend local mem ok, rank: " << options_.rank << " memType: " << memType
+                                                  << " gva: " << newGva << " size: " << size);
         return SM_OK;
     }
     SM_LOG_ERROR("group update timeout. rank:" << options_.rank);
@@ -509,17 +542,19 @@ Result SmemRallocEntry::GetLocalMemInfo(smem_ralloc_mem_info_t *info)
     return SM_OK;
 }
 
-uint64_t SmemRallocEntry::GetMemSizeByRank(uint32_t rank)
+uint64_t SmemRallocEntry::GetMemSizeByRank(uint32_t rank, smem_ralloc_mem_type_t memType)
 {
     SM_ASSERT_RETURN(inited_, 0);
-    if (rank >= coreOptions_.rankCount || hostGva_ == nullptr) {
+    const bool deviceMedia = memType == SMEM_RALLOC_MEM_TYPE_DEVICE;
+    auto base = reinterpret_cast<uint64_t>(deviceMedia ? deviceGva_ : hostGva_);
+    auto slotSize = deviceMedia ? coreOptions_.maxHBMSize : coreOptions_.maxDRAMSize;
+    if (rank >= coreOptions_.rankCount || base == 0 || slotSize == 0) {
         return 0;
     }
-    /* hostGva_ is the window base (the rank0 slot base, identical in every process view),
-     * slot of rank r spans [hostGva_ + r * maxDRAMSize, +maxDRAMSize), same as GetMemPtrByRank */
-    auto slotBase = reinterpret_cast<uint64_t>(hostGva_) +
-                    static_cast<uint64_t>(rank) * coreOptions_.maxDRAMSize;
-    auto slotEnd = slotBase + coreOptions_.maxDRAMSize;
+    /* the window base is the rank0 slot base, identical in every process view, slot of rank r
+     * spans [base + r * slotSize, +slotSize), same as GetMemPtrByRank */
+    auto slotBase = base + static_cast<uint64_t>(rank) * slotSize;
+    auto slotEnd = slotBase + slotSize;
 
     uint32_t count = 0;
     std::vector<hybm_va_range> ranges;
@@ -549,12 +584,15 @@ uint64_t SmemRallocEntry::GetMemSizeByRank(uint32_t rank)
     return extent;
 }
 
-void *SmemRallocEntry::GetMemPtrByRank(uint32_t rank)
+void *SmemRallocEntry::GetMemPtrByRank(uint32_t rank, smem_ralloc_mem_type_t memType)
 {
-    if (!inited_ || hostGva_ == nullptr || rank >= coreOptions_.rankCount) {
+    const bool deviceMedia = memType == SMEM_RALLOC_MEM_TYPE_DEVICE;
+    auto base = deviceMedia ? deviceGva_ : hostGva_;
+    auto slotSize = deviceMedia ? coreOptions_.maxHBMSize : coreOptions_.maxDRAMSize;
+    if (!inited_ || base == nullptr || slotSize == 0 || rank >= coreOptions_.rankCount) {
         return nullptr;
     }
-    return static_cast<char *>(hostGva_) + static_cast<uint64_t>(rank) * coreOptions_.maxDRAMSize;
+    return static_cast<char *>(base) + static_cast<uint64_t>(rank) * slotSize;
 }
 
 std::vector<uint32_t> SmemRallocEntry::GetGroupRanks()
@@ -601,6 +639,9 @@ uint32_t SmemRallocEntry::GetRankIdByGva(void *gva)
     if (AddrInHostGva(gva, 1UL)) {
         return ((uint64_t)gva - (uint64_t)hostGva_) / coreOptions_.maxDRAMSize;
     }
+    if (AddrInDeviceGva(gva, 1UL)) {
+        return ((uint64_t)gva - (uint64_t)deviceGva_) / coreOptions_.maxHBMSize;
+    }
     return UINT32_MAX;
 }
 
@@ -637,6 +678,23 @@ bool SmemRallocEntry::AddrInHostGva(const void *address, uint64_t size)
     }
 
     if ((const uint8_t *)address < (const uint8_t *)hostGva_) {
+        return false;
+    }
+
+    return true;
+}
+bool SmemRallocEntry::AddrInDeviceGva(const void *address, uint64_t size)
+{
+    if (deviceGva_ == nullptr) {
+        return false;
+    }
+
+    auto totalSize = coreOptions_.maxHBMSize * coreOptions_.rankCount;
+    if ((const uint8_t *)address + size > (const uint8_t *)deviceGva_ + totalSize) {
+        return false;
+    }
+
+    if ((const uint8_t *)address < (const uint8_t *)deviceGva_) {
         return false;
     }
 

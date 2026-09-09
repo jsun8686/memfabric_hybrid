@@ -69,18 +69,21 @@ public:
     Result GetLocalMemInfo(smem_ralloc_mem_info_t *info);
 
     /* current committed size of one rank's slot, snapshot of local imported state, 0 if empty */
-    uint64_t GetMemSizeByRank(uint32_t rank);
+    uint64_t GetMemSizeByRank(uint32_t rank, smem_ralloc_mem_type_t memType = SMEM_RALLOC_MEM_TYPE_HOST);
 
-    /* slot base address of one rank, null if invalid */
-    void *GetMemPtrByRank(uint32_t rank);
+    /* slot base address of one rank on the requested media window, null if invalid */
+    void *GetMemPtrByRank(uint32_t rank, smem_ralloc_mem_type_t memType = SMEM_RALLOC_MEM_TYPE_HOST);
 
     /* snapshot of the ranks currently in the dynamic group, includes self, empty if not joined */
     std::vector<uint32_t> GetGroupRanks();
 
     smem_ralloc_role_t GetRole() const;
 
-    /* total committed bytes of the local slot, authoritative value for master accounting */
+    /* total committed bytes of the local HOST slot, authoritative value for master accounting */
     uint64_t GetCommittedBytes() const;
+
+    /* total committed bytes of the local DEVICE slot, authoritative value for master accounting */
+    uint64_t GetDeviceCommittedBytes() const;
 
     /* true when a FAR entry has been marked pool-empty (no NEAR member left) for longer
      * than graceSec, ready for self teardown by the manager reaper */
@@ -88,6 +91,8 @@ public:
 
 private:
     bool AddrInHostGva(const void *address, uint64_t size);
+
+    bool AddrInDeviceGva(const void *address, uint64_t size);
 
     Result CheckJoined() const;
 
@@ -110,6 +115,7 @@ private:
     SmemGroupEnginePtr globalGroup_ = nullptr;
     hybm_entity_t entity_ = nullptr;
     void *hostGva_ = nullptr;
+    void *deviceGva_ = nullptr; /* device/HBM window base, null when the pool has no HBM window */
 
     /* non-hot used variables */
     SmemRallocEntryOptions options_;
@@ -128,6 +134,7 @@ private:
     std::map<uint32_t, smem_ralloc_role_t> memberRoles_;
     std::atomic<uint64_t> poolEmptySinceUs_{0};
     std::atomic<uint64_t> committedBytes_{0};
+    std::atomic<uint64_t> deviceCommittedBytes_{0};
 };
 using SmemRallocEntryPtr = SmRef<SmemRallocEntry>;
 
@@ -154,6 +161,11 @@ inline smem_ralloc_role_t SmemRallocEntry::GetRole() const
 inline uint64_t SmemRallocEntry::GetCommittedBytes() const
 {
     return committedBytes_.load();
+}
+
+inline uint64_t SmemRallocEntry::GetDeviceCommittedBytes() const
+{
+    return deviceCommittedBytes_.load();
 }
 
 } // namespace smem

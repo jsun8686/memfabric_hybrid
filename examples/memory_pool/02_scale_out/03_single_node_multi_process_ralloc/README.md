@@ -12,7 +12,7 @@ copy_data AUTO 方向往返 → 二次远端获取（executor extend 分支 + LB
 
 ## 使用能力
 `ralloc.initialize / create / extend_local_mem / extend_remote_mem / get_group_ranks /
-get_mem_size_by_rank / get_mem_ptr_by_rank / copy_data / destroy`。
+get_mem_size_by_rank / get_mem_ptr_by_rank / copy_data / wait(仅 device) / destroy`。
 
 ## 规模建议
 - 2 进程（worldSize=2），每 rank 窗槽 1GiB（仅 VA 预留）。
@@ -20,7 +20,8 @@ get_mem_size_by_rank / get_mem_ptr_by_rank / copy_data / destroy`。
 
 ## 必要条件
 - 已安装 memfabric_hybrid whl（含 ralloc 子模块）。
-- data_op_type=HOST_TCP：单机进程间走本地 TCP 路径，无需 NPU/RDMA；有 RDMA 环境可改 HOST_RDMA。
+- host 模式（默认）data_op_type=HOST_TCP：单机进程间走本地 TCP 路径，无需 NPU/RDMA；有 RDMA 环境可改 HOST_RDMA。
+- device 模式 data_op_type=SDMA|DEVICE_RDMA：需 NPU+CANN（ASCEND_NPU 构建）环境。
 
 ## 验收标准
 - 输出 5/5 检查点全部通过，两子进程 exitcode=0。
@@ -29,5 +30,6 @@ get_mem_size_by_rank / get_mem_ptr_by_rank / copy_data / destroy`。
 
 ## 运行
 ```bash
-python3 03_single_node_multi_process_ralloc.py
+python3 03_single_node_multi_process_ralloc.py           # host 介质（默认）
+python3 03_single_node_multi_process_ralloc.py device    # HBM 介质（需 NPU+CANN，异步 SDMA 拷贝经 wait 收敛）
 ```

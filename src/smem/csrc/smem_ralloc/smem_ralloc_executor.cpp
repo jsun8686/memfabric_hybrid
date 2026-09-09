@@ -40,13 +40,21 @@ Result SmemRallocExecutor::OnJoinAlloc(SmemRallocRpcMsg &msg)
     SM_VALIDATE_RETURN(msg.size != 0, "join alloc size is 0", SM_INVALID_PARAM);
     SM_VALIDATE_RETURN(msg.size % SMEM_RALLOC_SIZE_ALIGNMENT == 0, "join alloc size is not 2M aligned",
                        SM_INVALID_PARAM);
-    SM_VALIDATE_RETURN(msg.maxDramSize != 0, "join alloc maxDramSize is 0", SM_INVALID_PARAM);
-    SM_VALIDATE_RETURN(msg.size <= msg.maxDramSize, "join alloc size exceeds maxDramSize", SM_INVALID_PARAM);
-    SM_VALIDATE_RETURN(msg.size <= SMEM_LOCAL_DRAM_SIZE_MAX, "join alloc size exceeds local dram max",
-                       SM_INVALID_PARAM);
+    const bool deviceMedia = msg.memType == static_cast<uint32_t>(SMEM_RALLOC_MEM_TYPE_DEVICE);
+    if (deviceMedia) {
+        SM_VALIDATE_RETURN(msg.maxHbmSize != 0, "join alloc maxHbmSize is 0", SM_INVALID_PARAM);
+        SM_VALIDATE_RETURN(msg.size <= msg.maxHbmSize, "join alloc size exceeds maxHbmSize", SM_INVALID_PARAM);
+        SM_VALIDATE_RETURN(msg.size <= SMEM_LOCAL_HBM_SIZE_MAX, "join alloc size exceeds local hbm max",
+                           SM_INVALID_PARAM);
+    } else {
+        SM_VALIDATE_RETURN(msg.memType == static_cast<uint32_t>(SMEM_RALLOC_MEM_TYPE_HOST),
+                           "join alloc mem type is neither HOST nor DEVICE", SM_NOT_SUPPORTED);
+        SM_VALIDATE_RETURN(msg.maxDramSize != 0, "join alloc maxDramSize is 0", SM_INVALID_PARAM);
+        SM_VALIDATE_RETURN(msg.size <= msg.maxDramSize, "join alloc size exceeds maxDramSize", SM_INVALID_PARAM);
+        SM_VALIDATE_RETURN(msg.size <= SMEM_LOCAL_DRAM_SIZE_MAX, "join alloc size exceeds local dram max",
+                           SM_INVALID_PARAM);
+    }
     SM_VALIDATE_RETURN(msg.dataOpType != 0, "join alloc dataOpType is 0", SM_INVALID_PARAM);
-    SM_VALIDATE_RETURN(msg.memType == static_cast<uint32_t>(SMEM_RALLOC_MEM_TYPE_HOST),
-                       "join alloc mem type is not HOST", SM_NOT_SUPPORTED);
 
     auto &manager = SmemRallocEntryManager::Instance();
     if (manager.GetConfig().role != SMEM_RALLOC_ROLE_FAR) {
@@ -58,7 +66,7 @@ Result SmemRallocExecutor::OnJoinAlloc(SmemRallocRpcMsg &msg)
     SmemRallocEntryPtr existEntry;
     if (manager.GetEntryById(msg.poolId, existEntry) == SM_OK && existEntry != nullptr) {
         smem_ralloc_mem_info_t info{};
-        auto extRet = existEntry->ExtendLocalMem(SMEM_RALLOC_MEM_TYPE_HOST, msg.size, &info);
+        auto extRet = existEntry->ExtendLocalMem(static_cast<smem_ralloc_mem_type_t>(msg.memType), msg.size, &info);
         if (extRet != SM_OK) {
             SM_LOG_ERROR("join alloc extend failed, pool: " << msg.poolId << " ret: " << extRet);
             return extRet;
@@ -84,7 +92,7 @@ Result SmemRallocExecutor::OnJoinAlloc(SmemRallocRpcMsg &msg)
 
     hybm_options options{};
     options.bmType = HYBM_TYPE_HOST_INITIATE;
-    options.memType = HYBM_MEM_TYPE_HOST;
+    options.memType = SmemRallocHelper::TransHybmMemType(msg.maxDramSize, msg.maxHbmSize);
     options.bmDataOpType = SmemRallocHelper::TransHybmDataOpType(
         static_cast<smem_ralloc_data_op_type>(msg.dataOpType));
 #if !defined(ASCEND_NPU)
@@ -97,10 +105,12 @@ Result SmemRallocExecutor::OnJoinAlloc(SmemRallocRpcMsg &msg)
     options.rankCount = manager.GetWorldSize();
     options.rankId = manager.GetRankId();
     options.devId = manager.GetDeviceId();
-    options.maxHBMSize = 0;
+    options.maxHBMSize = msg.maxHbmSize;
     options.maxDRAMSize = msg.maxDramSize;
-    options.deviceVASpace = 0;
-    options.hostVASpace = msg.size; /* X commits the initial block size */
+    /* X commits the initial block of the requested media, the other window stays reserved-only */
+    const bool deviceMedia = msg.memType == SMEM_RALLOC_MEM_TYPE_DEVICE;
+    options.deviceVASpace = deviceMedia ? msg.size : 0;
+    options.hostVASpace = deviceMedia ? 0 : msg.size;
     options.role = HYBM_ROLE_PEER;
     options.flags = msg.flags;
     options.enable56BitsGva = msg.enable56BitsGva;

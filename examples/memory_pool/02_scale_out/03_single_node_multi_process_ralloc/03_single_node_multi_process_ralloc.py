@@ -10,6 +10,7 @@
 # MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
 # See the Mulan PSL v2 for more details.
 import multiprocessing as mp
+import sys
 
 import torch
 
@@ -28,6 +29,15 @@ RANK_FAR, DEVICE_ID = 0, 0
 RANK_NEAR = 1
 
 
+def _media_config(media):
+    """host (default): HOST media via HOST_RDMA; device: HBM media via SDMA|DEVICE_RDMA (NPU required)."""
+    if media == "device":
+        mem_type = ralloc.RallocMemType.DEVICE
+        data_op = ralloc.RallocDataOpType.SDMA | ralloc.RallocDataOpType.DEVICE_RDMA
+        return mem_type, data_op, ONE_GIB
+    return ralloc.RallocMemType.HOST, ralloc.RallocDataOpType.HOST_RDMA, 0
+
+
 def _wait_for_store(timeout_sec=60.0):
     """NEAR needs the FAR-hosted store (and its master key) before ralloc.initialize."""
     import socket
@@ -43,7 +53,8 @@ def _wait_for_store(timeout_sec=60.0):
     raise RuntimeError(f"config store not reachable within {timeout_sec}s: {STORE_URL}")
 
 
-def _near_main(sync: mp.Barrier):
+def _near_main(sync: mp.Barrier, media: str):
+    mem_type, data_op, max_hbm = _media_config(media)
     mf.set_log_level(3)
     assert mf.initialize() == 0, "mf.initialize failed"
     ralloc_inited = False
@@ -63,23 +74,24 @@ def _near_main(sync: mp.Barrier):
         handle = ralloc.create(
             id=0,
             max_dram_size=ONE_GIB,
-            data_op_type=ralloc.RallocDataOpType.HOST_RDMA,
+            max_hbm_size=max_hbm,
+            data_op_type=data_op,
         )
         print(f"[rank {RANK_NEAR}] (2/5) pool created (pure alignment, no local commit)", flush=True)
 
         # Phase 1: extend one block on the local NEAR slot
-        ret, info = handle.extend_local_mem(ralloc.RallocMemType.HOST, EXTEND_LOCAL_BYTES)
+        ret, info = handle.extend_local_mem(mem_type, EXTEND_LOCAL_BYTES)
         assert ret == 0 and info["rank_id"] == RANK_NEAR and info["gva"] != 0, f"extend_local_mem: {ret} {info}"
-        assert handle.get_mem_size_by_rank(RANK_NEAR) == EXTEND_LOCAL_BYTES, "local slot size"
+        assert handle.get_mem_size_by_rank(RANK_NEAR, mem_type) == EXTEND_LOCAL_BYTES, "local slot size"
         print(f"[rank {RANK_NEAR}] (3/5) extend_local_mem OK (gva=0x{info['gva']:x})", flush=True)
 
         # Phase 2: acquire a remote block from the FAR contributor via master placement
-        ret, info = handle.extend_remote_mem(ralloc.RallocMemType.HOST, EXTEND_REMOTE_BYTES)
+        ret, info = handle.extend_remote_mem(mem_type, EXTEND_REMOTE_BYTES)
         assert ret == 0 and info["rank_id"] == RANK_FAR and info["gva"] != 0, f"extend_remote_mem: {ret} {info}"
         gva_remote = info["gva"]
         assert sorted(handle.get_group_ranks()) == sorted([RANK_NEAR, RANK_FAR]), "group ranks"
-        assert handle.get_mem_size_by_rank(RANK_FAR) >= EXTEND_REMOTE_BYTES, "far slot size"
-        slot_base = handle.get_mem_ptr_by_rank(RANK_FAR)
+        assert handle.get_mem_size_by_rank(RANK_FAR, mem_type) >= EXTEND_REMOTE_BYTES, "far slot size"
+        slot_base = handle.get_mem_ptr_by_rank(RANK_FAR, mem_type)
         assert slot_base != 0 and slot_base <= gva_remote < slot_base + ONE_GIB, \
             f"gva outside far slot: base=0x{slot_base:x} gva=0x{gva_remote:x}"
 
@@ -87,13 +99,16 @@ def _near_main(sync: mp.Barrier):
         assert handle.copy_data(src.data_ptr(), gva_remote, COPY_BYTES, 0) == 0, "H2G into far slot"
         got = torch.empty(COPY_BYTES // 4, dtype=torch.int32)
         assert handle.copy_data(gva_remote, got.data_ptr(), COPY_BYTES, 0) == 0, "G2H from far slot"
+        if media == "device":
+            assert handle.wait() == 0, "wait for async SDMA copies"
         assert torch.equal(got, src), "round-trip via far block"
         print(f"[rank {RANK_NEAR}] (4/5) extend_remote_mem + round-trip OK (contributor rank {RANK_FAR})", flush=True)
 
         # Phase 3: second remote acquire hits the executor extend branch, LB accounting refreshed
-        ret, info = handle.extend_remote_mem(ralloc.RallocMemType.HOST, EXTEND_REMOTE_AGAIN)
+        ret, info = handle.extend_remote_mem(mem_type, EXTEND_REMOTE_AGAIN)
         assert ret == 0 and info["rank_id"] == RANK_FAR and info["gva"] != 0, f"extend_remote_mem again: {ret} {info}"
-        assert handle.get_mem_size_by_rank(RANK_FAR) >= EXTEND_REMOTE_BYTES + EXTEND_REMOTE_AGAIN, "far slot size"
+        assert handle.get_mem_size_by_rank(RANK_FAR, mem_type) >= EXTEND_REMOTE_BYTES + EXTEND_REMOTE_AGAIN, \
+            "far slot size"
 
         sync.wait()  # (5/5) FAR side may finish once the phases are done
         handle.destroy()
@@ -105,7 +120,7 @@ def _near_main(sync: mp.Barrier):
         mf.uninitialize()
 
 
-def _far_main(sync: mp.Barrier):
+def _far_main(sync: mp.Barrier, media: str):
     mf.set_log_level(3)
     assert mf.initialize() == 0, "mf.initialize failed"
     ralloc_inited = False
@@ -131,11 +146,14 @@ def _far_main(sync: mp.Barrier):
 
 
 def main():
+    media = sys.argv[1].lower() if len(sys.argv) > 1 else "host"
+    if media not in ("host", "device"):
+        raise RuntimeError("usage: python 03_single_node_multi_process_ralloc.py [host|device]")
     mp.set_start_method("spawn", force=True)
     sync = mp.Barrier(WORLD_SIZE)
 
-    p_near = mp.Process(target=_near_main, args=(sync,))
-    p_far = mp.Process(target=_far_main, args=(sync,))
+    p_near = mp.Process(target=_near_main, args=(sync, media))
+    p_far = mp.Process(target=_far_main, args=(sync, media))
 
     p_near.start()
     p_far.start()
@@ -144,7 +162,7 @@ def main():
 
     if p_near.exitcode != 0 or p_far.exitcode != 0:
         raise RuntimeError(f"child failed: near={p_near.exitcode}, far={p_far.exitcode}")
-    print("(5/5) 03_single_node_multi_process_ralloc: NEAR+FAR OK", flush=True)
+    print(f"(5/5) 03_single_node_multi_process_ralloc [{media}]: NEAR+FAR OK", flush=True)
 
 
 if __name__ == "__main__":

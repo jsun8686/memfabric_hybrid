@@ -132,7 +132,7 @@ static inline int32_t SmemRallocDataOpCheck(smem_ralloc_data_op_type dataOpType)
 static inline bool SmemRallocCreateOptionCheck(const smem_ralloc_create_option_t *option)
 {
     SM_VALIDATE_RETURN(option != nullptr, "option is null", false);
-    SM_VALIDATE_RETURN(option->maxDramSize != 0UL, "maxDramSize is 0", false);
+    SM_VALIDATE_RETURN(!(option->maxDramSize == 0UL && option->maxHbmSize == 0UL), "maxMemorySize is 0", false);
     SM_VALIDATE_RETURN(option->maxDramSize % SMEM_RALLOC_SIZE_ALIGNMENT == 0UL, "maxDramSize is not 2M aligned",
                        false);
     SM_VALIDATE_RETURN(option->maxHbmSize % SMEM_RALLOC_SIZE_ALIGNMENT == 0UL, "maxHbmSize is not 2M aligned",
@@ -180,7 +180,7 @@ static int32_t smem_ralloc_create_inner(uint32_t id, const smem_ralloc_create_op
 
     hybm_options options{};
     options.bmType = HYBM_TYPE_HOST_INITIATE;
-    options.memType = HYBM_MEM_TYPE_HOST;
+    options.memType = SmemRallocHelper::TransHybmMemType(option->maxDramSize, option->maxHbmSize);
     options.bmDataOpType = SmemRallocHelper::TransHybmDataOpType(option->dataOpType);
 #if !defined(ASCEND_NPU)
     if ((options.bmDataOpType & HYBM_DOP_TYPE_SDMA) || (options.bmDataOpType & HYBM_DOP_TYPE_DEVICE_RDMA)) {
@@ -194,7 +194,7 @@ static int32_t smem_ralloc_create_inner(uint32_t id, const smem_ralloc_create_op
     options.rankCount = manager.GetWorldSize();
     options.rankId = manager.GetRankId();
     options.devId = manager.GetDeviceId();
-    options.maxHBMSize = 0; /* HBM window is a placeholder this phase, wired up with device support */
+    options.maxHBMSize = option->maxHbmSize; /* >0 reserves the HBM window, commit still comes from extend_* */
     options.maxDRAMSize = option->maxDramSize;
     options.deviceVASpace = 0;
     options.hostVASpace = 0; /* create never commits local memory, blocks come from extend_* only */
@@ -202,12 +202,14 @@ static int32_t smem_ralloc_create_inner(uint32_t id, const smem_ralloc_create_op
     options.flags = option->flags;
 
     constexpr uint64_t SMEM_56BITS_GVA_REQUIRED_THRESHOLD = 32ULL << 40; // 32TB
-    const uint64_t totalAddrSpace = option->maxDramSize * static_cast<uint64_t>(options.rankCount);
+    const uint64_t totalAddrSpace =
+        (option->maxDramSize + option->maxHbmSize) * static_cast<uint64_t>(options.rankCount);
     if (!option->enable56BitsGva && totalAddrSpace > SMEM_56BITS_GVA_REQUIRED_THRESHOLD) {
         SM_LOG_AND_SET_LAST_ERROR_CODE(SM_INVALID_PARAM,
             "total address space (" << totalAddrSpace << " B) exceeds 32TB but enable56BitsGva is false. "
             << "Please set enable56BitsGva = true, "
-            << "maxDram=" << option->maxDramSize << ", rankCount=" << options.rankCount);
+            << "maxDram=" << option->maxDramSize << ", maxHbm=" << option->maxHbmSize
+            << ", rankCount=" << options.rankCount);
         cleanup();
         return SM_INVALID_PARAM;
     }
@@ -327,8 +329,8 @@ SMEM_API int32_t smem_ralloc_extend_remote_mem(smem_ralloc_t handle, smem_ralloc
 {
     SM_VALIDATE_RETURN(handle != nullptr, "invalid param, handle is NULL", SM_INVALID_PARAM);
     SM_VALIDATE_RETURN(g_smemRallocInited, "smem ralloc not initialized yet", SM_NOT_INITIALIZED);
-    SM_VALIDATE_RETURN(memType == SMEM_RALLOC_MEM_TYPE_HOST, "invalid param, only HOST mem type is supported",
-                       SM_NOT_SUPPORTED);
+    SM_VALIDATE_RETURN(memType == SMEM_RALLOC_MEM_TYPE_HOST || memType == SMEM_RALLOC_MEM_TYPE_DEVICE,
+        "invalid param, mem type must be HOST or DEVICE", SM_NOT_SUPPORTED);
     SM_VALIDATE_RETURN(size > 0, "invalid param, size is 0", SM_INVALID_PARAM);
     SM_VALIDATE_RETURN(size % SMEM_RALLOC_SIZE_ALIGNMENT == 0, "invalid param, size is not 2M aligned",
                        SM_INVALID_PARAM);
@@ -352,10 +354,11 @@ SMEM_API int32_t smem_ralloc_extend_remote_mem(smem_ralloc_t handle, smem_ralloc
         return SM_NOT_STARTED;
     }
 
-    /* 1. ask master to pick the contributor node (least loaded, never the requester itself) */
+    /* 1. ask master to pick the contributor node (least loaded on the requested media, never the requester itself) */
     SmemRallocRpcMsg placeMsg{};
     placeMsg.op = SMEMRA_RPC_OP_PLACEMENT;
     placeMsg.size = size;
+    placeMsg.memType = static_cast<uint32_t>(memType);
     auto masterEp = manager.GetMasterEndpoint();
     ret = rpc.SyncCall(masterEp, placeMsg);
     if (ret == SM_NOT_CONNECTED) {
@@ -381,6 +384,7 @@ SMEM_API int32_t smem_ralloc_extend_remote_mem(smem_ralloc_t handle, smem_ralloc
     allocMsg.poolId = entry->Id();
     allocMsg.size = size;
     allocMsg.maxDramSize = coreOptions.maxDRAMSize;
+    allocMsg.maxHbmSize = coreOptions.maxHBMSize;
     allocMsg.dataOpType = SmemRallocHelper::TransSmemDataOpType(coreOptions.bmDataOpType);
     allocMsg.flags = coreOptions.flags;
     allocMsg.enable56BitsGva = coreOptions.enable56BitsGva;
@@ -408,7 +412,8 @@ SMEM_API int32_t smem_ralloc_extend_remote_mem(smem_ralloc_t handle, smem_ralloc
     return SM_OK;
 }
 
-SMEM_API uint64_t smem_ralloc_get_mem_size_by_rank(smem_ralloc_t handle, uint32_t rank)
+SMEM_API uint64_t smem_ralloc_get_mem_size_by_rank(smem_ralloc_t handle, uint32_t rank,
+                                                   smem_ralloc_mem_type_t memType)
 {
     SM_VALIDATE_RETURN(handle != nullptr, "invalid param, handle is NULL", 0);
     SM_VALIDATE_RETURN(g_smemRallocInited, "smem ralloc not initialized yet", 0);
@@ -420,10 +425,11 @@ SMEM_API uint64_t smem_ralloc_get_mem_size_by_rank(smem_ralloc_t handle, uint32_
         return 0;
     }
 
-    return entry->GetMemSizeByRank(rank);
+    return entry->GetMemSizeByRank(rank, memType);
 }
 
-SMEM_API void *smem_ralloc_get_mem_ptr_by_rank(smem_ralloc_t handle, uint32_t rank)
+SMEM_API void *smem_ralloc_get_mem_ptr_by_rank(smem_ralloc_t handle, uint32_t rank,
+                                               smem_ralloc_mem_type_t memType)
 {
     SM_VALIDATE_RETURN(handle != nullptr, "invalid param, handle is NULL", nullptr);
     SM_VALIDATE_RETURN(g_smemRallocInited, "smem ralloc not initialized yet", nullptr);
@@ -435,7 +441,7 @@ SMEM_API void *smem_ralloc_get_mem_ptr_by_rank(smem_ralloc_t handle, uint32_t ra
         return nullptr;
     }
 
-    return entry->GetMemPtrByRank(rank);
+    return entry->GetMemPtrByRank(rank, memType);
 }
 
 SMEM_API uint32_t smem_ralloc_get_group_ranks(smem_ralloc_t handle, uint32_t *rankIds, uint32_t maxCount)

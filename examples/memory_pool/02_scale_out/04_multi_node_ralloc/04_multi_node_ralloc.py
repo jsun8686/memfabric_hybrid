@@ -28,7 +28,17 @@ FAR_WAIT_TIMEOUT_SEC = 600
 FAR_WAIT_RETRY_SEC = 5
 
 
-def _run_near(head_node_ip: str) -> None:
+def _media_config(media):
+    """host (default): HOST media via HOST_RDMA; device: HBM media via SDMA|DEVICE_RDMA (NPU required)."""
+    if media == "device":
+        mem_type = ralloc.RallocMemType.DEVICE
+        data_op = ralloc.RallocDataOpType.SDMA | ralloc.RallocDataOpType.DEVICE_RDMA
+        return mem_type, data_op, ONE_GIB
+    return ralloc.RallocMemType.HOST, ralloc.RallocDataOpType.HOST_RDMA, 0
+
+
+def _run_near(head_node_ip: str, media: str) -> None:
+    mem_type, data_op, max_hbm = _media_config(media)
     store_url = f"tcp://{head_node_ip}:{STORE_PORT}"
     mf.set_log_level(3)
     assert mf.initialize() == 0, "mf.initialize failed"
@@ -39,21 +49,22 @@ def _run_near(head_node_ip: str) -> None:
         cfg.auto_ranking = False  # fixed identities: head is rank 0, node B is rank 1
         cfg.role = ralloc.RallocRole.NEAR
         cfg.start_store = True  # head hosts the store; master service runs in this process
-        cfg.set_nic("tcp://174.111.50.205:10005")
+        cfg.set_nic("tcp://127.0.0.1:10005")
         assert ralloc.initialize(store_url, WORLD_SIZE, 0, cfg) == 0, "ralloc.initialize failed"
         ralloc_inited = True
 
         handle = ralloc.create(
             id=0,
             max_dram_size=ONE_GIB,
-            data_op_type=ralloc.RallocDataOpType.HOST_RDMA,
+            max_hbm_size=max_hbm,
+            data_op_type=data_op,
         )
         print(f"[near] pool created (store={store_url}) — waiting for the FAR contributor on node B ...", flush=True)
 
         ret, info = 0, {"rank_id": 0xFFFFFFFF, "gva": 0}
         deadline = time.time() + FAR_WAIT_TIMEOUT_SEC
         while True:
-            ret, info = handle.extend_remote_mem(ralloc.RallocMemType.HOST, EXTEND_REMOTE_BYTES)
+            ret, info = handle.extend_remote_mem(mem_type, EXTEND_REMOTE_BYTES)
             if ret == 0:
                 break
             if time.time() > deadline:
@@ -61,6 +72,8 @@ def _run_near(head_node_ip: str) -> None:
             print("[near] no FAR candidate yet (start rank 1 on node B), retrying ...", flush=True)
             time.sleep(FAR_WAIT_RETRY_SEC)
         assert info["rank_id"] == 1 and info["gva"] != 0, f"extend_remote_mem: {ret} {info}"
+        # the retry loop above fails by design until the FAR registers; drop that stale
+        # sticky last-error so the final blanket assertion is not polluted by it
         mf.get_and_clear_last_err_msg()
         gva = info["gva"]
         print(f"[near] remote block acquired from rank {info['rank_id']} (gva=0x{gva:x})", flush=True)
@@ -69,9 +82,11 @@ def _run_near(head_node_ip: str) -> None:
         assert handle.copy_data(src.data_ptr(), gva, COPY_BYTES, 0) == 0, "H2G into far slot"
         got = torch.empty(COPY_BYTES // 4, dtype=torch.int32)
         assert handle.copy_data(gva, got.data_ptr(), COPY_BYTES, 0) == 0, "G2H from far slot"
+        if media == "device":
+            assert handle.wait() == 0, "wait for async SDMA copies"
         assert torch.equal(got, src), "round-trip via far block"
         assert handle.get_group_ranks() == [0, 1], "group ranks"
-        assert handle.get_mem_size_by_rank(1) >= EXTEND_REMOTE_BYTES, "far slot size"
+        assert handle.get_mem_size_by_rank(1, mem_type) >= EXTEND_REMOTE_BYTES, "far slot size"
         print("[near] round-trip via FAR block OK — sleeping until Ctrl+C", flush=True)
         try:
             while True:
@@ -116,13 +131,20 @@ def _run_far(head_node_ip: str) -> None:
 
 
 def main() -> None:
-    if len(sys.argv) < 2 or sys.argv[1] not in ("0", "1"):
-        raise RuntimeError("usage: python3 04_multi_node_ralloc.py <0|1> [head_ip]")
-    head_ip = (sys.argv[2] if len(sys.argv) > 2 else input("Head node IP: ")).strip()
+    args = [a for a in sys.argv[1:]]
+    media = "host"
+    if "device" in args:
+        media = "device"
+        args.remove("device")
+    elif "host" in args:
+        args.remove("host")
+    if len(args) < 1 or args[0] not in ("0", "1"):
+        raise RuntimeError("usage: python3 04_multi_node_ralloc.py <0|1> [head_ip] [host|device]")
+    head_ip = (args[1] if len(args) > 1 else input("Head node IP: ")).strip()
     if not head_ip:
         raise RuntimeError("head node IP required")
-    if int(sys.argv[1]) == 0:
-        _run_near(head_ip)
+    if int(args[0]) == 0:
+        _run_near(head_ip, media)
     else:
         _run_far(head_ip)
 

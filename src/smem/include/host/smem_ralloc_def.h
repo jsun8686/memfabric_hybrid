@@ -47,9 +47,9 @@ typedef enum {
 typedef smem_ralloc_data_op_type smem_ralloc_data_op_type_t;
 
 /**
- * @brief memory type, enum values keep consistent with smem_bm_def.h,
- * only SMEM_RALLOC_MEM_TYPE_HOST is supported by ralloc of current phase
- */
+* @brief memory type, enum values keep consistent with smem_bm_def.h,
+* HOST and DEVICE are both supported, DEVICE requires a CANN(NPU) based backend for the data plane
+*/
 typedef enum {
     SMEM_RALLOC_MEM_TYPE_LOCAL_DEVICE = 0, /* memory on local device */
     SMEM_RALLOC_MEM_TYPE_LOCAL_HOST,       /* memory on local host */
@@ -103,8 +103,8 @@ typedef struct {
 
 typedef struct {
     uint64_t maxDramSize;                  /* the max size of one rank DRAM slot reserved in the window, must be 2M aligned */
-    uint64_t maxHbmSize;                   /* reserved for the future HBM window slot, must be 2M aligned, device
-                                              commit is not wired up in current phase */
+    uint64_t maxHbmSize;                   /* the max size of one rank HBM slot reserved in the window, must be 2M aligned,
+                                              0 means no HBM window, blocks come from extend_* with DEVICE mem type */
     smem_ralloc_data_op_type dataOpType;   /* data operation type of the pool */
     bool enable56BitsGva;                  /* enable 56-bit GVA when total addr space exceeds 32TB */
     uint32_t flags;                        /* optional flags, default 0 */

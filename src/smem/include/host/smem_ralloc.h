@@ -114,7 +114,7 @@ int32_t smem_ralloc_wait(smem_ralloc_t handle);
  * @brief Extend one memory block on local slot, members of the pool import it via UPDATE event
  *
  * @param handle           [in] ralloc object handle created by <i>smem_ralloc_create</i>
- * @param memType          [in] memory type, only SMEM_RALLOC_MEM_TYPE_HOST is supported
+ * @param memType          [in] memory type, SMEM_RALLOC_MEM_TYPE_HOST or SMEM_RALLOC_MEM_TYPE_DEVICE
  * @param size             [in] block size in byte, must be 2M aligned
  * @param info             [out] memory info of the new block, can be null if not care
  * @return 0 if successful
@@ -124,11 +124,11 @@ int32_t smem_ralloc_extend_local_mem(smem_ralloc_t handle, smem_ralloc_mem_type_
 
 /**
  * @brief Extend one memory block on a remote contributor node, which is selected by the master
- * of the deployment (least loaded candidate, never the requester itself). The selected node
- * contributes the memory and joins the pool on demand.
+ * of the deployment (least loaded candidate on the requested media, never the requester itself).
+ * The selected node contributes the memory and joins the pool on demand.
  *
  * @param handle           [in] ralloc object handle created by <i>smem_ralloc_create</i>
- * @param memType          [in] memory type, only SMEM_RALLOC_MEM_TYPE_HOST is supported
+ * @param memType          [in] memory type, SMEM_RALLOC_MEM_TYPE_HOST or SMEM_RALLOC_MEM_TYPE_DEVICE
  * @param size             [in] block size in byte, must be 2M aligned
  * @param info             [out] memory info of the new block, rankId is the contributor rank,
  *                              can be null if not care
@@ -144,9 +144,11 @@ int32_t smem_ralloc_extend_remote_mem(smem_ralloc_t handle, smem_ralloc_mem_type
  *
  * @param handle           [in] ralloc object handle created by <i>smem_ralloc_create</i>
  * @param rank             [in] rank id of the slot
+ * @param memType          [in] memory type of the window the slot belongs to
  * @return committed size in byte, 0 if the rank is invalid or has no imported block
  */
-uint64_t smem_ralloc_get_mem_size_by_rank(smem_ralloc_t handle, uint32_t rank);
+uint64_t smem_ralloc_get_mem_size_by_rank(smem_ralloc_t handle, uint32_t rank,
+                                          smem_ralloc_mem_type_t memType);
 
 /**
  * @brief Get slot base address of one rank, paired with <i>smem_ralloc_get_mem_size_by_rank</i>
@@ -155,9 +157,10 @@ uint64_t smem_ralloc_get_mem_size_by_rank(smem_ralloc_t handle, uint32_t rank);
  *
  * @param handle           [in] ralloc object handle created by <i>smem_ralloc_create</i>
  * @param rank             [in] rank ID of the slot
+ * @param memType          [in] memory type of the window the slot belongs to
  * @return slot base address, null if failed
  */
-void *smem_ralloc_get_mem_ptr_by_rank(smem_ralloc_t handle, uint32_t rank);
+void *smem_ralloc_get_mem_ptr_by_rank(smem_ralloc_t handle, uint32_t rank, smem_ralloc_mem_type_t memType);
 
 /**
  * @brief Get the ranks currently in the pool's dynamic group, which is a snapshot taken at the

@@ -17,11 +17,14 @@ copy_data / destroy`。
 
 ## 必要条件
 - 两节点已安装同版本 memfabric_hybrid whl，网络互通。
-- data_op_type=HOST_RDMA：需节点间 RDMA（RoCE/IB）NIC；无 RDMA 环境可改为 HOST_TCP（吞吐下降）。
+- host 模式（默认）data_op_type=HOST_RDMA：需节点间 RDMA（RoCE/IB）NIC；无 RDMA 环境可改为 HOST_TCP（吞吐下降）。
+- device 模式追加 `device` 参数：data_op_type=SDMA|DEVICE_RDMA，需 NPU+CANN（ASCEND_NPU 构建）环境。
 
 ## 验收标准
 - head 输出 "round-trip via FAR block OK"（远端块写读一致）且 `get_group_ranks() == [0, 1]`。
 - Ctrl+C 后双侧干净退出，`mf.get_last_err_msg() == ""`。
+- head 等待 FAR 注册期间，master 日志的 `no candidate for placement` 与 head 侧 "no FAR candidate
+  yet ... retrying" 属预期噪音（重试环设计内失败，成功后 last error 已被清除）。
 
 ## 运行
 启动顺序不严格（head 内置等待 FAR 注册的重试环），推荐先起 node B：
@@ -30,4 +33,7 @@ copy_data / destroy`。
 python3 04_multi_node_ralloc.py 1 <head_ip>
 # head (NEAR 请求者 + store)
 python3 04_multi_node_ralloc.py 0 <head_ip>
+# HBM 介质变体（两节点均追加 device 参数）
+python3 04_multi_node_ralloc.py 1 <head_ip> device
+python3 04_multi_node_ralloc.py 0 <head_ip> device
 ```

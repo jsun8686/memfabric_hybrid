@@ -412,3 +412,47 @@ src/hybm/
 | **槽字节数推导贡献者**（GetMemSizeByRank>0 ⟺ FAR） | 会被 extend_local（NEAR 本地提交）污染；改显式角色键 RA_ROLE_ |
 | **master 乐观记账**（PLACEMENT 时 committedBytes += size） | 覆盖式权威上报取代：计数漂移/destroy 虚高/切主候选表重建三问题一并消解 |
 | **handler 仅 master 注册** | 四 op 全员注册+IsRunning 激活门：切主后 handler 不缺位，PING 对任意节点可探活 |
+
+
+## 11. HBM 双介质支持（v10）
+
+### 11.1 模型（对齐 hybm/bm 一池双介质）
+
+- create(max_dram_size, max_hbm_size)：两窗任选，>0 即预留该介质窗（双开即双介质池）；两窗全 0 → 拒绝（对齐 bm "maxMemorySize is 0"）
+- extend_local/remote(mem_type, size)：**单次调用单介质**，块落入该介质的 rank 槽；DEVICE 且池无 HBM 窗 → SM_NOT_SUPPORTED
+- GVA 布局双窗并列：host 窗 hostGva_ + rank×maxDRAMSize，device 窗 deviceGva_ + rank×maxHBMSize，各窗基址进程间一致（bm GetPeerDevicePtr 同构）
+- **op 位与介质解耦**（对齐 bm，无介质-op 交叉校验）：错配（HBM 窗 + 全 host 位）走 hybm 运行时自然失败；非 NPU 构建下 SDMA/DEVICE_RDMA 位仍被编译守卫拒绝（create 与 executor 两处）
+
+### 11.2 RPC 消息 v2（128B → 144B，msgVersion=2）
+
+| 新增字段 | 用途 |
+|---|---|
+| uint64 maxHbmSize | JOIN_ALLOC：FAR 建池时预留 HBM 窗 |
+| uint64 deviceCommittedBytes | REGISTER：DEVICE 介质 committed 记账（size 语义收窄为 HOST committed） |
+
+### 11.3 分介质 LB 记账
+
+- REGISTER 双桶：Candidate{committedBytes(host), deviceCommittedBytes}，覆盖式权威上报（ reporter/PokeReporter 三触发不变）
+- PLACEMENT 按请求介质取对应桶选 least-loaded，仍永不选 requester
+
+### 11.4 分层落点
+
+| 层 | 变更 |
+|---|---|
+| entry | deviceGva_ 成员；Initialize 双窗口（HBM>0 预留 device 窗，提交仍延迟到 extend，与 host 窗对称）；committedBytes_/deviceCommittedBytes_ 分桶；ExtendLocalMem 按 memType 路由 alloc/export；GetMemPtr/SizeByRank(rank, memType)、GetRankIdByGva 先判属窗、AddrInHostGva/AddrInDeviceGva |
+| executor | JOIN_ALLOC 校验按介质分支（maxHbm/maxDram、LOCAL_HBM/DRAM_SIZE_MAX）；create 分支 TransHybmMemType(maxDram,maxHbm) + 初始 size 按 memType 路由 deviceVASpace/hostVASpace；extend 分支透传 msg.memType |
+| master | Candidate 双桶 + OnPlacement 按介质选点（§11.3） |
+| create | maxHbmSize 接线、TransHybmMemType、56 位阈值改 (dram+hbm)×rankCount（对齐 bm） |
+| 公开 API | smem_ralloc_get_mem_size/ptr_by_rank 增 memType 参数（默认 HOST 向后兼容） |
+| python | 同名 mem_type 参数（默认 HOST）；RallocDataOpType 开 py::arithmetic() 支持 SDMA \| DEVICE_RDMA 位组合 |
+| 用例 | 03/04 参数化 [host|device]：device 变体 data_op_type=SDMA\|DEVICE_RDMA + copy 后 handle.wait()（SDMA 异步收敛，HOST 路径无 wait） |
+
+### 11.5 验证矩阵与待验证项（NPU 环境首查）
+
+- P1（TCP 集群，编译级）：全量重编（msg v2）→ 03/04 host 路径全绿（双拓扑）为回归基线
+- P2（NPU+CANN）：03/04 device 变体 E2E。待验证：① maxHBMSize>0, deviceVASpace=0 时 hybm 对称"只预留不提交"；② hybm_query_alloc_ranges 对 device 窗区间可用；③ DataCopy AUTO 对 device GVA 的介质识别；④ device 窗基址跨进程一致性
+
+### 11.6 假设与边界（v1）
+
+- FAR 节点同构假设：不做 per-node HBM 容量过滤（后续按介质容量/余量扩展）
+- 一池双介质窗均全 rank 织造（与 host 窗同构）；非 NPU 构建下 HBM 池在 hybm device alloc 处自然报错（无 create 前置门，对齐 bm）

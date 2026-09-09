@@ -56,7 +56,8 @@ public:
 private:
     struct Candidate {
         SmemRallocRpcEndpoint ep{};
-        uint64_t committedBytes = 0;
+        uint64_t committedBytes = 0;       /* committed bytes on the HOST media, last reported value */
+        uint64_t deviceCommittedBytes = 0; /* committed bytes on the DEVICE media, last reported value */
     };
 
     std::mutex mutex_;

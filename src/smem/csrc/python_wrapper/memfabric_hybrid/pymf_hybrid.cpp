@@ -425,14 +425,14 @@ public:
         return smem_ralloc_wait(handle_);
     }
 
-    uint64_t GetMemSizeByRank(uint32_t rank)
+    uint64_t GetMemSizeByRank(uint32_t rank, smem_ralloc_mem_type memType)
     {
-        return smem_ralloc_get_mem_size_by_rank(handle_, rank);
+        return smem_ralloc_get_mem_size_by_rank(handle_, rank, memType);
     }
 
-    uint64_t GetMemPtrByRank(uint32_t rank)
+    uint64_t GetMemPtrByRank(uint32_t rank, smem_ralloc_mem_type memType)
     {
-        auto ptr = smem_ralloc_get_mem_ptr_by_rank(handle_, rank);
+        auto ptr = smem_ralloc_get_mem_ptr_by_rank(handle_, rank, memType);
         return ptr == nullptr ? 0 : (uint64_t)(ptrdiff_t)ptr;
     }
 
@@ -993,7 +993,7 @@ void DefineRallocConfig(py::module_ &m)
         .value("DEVICE", SMEM_RALLOC_MEM_TYPE_DEVICE, "memory type is on global DEVICE side.")
         .value("HOST", SMEM_RALLOC_MEM_TYPE_HOST, "memory type is on global HOST side.");
 
-    py::enum_<smem_ralloc_data_op_type>(m, "RallocDataOpType")
+    py::enum_<smem_ralloc_data_op_type>(m, "RallocDataOpType", py::arithmetic())
         .value("SDMA", SMEMRA_DATA_OP_SDMA, "data operation done by device SDMA")
         .value("HOST_RDMA", SMEMRA_DATA_OP_HOST_RDMA, "data operation done by host RDMA")
         .value("HOST_TCP", SMEMRA_DATA_OP_HOST_TCP, "data operation done by host TCP")
@@ -1076,7 +1076,8 @@ reserved and the dynamic group is joined, no local memory is committed by create
 Arguments:
     id(int):                       identity of the ralloc pool, different pools need different ids
     max_dram_size(int):            the max size of one rank DRAM slot reserved in the window, 2M aligned
-    max_hbm_size(int):             reserved for the future HBM window slot, default 0
+    max_hbm_size(int):             the max size of one rank HBM slot reserved in the window, 2M aligned,
+                                   default 0 (no HBM window)
     data_op_type(RallocDataOpType): data operation type of the pool, default HOST_RDMA
     enable_56bits_gva(bool):       explicitly enable 56-bit GVA, default false
     flags(int):                    optional flags, default 0
@@ -1090,7 +1091,7 @@ Returns:
 Extend one memory block on the local slot.
 
 Arguments:
-    mem_type(RallocMemType): memory type, only HOST is supported, default HOST
+    mem_type(RallocMemType): memory type, HOST or DEVICE, default HOST
     size(int):               block size in byte, must be 2M aligned
 Returns:
     tuple: (ret, {"rank_id": int, "gva": int}) — rank_id is the contributor rank (local rank),
@@ -1098,10 +1099,10 @@ Returns:
         .def("extend_remote_mem", &RallocPool::ExtendRemoteMem, py::call_guard<py::gil_scoped_release>(),
              py::arg("mem_type") = SMEM_RALLOC_MEM_TYPE_HOST, py::arg("size"), R"(
 Acquire one memory block from a remote contributor node selected by the master
-(least loaded candidate, never the requester itself).
+(least loaded candidate on the requested media, never the requester itself).
 
 Arguments:
-    mem_type(RallocMemType): memory type, only HOST is supported, default HOST
+    mem_type(RallocMemType): memory type, HOST or DEVICE, default HOST
     size(int):               block size in byte, must be 2M aligned
 Returns:
     tuple: (ret, {"rank_id": int, "gva": int}) — rank_id is the contributor rank,
@@ -1122,19 +1123,21 @@ Wait all issued async copy(s) finish.)")
         .def("destroy", &RallocPool::Destroy, py::call_guard<py::gil_scoped_release>(), R"(
 Destroy the ralloc pool handle, all local memory of the entry is released with it.)")
         .def("get_mem_size_by_rank", &RallocPool::GetMemSizeByRank, py::call_guard<py::gil_scoped_release>(),
-             py::arg("rank"), R"(
+             py::arg("rank"), py::arg("mem_type") = SMEM_RALLOC_MEM_TYPE_HOST, R"(
 Get the current committed size of one rank's slot, a snapshot of the local imported state.
 
 Arguments:
-    rank(int): rank id of the slot
+    rank(int):                rank id of the slot
+    mem_type(RallocMemType): memory type of the window the slot belongs to, default HOST
 Returns:
     committed size in byte, 0 if the rank is invalid or has no imported block)")
         .def("get_mem_ptr_by_rank", &RallocPool::GetMemPtrByRank, py::call_guard<py::gil_scoped_release>(),
-             py::arg("rank"), R"(
+             py::arg("rank"), py::arg("mem_type") = SMEM_RALLOC_MEM_TYPE_HOST, R"(
 Get slot base address of one rank, paired with get_mem_size_by_rank.
 
 Arguments:
-    rank(int): rank id of the slot
+    rank(int):                rank id of the slot
+    mem_type(RallocMemType): memory type of the window the slot belongs to, default HOST
 Returns:
     slot base address, 0 if failed)")
         .def("get_group_ranks", &RallocPool::GetGroupRanks, py::call_guard<py::gil_scoped_release>(), R"(

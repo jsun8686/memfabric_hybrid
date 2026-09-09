@@ -23,7 +23,7 @@ namespace smem {
  * the same fixed-size POD struct, fields marked [resp] are meaningful in response only,
  * fields marked [register] are meaningful in SMEMRA_RPC_OP_REGISTER request only. */
 constexpr uint16_t SMEMRA_RPC_MAGIC = 0x524AU;      /* 'R','A' */
-constexpr uint16_t SMEMRA_RPC_MSG_VERSION = 1U;
+constexpr uint16_t SMEMRA_RPC_MSG_VERSION = 2U;
 constexpr int16_t SMEMRA_RPC_MSG_TYPE = 1; /* acc_tcp route tag, valid range [MIN_MSG_TYPE, MAX_MSG_TYPE) = [0,48), 0 is taken by the tcp store */
 constexpr uint32_t SMEMRA_RPC_MASTER_KEY_MAX_LEN = 46U;
 
@@ -52,18 +52,20 @@ struct SmemRallocRpcMsg {
     uint32_t ownerRank;    /* [resp] rank of the contributor node */
     uint32_t dataOpType;   /* smem_ralloc_data_op_type bits */
     uint32_t flags;
-    uint32_t memType;      /* smem_ralloc_mem_type of the requested block, HOST only in current phase */
+    uint32_t memType;      /* smem_ralloc_mem_type of the requested block, HOST or DEVICE */
     int32_t result;        /* [resp] SM_* result code, signed: SM_* codes are negative */
     uint32_t nodeRank;     /* [resp][register] endpoint rank */
     uint32_t nodePort;     /* [resp][register] endpoint port */
     uint32_t reserved1;
-    uint64_t size;         /* requested region size in byte, reused as the committed bytes report in REGISTER */
-    uint64_t maxDramSize;  /* window slot size of the pool */
+    uint64_t size;         /* requested region size in byte, reused as the HOST committed bytes in REGISTER */
+    uint64_t maxDramSize;  /* window slot size of the pool, HOST media */
+    uint64_t maxHbmSize;   /* window slot size of the pool, DEVICE media, 0 when the pool has no HBM window */
     uint64_t gva;          /* [resp] global virtual address of the region */
+    uint64_t deviceCommittedBytes; /* [register] committed bytes on the DEVICE media */
     char nodeIp[SMEMRA_RPC_MASTER_KEY_MAX_LEN]; /* [resp][register] endpoint ip */
     uint8_t pad[10];
 };
-static_assert(sizeof(SmemRallocRpcMsg) == 128U, "smem ralloc rpc msg size must be 128");
+static_assert(sizeof(SmemRallocRpcMsg) == 144U, "smem ralloc rpc msg size must be 144");
 static_assert(sizeof(SmemRallocRpcEndpoint) == 56U, "smem ralloc rpc endpoint size must be 56 (54 bytes + 2 tail padding)");
 
 /* master endpoint published under the RA_ prefixed store, value is POD SmemRallocRpcEndpoint */
