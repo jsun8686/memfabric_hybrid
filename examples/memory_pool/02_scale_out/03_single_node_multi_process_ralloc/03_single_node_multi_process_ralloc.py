@@ -30,12 +30,12 @@ RANK_NEAR = 1
 
 
 def _media_config(media):
-    """host (default): HOST media via HOST_RDMA; device: HBM media via SDMA|DEVICE_RDMA (NPU required).
+    """host (default): HOST media via HOST_RDMA; device: HBM media via SDMA (NPU required).
     The device variant reserves an HBM-only window: on A2(910B) SoCs a DRAM window cannot carry the
     SDMA bit — the hybm conn-based dram segment is not sdma-reachable (910C/GVA_V4 unified VA除外)."""
     if media == "device":
         return (ralloc.RallocMemType.DEVICE,
-                ralloc.RallocDataOpType.SDMA | ralloc.RallocDataOpType.DEVICE_RDMA,
+                ralloc.RallocDataOpType.SDMA,
                 0, ONE_GIB)
     return ralloc.RallocMemType.HOST, ralloc.RallocDataOpType.HOST_RDMA, ONE_GIB, 0
 
