@@ -51,7 +51,7 @@ def _run_near(head_node_ip: str, media: str) -> None:
         cfg.auto_ranking = False  # fixed identities: head is rank 0, node B is rank 1
         cfg.role = ralloc.RallocRole.NEAR
         cfg.start_store = True  # head hosts the store; master service runs in this process
-        cfg.set_nic("tcp://127.0.0.1:10005")
+        cfg.set_nic("tcp://174.111.50.205:10005")
         assert ralloc.initialize(store_url, WORLD_SIZE, 0, cfg) == 0, "ralloc.initialize failed"
         ralloc_inited = True
 
