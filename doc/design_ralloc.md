@@ -41,14 +41,15 @@ NEAR 节点 A 调用 ralloc_create（纯对齐：建窗+join，零本地提交�
 | `smem_ralloc_copy(handle, src, dst, size, flags)` | 直包 hybm data op（AUTO 方向） |
 | `smem_ralloc_extend_local_mem(handle, memType, size) → info` | 本地槽扩展一块（bm extend_local_mem 同形+出参；alloc+export+GroupUpdate 闭环；memType 为 HBM 预留） |
 | `smem_ralloc_extend_remote_mem(handle, memType, size) → info` | 远端获取一块：PLACEMENT → JOIN_ALLOC（create-or-extend）→ {ownerRank, gva} 出参；memType 与 extend_local 对称（当前仅 HOST） |
-| `smem_ralloc_get_mem_size_by_rank(handle, rank)` | 动态 extent 查询：hybm_query_alloc_ranges 全窗折叠（替代 get_local_mem_size_by_mem_type） |
-| `smem_ralloc_get_mem_ptr_by_rank(handle, rank)` | 槽基址，与上行同族命名（get_mem_*_by_rank），配对得有效区间 [ptr, ptr+size) |
+| `smem_ralloc_get_mem_size_by_rank(handle, rank, memType)` | 动态 extent 查询：hybm_query_alloc_ranges 指定介质窗折叠（memType 默认 HOST 向后兼容；替代 get_local_mem_size_by_mem_type） |
+| `smem_ralloc_get_mem_ptr_by_rank(handle, rank, memType)` | 指定介质窗的槽基址，与上行同族命名（get_mem_*_by_rank），配对得有效区间 [ptr, ptr+size)，memType 默认 HOST |
 | `smem_ralloc_get_group_ranks(handle, rankIds, maxCount)` | 组成员快照枚举（含自身，引擎位图 GetMemberRanks 单次快照）：事件流单槽不可回放（前提 14），注册回调前的存量成员（含迟到 B 视角全员）由此发现；满容量按 worldSize 分配，返回实际数（>maxCount=截断可检测），UINT32_MAX=失败；配 get_mem_size_by_rank 区分"在组无提交"成员 |
 | `smem_ralloc_wait(handle)` / `get_rank_id()` / `set_group_event_handler(handle, cb, ctx)` | bm 同形 |
 | `smem_ralloc_register_user_mem(handle, addr, size)` / `smem_ralloc_unregister_user_mem(handle, addr)` | 用户本地内存注册（bm 同形）：`hybm_register_local_memory`/`hybm_free_local_memory` 直包，entry 幂等记账（registedSlice_，destroy 自动注销）；纯本地操作，不涉 master/RPC；按地址区间分流 HBM/DRAM，DEVICE_RDMA 池的 DRAM buffer 须 4K 对齐 |
 
 约束：`maxDramSize`/`maxHbmSize`/各 extend size 均 2M 对齐（hybm 大页约束，SMEM_RALLOC_SIZE_ALIGNMENT）；
-mem_type 枚举镜像 bm 取值，当前仅 HOST 合法；`maxHbmSize` 为 R10 占位字段（校验后暂不透传 hybm）。
+mem_type 枚举镜像 bm 取值（HOST/DEVICE，见 §11）；双介质池两窗任选其一大于 0 即建对应窗，两窗全 0 拒绝；
+**SDMA 位 + DRAM 窗的组合受 GVA_V4 门槛约束**（见 §11.7），device 形态池用 HBM-only 窗。
 
 rankId：**三角色统一由 init 分配**（`autoRanking` 从 store 原子取号 / config 显式，
 参考 smem_bm_entry_manager.cpp:64-67 / :115-133），组位图去重兜底（smem_net_group_engine.cpp:1291-1295）。
@@ -339,10 +340,11 @@ reaper（manager 周期线程，FAR 节点）：FAR entry 且标记超过宽限�
 | R7 | 本地扩展 | `extend_local_mem` 闭环 | 复用+薄封装 | P1.5 | 已交付（`extend_local_mem(handle, memType, size, info*)`，bm 同形+出参） |
 | R8 | 远端同节点扩展 | ~~REMOTE_EXTEND opcode~~ | 并入 R4 | — | 已消解（JOIN_ALLOC create-or-extend 二合一，无需独立 opcode） |
 | R9 | B 迟到访问 | create(0)+join 融合；extent 经 `get_mem_size_by_rank` 免费获知 | 复用 | P1.5 | 已交付（内存可见性消解；应用层仅剩对象布局元数据需自行同步；**存量成员发现缺口**经代码级验证——单槽事件流不可回放，见前提 14——由 `get_group_ranks` 补齐） |
-| R10 | HBM 介质放开 | ralloc option `maxHbmSize`（P2 占位：字段+2M 校验，暂不透传 hybm）；extend_* 的 memType 形已对称预留 | 新增 | P3 | 待启动 |
+| R10 | HBM 介质放开 | ralloc option `maxHbmSize`；extend_* memType 路由；RPC 消息 v2（maxHbmSize/deviceCommittedBytes）；master 双桶 LB（§11） | 新增 | P3 | 已交付（03 device 变体 E2E 5/5：HBM-only 池 + SDMA\|DEVICE_RDMA + extend_local/remote(DEVICE) + copy 往返 + wait；A2/910C-V3 环境约束与出路见 §11.7） |
 | R11 | zbal 适配评估 | — | — | P3 | 待启动 |
 | R12 | 故障场景（X 掉线/重连、master 降级/切主自动重竞速、LinkDown 时延打磨；hybm allocatedSize_ 失败不回滚） | LeaveHandle/LinkDown 机制 | 复用+打磨 | P3 | 待启动（handler 全员化+**watch 触发即时重注册**已消解切主 30s 收敛窗；FAR 周期 REGISTER 天然重建候选表；切主检测/重竞速本身仍待做） |
 | R13 | FAR entry 生命周期闭环（组空自毁） | 角色键 RA_ROLE_+memberRoles_+reaper | 新增 | P2 | 已交付（§6.5；宽限 5s/env；FAR 禁 create 免属主标记） |
+| R14 | 用户本地内存注册（bm 对齐） | `smem_ralloc_register_user_mem`/`unregister_user_mem`：entry 幂等记账 registedSlice_，destroy 自动注销；纯本地不涉 master/RPC | 新增（薄） | P3 | 已落码待重编验证（python：register/unregister；DRAM 主场景，DEVICE_RDMA 池 DRAM buffer 须 4K 对齐） |
 
 ## 8. 已代码验证的设计前提
 
@@ -448,24 +450,81 @@ src/hybm/
 | python | 同名 mem_type 参数（默认 HOST）；RallocDataOpType 开 py::arithmetic() 支持 SDMA \| DEVICE_RDMA 位组合 |
 | 用例 | 03/04 参数化 [host|device]：device 变体 data_op_type=SDMA\|DEVICE_RDMA + copy 后 handle.wait()（SDMA 异步收敛，HOST 路径无 wait） |
 
-### 11.5 验证矩阵与待验证项（NPU 环境首查）
+### 11.5 验证矩阵与状态
 
-- P1（TCP 集群，编译级）：全量重编（msg v2）→ 03/04 host 路径全绿（双拓扑）为回归基线
-- P2（NPU+CANN）：03/04 device 变体 E2E。待验证：① maxHBMSize>0, deviceVASpace=0 时 hybm 对称"只预留不提交"；② hybm_query_alloc_ranges 对 device 窗区间可用；③ DataCopy AUTO 对 device GVA 的介质识别；④ device 窗基址跨进程一致性
+- P1（TCP 集群，编译级）：全量重编（msg v2）→ 03/04 host 路径全绿（双拓扑）——**已通过**（回归基线）
+- P2（NPU+CANN）：03 device 变体 E2E——**已通过**（2026-09，单机双进程 NEAR+FAR，5/5：HBM-only 池创建 /
+  extend_local(DEVICE) 首块 gva=0x280080000000 / extend_remote(DEVICE) 跨进程贡献（PLACEMENT 双桶选点 +
+  JOIN_ALLOC device 分支）/ copy 往返（SDMA 优先链）+ wait 收敛）。原四项待验证随之覆盖：
+  ① device 窗"只预留不提交"✅ ② hybm_query_alloc_ranges 对 device 窗可用✅ ③ DataCopy AUTO 对 device GVA
+  介质识别✅ ④ device 窗基址跨进程一致✅（FAR 侧贡献块被 NEAR 按窗内偏移正确寻址）
+- 遗留待验证：① 04 device 双节点（跨机 HBM 贡献 + SDMA/DEVICE_RDMA 数据面）；② R14 register/unregister
+  重编后按探针脚本验证；③ 910C+hdk≥25.5.0（GVA_V4）上双介质池（DRAM 窗+SDMA 位）复验，解锁 §11.7 约束
 
 ### 11.6 假设与边界（v1）
 
 - FAR 节点同构假设：不做 per-node HBM 容量过滤（后续按介质容量/余量扩展）
 - 一池双介质窗均全 rank 织造（与 host 窗同构）；非 NPU 构建下 HBM 池在 hybm device alloc 处自然报错（无 create 前置门，对齐 bm）
 
-### 11.7 A2(910B) SoC 的 DRAM×SDMA 互斥约束（机理）
+### 11.7 DRAM×SDMA 互斥约束 = GVA_V4 门槛（机理，实测修订）
 
-hybm InitDramSegment（hybm_entity_default.cpp:1140）在 SDMA 位置位时要求 DRAM 段 CheckSdmaReaches 为真。段实现分派（hybm_mem_segment.cpp:85-94）：
+hybm InitDramSegment（hybm_entity_default.cpp:1140）在 SDMA 位置位时要求 DRAM 段 CheckSdmaReaches 为真。
+段分派（hybm_mem_segment.cpp:85-94）**不是按 SoC 而是按 GVA version**：`GVA_V4 && 910C && shmFd<0` 才走
+VmmBased，否则一律 ConnBased。实测：910C 机器 + hdk24.x 驱动（Innerversion V100R001C21SPC010B220，判为
+GVA_V3）**同样命中 ConnBased → 同一行报错**——约束的真界限是驱动代际，不是芯片。
 
-| 段类型 | SoC 条件 | CheckSdmaReaches | 根因 |
+**版本判定链**：`HalGvaPrecheck`（hybm_gva_version.cpp:175）读 `/etc/ascend_install.info` 的
+`Driver_Install_Path_Param=` → `<path>/driver/version.info` 的 `Innerversion=`，逐级比对：
+
+| GVA | 阈值（Innerversion） | HDK | HAL 符号组 |
 |---|---|---|---|
-| HybmConnBasedSegment | 910B 等（非 GVA_V4+910C） | 恒 false（基类默认） | 连接式模型：远端 DRAM 仅 mmap 进本进程 VA，数据走 hcom host 传输；段内无 serverId/superPodId 设备坐标，SDMA 设备引擎无设备侧地址/MR 可用 |
+| V3 | V100R001C21B035 | hdk24.x | devmm_*/svm_*（legacy SVM） |
+| **V4** | **V100R001C23SPC005B219** | **hdk25.5.0** | halMem*（VMM 统一编址） |
+| V5 | V100R001C10B001（归 V4 处理） | hdk26.0.0 | halMem* |
+
+SoC 识别独立于驱动：`AclrtGetSocName`（dl_acl_api.cpp:130，"Ascend910_93"→910C，static 缓存）。
+比 V4 旧的驱动会**静默降级**（V3 匹配即 init 成功），只有 SDMA+DRAM 组合在实体初始化时 fail-fast 暴露。
+
+段类型与注册语义（CheckSdmaReaches 分派）：
+
+| 段类型 | 条件 | CheckSdmaReaches | 根因 |
+|---|---|---|---|
+| HybmConnBasedSegment | 非 V4+910C（含 910B、910C+V3 驱动） | 恒 false（基类默认） | 连接式模型：远端 DRAM 仅 mmap 进本进程 VA，数据走 hcom host 传输；段内无 serverId/superPodId 设备坐标，SDMA 设备引擎无设备侧地址/MR 可用 |
 | HybmVmmBasedSegment | GVA_V4 + 910C | 恒 true | 统一编址：host DRAM 进入设备可编址 GVA 空间，SDMA 天然可达 |
 | HybmDevLegacySegment（HBM） | — | 按 importMap_ 拓扑判定（同 server/同 superpod，910B 再限同 CONN 组） | HBM 有真实设备坐标 |
 
-推论：A2 类 SoC 上"DRAM 窗 + SDMA 位"物理不可实现，实体初始化 fail-fast；双介质池携带 SDMA 位须待 910C/GVA_V4。device 变体用例（03/04）因此预留 **HBM-only 窗**（max_dram=0）。
+推论：**GVA_V4 门槛以下的任何环境**"DRAM 窗 + SDMA 位"物理不可实现（fail-fast）；双介质池携带 SDMA 位须
+hdk≥25.5.0（V4）。device 变体用例（03/04）因此预留 **HBM-only 窗**（max_dram=0），在 V3 驱动上走
+DevLegacy HBM 段 + SDMA（legacy 路径，实测通过，见 §11.5）。
+
+### 11.8 hybm 分配/注册机制速查（维护参考）
+
+**HAL 两代接口**（libascend_hal.so，随 HDK 驱动安装，按 GVA version 互斥 dlsym 加载，dl_hal_api.cpp:80-111）：
+V1-V3 = devmm_*/svm_*（legacy SVM，设备 VA 预留+物理页映射）；V4/V5 = halMem*（VMM 统一编址，host DRAM
+也进设备编址）。HDK 版本 ↔ GVA 映射见 §11.7。兄弟库：libascendcl（CANN 计算运行时，AclrtGetSocName）。
+
+**分配接口 × 段类型**（"谁分配"决定"要不要注册"）：
+
+| 介质/段 | 分配接口 | 说明 |
+|---|---|---|
+| HBM / DevLegacy（V1-V3） | GvaReserveMemory 预留 SVM VA + drv::HalGvaAlloc 映射 HBM 大页 | 分配即设备 VA |
+| HBM / VmmBased（V4/950） | HalMemCreate{MEM_DEV_SIDE, MEM_HBM_TYPE} | 分配即统一编址 |
+| DRAM / ConnBased（非 V4+910C） | **OS mmap** MAP_FIXED（hugepage→4K 降级链；56 位 GVA 边角才试 halMemAlloc，V3 下符号未加载必败） | 物理页是 OS 的，VA 钉在窗口 slot；HAL 不参与分配 |
+| DRAM / VmmBased（V4+910C） | HalMemCreate{MEM_HOST_SIDE, P2P_DDR}（1G 大页→2M 降级） | 分配即统一编址，无独立注册步骤 |
+
+**注册矩阵**（HAL=halHostRegister 拿 DVA；MR=RaRegisterMR 拿 lkey/rkey）：
+
+| op × 介质 | HAL 注册 | MR 注册 |
+|---|---|---|
+| SDMA × HBM | 不需要（分配即 DVA） | 不需要 |
+| SDMA × DRAM | V3：组合被拒（§11.7）；V4：不需要 | 不需要 |
+| DEVICE_RDMA × HBM | 不需要 | **需要**（DVA 原样注册；发 WR 无 key 直接报 lAddr not register） |
+| DEVICE_RDMA × DRAM | V3：**需要** halHostRegister(HOST_MEM_MAP_DEV)；V4：不需要 | V3：indirect 模式 skip per-region MR（swap 中转）；V4：需要（HVA→DVA 转换后注册） |
+
+**copy 选路**：GetPrioritedDataOperators 固定优先链 SDMA→DEVICE_RDMA→HOST_RDMA→HOST_URMA→HOST_TCP→
+HOST_SHM，逐个试错降级（首个 BM_OK 胜出，失败打 WARN "data copy ... with data op X failed"）。建池时
+InitTagManager 把 op 位展开为同 tag 规则，rank 对 op 集 = 池声明位集。
+
+**register_user_mem 链路**（R14）：hybm_register_local_memory → RegisterLocalMemory（bm 场景优先
+dramSegment_，entity:242-246）→ RegisterMemCommon 按地址区间分流（HBM 区间纯 VaManager 登记；host 地址
+含 DEVICE_RDMA 位才 halHostRegister）。MR 随后注册（isHbm ? HBM : DRAM flag）。纯本地，不影响组视图。
