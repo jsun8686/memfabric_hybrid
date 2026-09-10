@@ -600,7 +600,9 @@ entry 的节点则反序，master 失聪；单进程多 entry 场景 R12-B 之�
 ### 12.4 验证状态
 
 - 已落码待集群重编：tcp:// 回归（03/04 host 5/5 不破，且 03 不再出现 "already watched for rank state"
-  ERROR）+ HA E2E 两剧本——
+  ERROR）+ HA E2E 两剧本（已固化为自动化用例 `examples/memory_pool/02_scale_out/` 下
+  `05_far_eviction_ralloc`（tcp/etcd 双变体：剔除+换点+组收缩+多 waiter 护栏+etcd 固定 rank 透传硬校验）
+  与 `06_ha_master_switchover`（etcd：切主全链+恢复时限断言））——
   ① kill master（store leader 宿主）：观察 lease 过期→重选举→新 leader promotion→MASTER 键覆盖→FAR
   watch 收敛→extend_remote 恢复；
   ② kill FAR（贡献者）：master 日志 "candidate rank-down, rank: X existed: 1"（store 断链秒级触发）；
