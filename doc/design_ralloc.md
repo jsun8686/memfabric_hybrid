@@ -585,12 +585,22 @@ waiter 响应后不清除（server.cpp:1042-1050），一次注册持续推送�
 为下一周期 REGISTER（≤30s）。RPC 协议零新增（opcode 维持 1/2/3/5，144B/msgVersion=2 不变）。
 
 实现注意：TcpConfigStore **重连不重放 watch**（ReConnectAfterBroken 无重发），故订阅必须随 promotion 重挂；
-server 拒绝同链路重复 rank-watch（SM_REPEAT_CALL），重订阅失败时保留旧订阅（旧链路若仍活则仍在推送）。
 placement 失败（无 master/无候选）仍立即上抛——同类失败换点无意义。
+
+**rank-watch 每链路多订阅（03 E2E 发现的碰撞修复）**：server 原每链路仅允许一个 rank-state waiter
+（重复 → SM_REPEAT_CALL）。但组引擎是 per-entry 实例、每实例独立订阅 LINK_DOWN（group_engine.cpp:843，
+ralloc/bm/trans/shm 四栈 entry 共用），叠加 R12-B 的 master 剔除订阅——同进程多消费者同链路竞争，先到者
+赢、后到者永久失聪（实测 03 rank 0：master 先注 → 组引擎无限重试，entry 成员死亡清理哑火；HA 切主到已跑
+entry 的节点则反序，master 失聪；单进程多 entry 场景 R12-B 之前即会碰撞，仅 03/04 每进程单 entry 未暴露）。
+修复（server 端多 waiter）：`rankStateWaiters_` 单值 → vector（server.h），WatchRankStateHandler 判重
+删除改 push_back，RankStateTask 事件双层遍历全部推送；客户端/协议/HaConfigStore/两消费者调用代码零改动
+（每订阅独立 waiter 各收各的，订阅顺序无关）；LinkBroken 按 linkId 整链清除（原逻辑不变）。曾评估客户端
+多路复用方案（TcpConfigStore 载体扇出）后弃用——server 端 ~15 行容器化更简且语义自然。
 
 ### 12.4 验证状态
 
-- 已落码待集群重编：tcp:// 回归（03/04 host 5/5 不破）+ HA E2E 两剧本——
+- 已落码待集群重编：tcp:// 回归（03/04 host 5/5 不破，且 03 不再出现 "already watched for rank state"
+  ERROR）+ HA E2E 两剧本——
   ① kill master（store leader 宿主）：观察 lease 过期→重选举→新 leader promotion→MASTER 键覆盖→FAR
   watch 收敛→extend_remote 恢复；
   ② kill FAR（贡献者）：master 日志 "candidate rank-down, rank: X existed: 1"（store 断链秒级触发）；

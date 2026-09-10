@@ -885,12 +885,9 @@ Result AccStoreServer::WatchRankStateHandler(const acc::AccTcpRequestContext &co
     STORE_ASSERT_RETURN(context.Link() != nullptr, SM_INVALID_PARAM);
     auto linkId = context.Link()->Id();
     StoreWaitContext waitContext{-1L, WATCH_RANK_DOWN_KEY, context};
-    std::unique_lock<std::mutex> uniqueLock{storeMutex_};
-    auto pair = rankStateWaiters_.emplace(linkId, waitContext);
-    if (!pair.second) {
-        uniqueLock.unlock();
-        STORE_LOG_ERROR("link id : " << linkId << ", already watched for rank state.");
-        return SM_REPEAT_CALL;
+    {
+        std::unique_lock<std::mutex> uniqueLock{storeMutex_};
+        rankStateWaiters_[linkId].emplace_back(waitContext);
     }
     STORE_LOG_DEBUG("WATCH REQUEST(" << context.SeqNo() << ") for key(" << WATCH_RANK_DOWN_KEY
                                      << ") finished, linkId: " << linkId);
@@ -1040,13 +1037,15 @@ void AccStoreServer::RankStateTask() noexcept
         responseMessage.values.push_back(value);
         auto response = SmemMessagePacker::Pack(responseMessage);
         for (auto it = rankStateWaiters_.begin(); it != rankStateWaiters_.end(); ++it) {
-            if (!it->second.ReqCtx().Link()->Established()) {
-                STORE_LOG_WARN("rankId: " << rankId << " down notify to linkId: " << it->first
-                                          << ", id: " << it->second.ReqCtx().Link()->Id());
-                continue;
+            for (auto &waiter : it->second) {
+                if (!waiter.ReqCtx().Link()->Established()) {
+                    STORE_LOG_WARN("rankId: " << rankId << " down notify to linkId: " << it->first
+                                              << ", id: " << waiter.ReqCtx().Link()->Id());
+                    continue;
+                }
+                STORE_LOG_DEBUG("rankId: " << rankId << " down notify to linkId: " << it->first);
+                ReplyWithMessage(waiter.ReqCtx(), StoreErrorCode::SUCCESS, response);
             }
-            STORE_LOG_DEBUG("rankId: " << rankId << " down notify to linkId: " << it->first);
-            ReplyWithMessage(it->second.ReqCtx(), StoreErrorCode::SUCCESS, response);
         }
     }
 }
