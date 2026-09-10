@@ -140,6 +140,10 @@ void SmemRallocEntry::UnInitialize()
     }
     slices_.clear();
     sliceInfos_.clear();
+    for (auto &pair : registedSlice_) {
+        hybm_free_local_memory(entity_, pair.second.second, 1, flags);
+    }
+    registedSlice_.clear();
     hybm_unreserve_mem_space(entity_, flags);
     hybm_destroy_entity(entity_, flags);
     entity_ = nullptr;
@@ -622,6 +626,51 @@ Result SmemRallocEntry::Wait()
 {
     SM_ASSERT_RETURN(inited_, SM_NOT_INITIALIZED);
     return hybm_wait(entity_);
+}
+
+Result SmemRallocEntry::RegisterMem(uint64_t addr, uint64_t size)
+{
+    SM_ASSERT_RETURN(inited_, SM_NOT_INITIALIZED);
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto iter = registedSlice_.find(addr);
+    if (iter != registedSlice_.end()) {
+        if (iter->second.first != size) {
+            SM_LOG_ERROR("RegisterMem size_mismatch: addr=0x" << std::hex << addr << std::dec
+                << " new_size=" << size << " existing_size=" << iter->second.first);
+            return SM_ERROR;
+        }
+        SM_LOG_WARN("RegisterMem skip_dup: addr=0x" << std::hex << addr << std::dec << " size=" << size);
+        return SM_OK;
+    }
+    auto slice = hybm_register_local_memory(entity_, reinterpret_cast<void *>(addr), size, 0);
+    if (slice != nullptr) {
+        registedSlice_.emplace(addr, std::make_pair(size, slice));
+        SM_LOG_INFO("RegisterMem ok: addr=0x" << std::hex << addr << std::dec << " size=" << size);
+        return SM_OK;
+    }
+    SM_LOG_ERROR("RegisterMem fail: addr=0x" << std::hex << addr << std::dec << " size=" << size);
+    return SM_ERROR;
+}
+
+Result SmemRallocEntry::UnRegisterMem(uint64_t addr)
+{
+    SM_ASSERT_RETURN(inited_, SM_NOT_INITIALIZED);
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto iter = registedSlice_.find(addr);
+    if (iter == registedSlice_.end()) {
+        SM_LOG_WARN("UnRegisterMem skip_notfound: addr=0x" << std::hex << addr);
+        return SM_OK;
+    }
+    auto sz = iter->second.first;
+    auto ret = hybm_free_local_memory(entity_, iter->second.second, 1, 0);
+    if (ret != 0) {
+        SM_LOG_ERROR("UnRegisterMem free_fail: addr=0x" << std::hex << addr << std::dec
+                                                         << " size=" << sz << " ret=" << ret);
+        return SM_ERROR;
+    }
+    registedSlice_.erase(iter);
+    SM_LOG_INFO("UnRegisterMem ok: addr=0x" << std::hex << addr << std::dec << " size=" << sz);
+    return SM_OK;
 }
 
 Result SmemRallocEntry::SetGroupEventHandler(smem_ralloc_group_event_cb cb, void *context)

@@ -45,6 +45,7 @@ NEAR 节点 A 调用 ralloc_create（纯对齐：建窗+join，零本地提交�
 | `smem_ralloc_get_mem_ptr_by_rank(handle, rank)` | 槽基址，与上行同族命名（get_mem_*_by_rank），配对得有效区间 [ptr, ptr+size) |
 | `smem_ralloc_get_group_ranks(handle, rankIds, maxCount)` | 组成员快照枚举（含自身，引擎位图 GetMemberRanks 单次快照）：事件流单槽不可回放（前提 14），注册回调前的存量成员（含迟到 B 视角全员）由此发现；满容量按 worldSize 分配，返回实际数（>maxCount=截断可检测），UINT32_MAX=失败；配 get_mem_size_by_rank 区分"在组无提交"成员 |
 | `smem_ralloc_wait(handle)` / `get_rank_id()` / `set_group_event_handler(handle, cb, ctx)` | bm 同形 |
+| `smem_ralloc_register_user_mem(handle, addr, size)` / `smem_ralloc_unregister_user_mem(handle, addr)` | 用户本地内存注册（bm 同形）：`hybm_register_local_memory`/`hybm_free_local_memory` 直包，entry 幂等记账（registedSlice_，destroy 自动注销）；纯本地操作，不涉 master/RPC；按地址区间分流 HBM/DRAM，DEVICE_RDMA 池的 DRAM buffer 须 4K 对齐 |
 
 约束：`maxDramSize`/`maxHbmSize`/各 extend size 均 2M 对齐（hybm 大页约束，SMEM_RALLOC_SIZE_ALIGNMENT）；
 mem_type 枚举镜像 bm 取值，当前仅 HOST 合法；`maxHbmSize` 为 R10 占位字段（校验后暂不透传 hybm）。

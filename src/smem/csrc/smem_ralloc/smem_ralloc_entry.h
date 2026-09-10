@@ -55,6 +55,10 @@ public:
 
     Result Wait();
 
+    Result RegisterMem(uint64_t addr, uint64_t size);
+
+    Result UnRegisterMem(uint64_t addr);
+
     Result SetGroupEventHandler(smem_ralloc_group_event_cb cb, void *context);
 
     uint32_t Id() const;
@@ -124,6 +128,7 @@ private:
     hybm_exchange_info entityInfo_;
     std::vector<hybm_mem_slice_t> slices_;
     std::vector<hybm_exchange_info> sliceInfos_;
+    std::map<uint64_t, std::pair<uint64_t, hybm_mem_slice_t>> registedSlice_;
 
     std::mutex eventCbMutex_;
     smem_ralloc_group_event_cb eventCb_ = nullptr;

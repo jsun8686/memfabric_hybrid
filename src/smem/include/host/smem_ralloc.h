@@ -111,6 +111,28 @@ int32_t smem_ralloc_copy(smem_ralloc_t handle, const void *src, void *dest, uint
 int32_t smem_ralloc_wait(smem_ralloc_t handle);
 
 /**
+ * @brief Register a local user memory buffer to the pool, making it usable as the source or
+ * destination of <i>smem_ralloc_copy</i>. Purely local operation with no group interaction.
+ * DRAM buffers are the main scenario, HBM addresses are routed by address range. When the
+ * pool carries DEVICE RDMA, a DRAM buffer must be 4K aligned to register successfully.
+ *
+ * @param handle           [in] ralloc object handle created by <i>smem_ralloc_create</i>
+ * @param addr             [in] start address of the buffer
+ * @param size             [in] size of the buffer in byte
+ * @return 0 if successful
+ */
+int32_t smem_ralloc_register_user_mem(smem_ralloc_t handle, uint64_t addr, uint64_t size);
+
+/**
+ * @brief Unregister a memory buffer previously registered by <i>smem_ralloc_register_user_mem</i>
+ *
+ * @param handle           [in] ralloc object handle created by <i>smem_ralloc_create</i>
+ * @param addr             [in] start address used at registration
+ * @return 0 if successful
+ */
+int32_t smem_ralloc_unregister_user_mem(smem_ralloc_t handle, uint64_t addr);
+
+/**
  * @brief Extend one memory block on local slot, members of the pool import it via UPDATE event
  *
  * @param handle           [in] ralloc object handle created by <i>smem_ralloc_create</i>

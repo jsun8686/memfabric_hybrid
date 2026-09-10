@@ -440,6 +440,16 @@ public:
         return smem_ralloc_wait(handle_);
     }
 
+    int32_t RegisterMem(uint64_t addr, uint64_t size) noexcept
+    {
+        return smem_ralloc_register_user_mem(handle_, addr, size);
+    }
+
+    int32_t UnRegisterMem(uint64_t addr) noexcept
+    {
+        return smem_ralloc_unregister_user_mem(handle_, addr);
+    }
+
     uint64_t GetMemSizeByRank(uint32_t rank, smem_ralloc_mem_type memType)
     {
         return smem_ralloc_get_mem_size_by_rank(handle_, rank, memType);
@@ -1137,6 +1147,23 @@ Returns:
     0 if successful)")
         .def("wait", &RallocPool::Wait, py::call_guard<py::gil_scoped_release>(), R"(
 Wait all issued async copy(s) finish.)")
+        .def("register", &RallocPool::RegisterMem, py::call_guard<py::gil_scoped_release>(), py::arg("addr"),
+             py::arg("size"), R"(
+Register a local user memory buffer to the pool, making it usable as a copy source or
+destination. DRAM buffers are the main scenario, HBM addresses are routed by address range.
+
+Arguments:
+    addr(int): start address of the buffer
+    size(int): size of the buffer in byte
+Returns:
+    0 if successful)")
+        .def("unregister", &RallocPool::UnRegisterMem, py::call_guard<py::gil_scoped_release>(), py::arg("addr"), R"(
+Unregister a memory buffer previously registered by register.
+
+Arguments:
+    addr(int): start address used at registration
+Returns:
+    0 if successful)")
         .def("destroy", &RallocPool::Destroy, py::call_guard<py::gil_scoped_release>(), R"(
 Destroy the ralloc pool handle, all local memory of the entry is released with it.)")
         .def("get_mem_size_by_rank", &RallocPool::GetMemSizeByRank, py::call_guard<py::gil_scoped_release>(),
