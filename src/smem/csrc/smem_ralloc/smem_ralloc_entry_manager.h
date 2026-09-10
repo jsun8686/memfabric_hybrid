@@ -101,18 +101,20 @@ public:
     /* wake the reporter for an immediate committed-bytes report (master change / join alloc / reap) */
     void PokeReporter();
 
-    /* this process hosts the config store server (and then the ralloc master service) */
-    inline bool IsStoreServer() const
-    {
-        return isStoreServer_;
-    }
-
 private:
     int32_t PrepareStore();
     int32_t RacingForStoreServer();
     int32_t AutoRanking();
     Result StartControlPlane();
     void StopControlPlane();
+    /* activate the local master service (idempotent): full start on first call, master-key
+     * re-publish on later calls so a failover recovery overwrites a stale leader entry */
+    Result ActivateMasterOnPromotion();
+    /* leader promotion callback entry: offloads activation off the store election thread */
+    void OnLeaderPromoted();
+    /* (re)subscribe the store rank-down watch feeding the master candidate eviction;
+     * safe to call repeatedly, a failed re-subscribe keeps the previous subscription */
+    void SubscribeRankDownWatch();
     /* periodic thread on FAR nodes: reports committed bytes to the master and reaps
      * pool-empty executor entries after the grace period */
     void StartReporter();
@@ -130,7 +132,10 @@ private:
     uint32_t worldSize_{0};
     uint16_t deviceId_{0};
     bool inited_ = false;
-    bool isStoreServer_ = false;
+    std::atomic<bool> masterActivated_{false};
+    SmemRallocRpcEndpoint localEp_{};
+    std::mutex promotionThreadMutex_;
+    std::thread promotionThread_;
     std::thread reporterThread_;
     std::atomic<bool> reporterStop_{false};
     uint32_t reportIntervalSec_ = 30U;
@@ -139,6 +144,7 @@ private:
     std::condition_variable reporterCv_;
     bool reporterPoke_ = false;
     uint32_t masterWatchId_ = UINT32_MAX;
+    uint32_t rankWatchId_ = UINT32_MAX;
     mutable std::mutex masterMutex_;
     SmemRallocRpcEndpoint masterEp_{};
     UrlExtraction storeUrlExtraction_;

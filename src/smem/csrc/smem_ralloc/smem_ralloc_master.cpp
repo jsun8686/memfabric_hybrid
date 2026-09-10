@@ -20,6 +20,10 @@
 
 namespace ock {
 namespace smem {
+/* a candidate that has not re-registered for this long is considered dead (reporter default
+ * interval is 30s, 3 missed periods = death); false positives self-heal on next REGISTER */
+constexpr uint32_t SMEMRA_CANDIDATE_STALE_SEC = 90U;
+
 SmemRallocMasterService &SmemRallocMasterService::Instance()
 {
     static SmemRallocMasterService instance;
@@ -48,6 +52,7 @@ Result SmemRallocMasterService::Start(const StorePtr &store, const SmemRallocRpc
         if (seedSelf) {
             Candidate self{};
             self.ep = selfEp;
+            self.lastSeen = std::chrono::steady_clock::now();
             candidates_.emplace(selfEp.rankId, self);
         }
     }
@@ -95,6 +100,7 @@ Result SmemRallocMasterService::OnRegister(SmemRallocRpcMsg &msg)
         candidate.ep = ep;
         candidate.committedBytes = msg.size;
         candidate.deviceCommittedBytes = msg.deviceCommittedBytes;
+        candidate.lastSeen = std::chrono::steady_clock::now();
         auto it = candidates_.find(msg.nodeRank);
         if (it != candidates_.end()) {
             it->second = candidate;
@@ -117,6 +123,18 @@ Result SmemRallocMasterService::OnPlacement(SmemRallocRpcMsg &msg)
 
     {
         std::lock_guard<std::mutex> guard(mutex_);
+        /* prune candidates whose reporter went silent (crashed node): placement must never
+         * pick a node nobody has heard from for 3 report periods */
+        const auto now = std::chrono::steady_clock::now();
+        for (auto it = candidates_.begin(); it != candidates_.end();) {
+            if (now - it->second.lastSeen > std::chrono::seconds(SMEMRA_CANDIDATE_STALE_SEC)) {
+                SM_LOG_WARN("prune stale candidate, rank: " << it->first << " endpoint: " << it->second.ep.ip
+                                                            << ":" << it->second.ep.port);
+                it = candidates_.erase(it);
+            } else {
+                ++it;
+            }
+        }
         /* pick the least committed candidate of the requested media (last reported value), never
          * place on the requester itself; accounting is overwrite-style, no optimistic add here */
         const bool deviceMedia = msg.memType == SMEM_RALLOC_MEM_TYPE_DEVICE;
@@ -149,6 +167,18 @@ Result SmemRallocMasterService::OnPlacement(SmemRallocRpcMsg &msg)
                                                  << msg.nodeRank << " endpoint: " << msg.nodeIp << ":"
                                                  << msg.nodePort);
     return SM_OK;
+}
+
+void SmemRallocMasterService::OnRankDown(uint32_t rank)
+{
+    {
+        std::lock_guard<std::mutex> guard(mutex_);
+        auto erased = candidates_.erase(rank);
+        SM_LOG_WARN("candidate rank-down, rank: " << rank << " existed: " << erased);
+    }
+    /* idempotent: an absent rank is a no-op (e.g. NEAR-only links also fire rank-down);
+     * a wrongly dropped node re-registers on its next periodic report, the table
+     * self-heals within one report interval */
 }
 } // namespace smem
 } // namespace ock

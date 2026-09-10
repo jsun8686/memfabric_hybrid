@@ -96,6 +96,12 @@ public:
     void SetConnectStatus(bool status) noexcept override;
     void RegisterClientBrokenHandler(const ConfigStoreClientBrokenHandler &handler) noexcept override;
     void RegisterServerBrokenHandler(const ConfigStoreServerBrokenHandler &handler) noexcept override;
+    void RegisterLeaderPromotionHandler(const ConfigStoreLeaderPromotionHandler &handler) noexcept override;
+
+    bool IsLeaderStore() const noexcept override
+    {
+        return isLeader_.load(std::memory_order_acquire);
+    }
 
 protected:
     [[nodiscard]] Result GetReal(const std::string &key, std::vector<uint8_t> &value,
@@ -147,6 +153,7 @@ private:
     std::thread reElectionThread_;
 
     ConfigStoreServerBrokenHandler cachedServerBrokenHandler_{nullptr};
+    ConfigStoreLeaderPromotionHandler leaderPromotionHandler_{nullptr};
 
     std::atomic<bool> healthCheckRunning_{false};
     std::thread healthCheckThread_;

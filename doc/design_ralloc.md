@@ -342,7 +342,7 @@ reaper（manager 周期线程，FAR 节点）：FAR entry 且标记超过宽限�
 | R9 | B 迟到访问 | create(0)+join 融合；extent 经 `get_mem_size_by_rank` 免费获知 | 复用 | P1.5 | 已交付（内存可见性消解；应用层仅剩对象布局元数据需自行同步；**存量成员发现缺口**经代码级验证——单槽事件流不可回放，见前提 14——由 `get_group_ranks` 补齐） |
 | R10 | HBM 介质放开 | ralloc option `maxHbmSize`；extend_* memType 路由；RPC 消息 v2（maxHbmSize/deviceCommittedBytes）；master 双桶 LB（§11） | 新增 | P3 | 已交付（03 device 变体 E2E 5/5：HBM-only 池 + SDMA\|DEVICE_RDMA + extend_local/remote(DEVICE) + copy 往返 + wait；A2/910C-V3 环境约束与出路见 §11.7） |
 | R11 | zbal 适配评估 | — | — | P3 | 待启动 |
-| R12 | 故障场景（X 掉线/重连、master 降级/切主自动重竞速、LinkDown 时延打磨；hybm allocatedSize_ 失败不回滚） | LeaveHandle/LinkDown 机制 | 复用+打磨 | P3 | 待启动（handler 全员化+**watch 触发即时重注册**已消解切主 30s 收敛窗；FAR 周期 REGISTER 天然重建候选表；切主检测/重竞速本身仍待做） |
+| R12 | 故障场景（X 掉线/重连、master 降级/切主自动重竞速、死 FAR 剔除；LinkDown 时延打磨、hybm allocatedSize_ 失败不回滚留待） | HA store 切主联动（promotion 订阅+IsLeaderStore 查询，isStoreServer_ 意图旗标删除）+master 订阅 store rank-down watch+候选表 lastSeen prune | 新增（薄，store 层零控制逻辑）+复用 | P3 | 已落码待验证（§12：A=HA 切主联动+激活归一为 IsLeaderStore 查询（意图/状态分离）；B=死 FAR 剔除——rank-down watch 秒级剔（主信号）+同节点退避重选（补竞窗）+90s prune（兜底）；tcp 回归不破，行为等价矩阵见 §12.2/12.3） |
 | R13 | FAR entry 生命周期闭环（组空自毁） | 角色键 RA_ROLE_+memberRoles_+reaper | 新增 | P2 | 已交付（§6.5；宽限 5s/env；FAR 禁 create 免属主标记） |
 | R14 | 用户本地内存注册（bm 对齐） | `smem_ralloc_register_user_mem`/`unregister_user_mem`：entry 幂等记账 registedSlice_，destroy 自动注销；纯本地不涉 master/RPC | 新增（薄） | P3 | 已落码待重编验证（python：register/unregister；DRAM 主场景，DEVICE_RDMA 池 DRAM buffer 须 4K 对齐） |
 
@@ -528,3 +528,75 @@ InitTagManager 把 op 位展开为同 tag 规则，rank 对 op 集 = 池声明�
 **register_user_mem 链路**（R14）：hybm_register_local_memory → RegisterLocalMemory（bm 场景优先
 dramSegment_，entity:242-246）→ RegisterMemCommon 按地址区间分流（HBM 区间纯 VaManager 登记；host 地址
 含 DEVICE_RDMA 位才 halHostRegister）。MR 随后注册（isHbm ? HBM : DRAM flag）。纯本地，不影响组视图。
+
+## 12. 故障容错（R12：HA 切主联动 + 死 FAR 剔除）
+
+### 12.1 背景：HA 部署下 ralloc master 曾无法启动
+
+bm/ralloc 的 master 激活原是 init 期 `isStoreServer_` 判定（rankId==0 或本地 IP 竞速胜出）。tcp:// 单点
+store 下成立；但 reg://etcd:// 部署下 store server 宿主由 HaConfigStore 选举决定（TTL 5s lease + 4s 健康
+检查 + 断连异步重选举，config_store_cluster_ha.md），init 判定恒失败 ⇒ master 无人激活。rankId 调查另证
+实：`CreateHaStore` 曾丢弃 isServer/rankId 参数——isServer 属意图（HA 按定义忽略，正确），rankId 丢弃则是
+bug（固定 rank 在 store 存活体系不可见，且 R12-B 的 rank-down watch 主信号会哑火）；已修复为工厂透传
+rankId（clientDelegate 连接时注册，server 端机制现成），isServer 维持丢弃。
+
+### 12.2 A 部分：切主联动（promotion 回调为唯一激活源）
+
+```
+HaConfigStore::TryBecomeLeader 成功点（server 起+KEY_LEADER 注册+自连通）
+  └─ leaderPromotionHandler_（新钩子，stateMutex_ 保护）
+       └─ ralloc: OnLeaderPromoted（选举线程契约：offload 到 promotionThread_ 链式线程）
+            └─ ActivateMasterOnPromotion()（幂等，CAS masterActivated_）
+                 首次：Start master（Set MASTER 键）+ masterEp_=self + FAR 补 StartReporter
+                 再次：仅重发布 MASTER 键（清掉死 leader 遗留的陈旧端点）
+```
+
+- **钩子接口**：`ConfigStoreManager::RegisterLeaderPromotionHandler`（基类默认空，TcpConfigStore 零改动，
+  PrefixStore 转发）；配套 `IsLeaderStore()` 查询虚函数（tcp=isServer_ / HA=isLeader_，同转发）。
+  store 层本需求只新增查询/订阅，**零控制逻辑**
+- **首选举竞态**：HaConfigStore 选举在 CreateStoreByUrl 内同步完成，先于 ralloc 注册钩子；StartControlPlane
+  注册后立即 `IsLeaderStore()` 追赶，错过的事件补激活
+- **单激活源（意图/状态分离）**：激活唯一依据 = `IsLeaderStore()` 查询（tcp=创建期 isServer_ / HA=选举
+  isLeader_）；ralloc 不再缓存 `isStoreServer_` 意图旗标（已删，含 getter）。意图经既有 `isServer` 参数
+  流入 store——HA backend 按定义忽略（"用不用是他的事情"），tcp 按显式语义执行（rank0 非宿主 misconfig
+  快失败升格为显式语义）；竞速（IP 检查→抢端口→RESOURCE_IN_USE 降级）留在引擎侧 RacingForStoreServer，
+  胜负结果不落旗标、事后查询。杜绝 rank0-init 与 promotion 双主互踩（意图旗标与选举状态不再可能脱钩）
+- **FAR 死端自愈**（顺带修复）：init 期 master 未发现不再提前 return（reporter/watch 照常启动）；
+  ReportCommittedBytes 在 !HasMaster() 时先 RefreshMasterEndpoint 再放弃——HA 初始竞态下一周期自愈
+- **降级不处理**（A5 决策）：leader 降级后本地 master 服务留存，新 leader promotion 重发布 MASTER 键，
+  存量节点 watch 收敛（秒级，2s 节流）+ FAR 周期重注册重建候选表；脑裂窗口 = lease TTL（秒级），可接受
+
+### 12.3 B 部分：死 FAR 剔除（三层，master 侧监控为主信号）
+
+master 宿主在激活时（`ActivateMasterOnPromotion`，随每次 promotion 续订）通过 confStore_ 订阅 store 的
+`WATCH_RANK_LINK_DOWN`：store 对每条连接做心跳（超时≈3s），断链即向所有订阅链接推送 rank-down；server 端
+waiter 响应后不清除（server.cpp:1042-1050），一次注册持续推送。**ralloc rankId ≡ store 连接 rank**（tcp+
+固定与 etcd+固定：connReq 携带、连接时登记——etcd 侧经 rankId 工厂透传修复；tcp/etcd+auto：FindOrInsertRank
+分配后 SetRankId 回填），键可直接对用。
+
+| 层 | 触发 | 行为 | 时延 |
+|---|---|---|---|
+| **rank-down watch**（主信号） | store 断链/心跳超时 → master 回调 `OnRankDown` 擦候选表 | 秒级、全集群生效、零轮询 | ~3s |
+| 同节点退避重选（调用内补竞窗） | extend_remote JOIN 连接级失败（SM_NOT_CONNECTED/SM_TIMEOUT）后 placement 仍选中该 rank | 记 failedRank，被重选时 sleep 2s 等 watch 落地再重选，≤4 轮 | 竞窗内 |
+| lastSeen prune（兜底卫生） | 每次 OnPlacement | 剔 90s（3×上报周期）未上报候选——watch 丢失/未覆盖也能收敛 | ≤90s |
+
+设计取舍（弃用 requester 主动 EVICT rpc 的原因）：真死场景 watch 全覆盖且更快；**NEAR↔FAR 分区场景**
+（FAR 健康、仅请求方不可达）requester 侧 JOIN 超时会误剔健康节点，watch 侧不剔（正确）；误剔自愈路径统一
+为下一周期 REGISTER（≤30s）。RPC 协议零新增（opcode 维持 1/2/3/5，144B/msgVersion=2 不变）。
+
+实现注意：TcpConfigStore **重连不重放 watch**（ReConnectAfterBroken 无重发），故订阅必须随 promotion 重挂；
+server 拒绝同链路重复 rank-watch（SM_REPEAT_CALL），重订阅失败时保留旧订阅（旧链路若仍活则仍在推送）。
+placement 失败（无 master/无候选）仍立即上抛——同类失败换点无意义。
+
+### 12.4 验证状态
+
+- 已落码待集群重编：tcp:// 回归（03/04 host 5/5 不破）+ HA E2E 两剧本——
+  ① kill master（store leader 宿主）：观察 lease 过期→重选举→新 leader promotion→MASTER 键覆盖→FAR
+  watch 收敛→extend_remote 恢复；
+  ② kill FAR（贡献者）：master 日志 "candidate rank-down, rank: X existed: 1"（store 断链秒级触发）；
+  NEAR 侧 extend_remote 观察重选点（多 FAR 部署）或竞窗退避后换点成功；
+  单 FAR 部署 kill FAR → 剔除后无候选，placement 报 SM_OBJECT_NOT_EXISTS（预期）
+- rankId × store 模式组合结论（本轮调查+修复后，均待 E2E）：tcp+auto ✅（rank=连接顺序，跨重启不稳定，
+  127.0.0.1 同机多进程勿用）；tcp+固定 ✅（连接时登记）；etcd+auto ✅（FindOrInsertRank 打到真 leader）；
+  **etcd+固定 ✅（本轮修复：rankId 工厂透传 → 连接时登记 → rank 存活/watch 打通；master 激活经
+  IsLeaderStore/promotion 不再绑死 rank0）**；dup-rank（两节点同 rankId）四组合均为用户配置责任，未处理

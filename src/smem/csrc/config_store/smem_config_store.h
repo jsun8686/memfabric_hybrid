@@ -40,6 +40,7 @@ using ConfigStoreClientBrokenHandler = std::function<int()>;
 using ConfigStoreServerOpHandler =
     std::function<int32_t(const uint32_t, const std::string &, std::vector<uint8_t> &, const StoreBackendPtr &)>;
 using ConfigStoreServerBrokenHandler = std::function<void(const uint32_t, StoreBackendPtr &)>;
+using ConfigStoreLeaderPromotionHandler = std::function<void()>;
 
 class ConfigStore : public SmReferable {
 public:
@@ -282,6 +283,27 @@ public:
      * @param handler      [in] handler to be invoked when server connection is broken
      */
     virtual void RegisterServerBrokenHandler(const ConfigStoreServerBrokenHandler &handler) noexcept = 0;
+
+    /**
+     * @brief Register leader promotion handler (HA store only).
+     *        Invoked when this node wins the leader election and the store server
+     *        is fully promoted. Never fires on non-HA (tcp) stores. The callback
+     *        runs on the election thread and must return quickly (spawn its own
+     *        thread for heavy work).
+     * @param handler      [in] handler to be invoked on leader promotion
+     */
+    virtual void RegisterLeaderPromotionHandler(const ConfigStoreLeaderPromotionHandler &handler) noexcept
+    {
+        (void)handler;
+    }
+
+    /**
+     * @brief Whether this node currently hosts the store server (HA leader / tcp server host)
+     */
+    virtual bool IsLeaderStore() const noexcept
+    {
+        return false;
+    }
 
     virtual void SetRankId(const int32_t &rankId) noexcept {}
 };

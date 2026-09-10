@@ -79,8 +79,8 @@ public:
 
 private:
     static StorePtr CreateHaStore(const StoreBackendPtr &backend, const std::string &storeKey,
-                                  const std::string &storeUrl, uint32_t worldSize,
-                                  const std::string &instanceId) noexcept;
+                                  const std::string &storeUrl, uint32_t worldSize, const std::string &instanceId,
+                                  int32_t rankId = -1) noexcept;
     static std::mutex storesMutex_;
     static std::unordered_map<std::string, StorePtr> storesMap_;
     static smem_tls_config tlsOption_;

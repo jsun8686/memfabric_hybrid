@@ -12,6 +12,7 @@
 #ifndef MEMFABRIC_HYBRID_SMEM_RALLOC_MASTER_H
 #define MEMFABRIC_HYBRID_SMEM_RALLOC_MASTER_H
 
+#include <chrono>
 #include <map>
 #include <mutex>
 
@@ -22,11 +23,13 @@ namespace ock {
 namespace smem {
 /*
  * Master service of ralloc: pure rpc service, not a member of any pool.
- * Op handlers are registered by the rpc service on every node; the process hosting the
- * config store server activates the master role during smem_ralloc_init: publishes its
- * rpc endpoint under the RA_ prefixed store, keeps the candidate table of FAR nodes
- * (with their last reported committed bytes) and answers PLACEMENT with the least
- * committed node.
+ * Op handlers are registered by the rpc service on every node; the node hosting the
+ * config store server activates the master role: on tcp stores that host is fixed at
+ * init, on HA stores it follows the store leader election (promotion callback).
+ * It publishes its rpc endpoint under the RA_ prefixed store, keeps the candidate
+ * table of FAR nodes (with their last reported committed bytes and last-seen time)
+ * and answers PLACEMENT with the least committed node. Dead candidates are dropped
+ * via the store rank-down watch (seconds) and the placement-time stale prune (90s).
  */
 class SmemRallocMasterService {
 public:
@@ -53,11 +56,17 @@ public:
 
     Result OnPlacement(SmemRallocRpcMsg &msg);
 
+    /* local callback fed by the store rank-down watch: erase the candidate whose store
+     * link broke (store heartbeat detects death in seconds); idempotent, a transient
+     * flap self-heals on the node's next periodic REGISTER */
+    void OnRankDown(uint32_t rank);
+
 private:
     struct Candidate {
         SmemRallocRpcEndpoint ep{};
         uint64_t committedBytes = 0;       /* committed bytes on the HOST media, last reported value */
         uint64_t deviceCommittedBytes = 0; /* committed bytes on the DEVICE media, last reported value */
+        std::chrono::steady_clock::time_point lastSeen{}; /* refreshed by every periodic REGISTER */
     };
 
     std::mutex mutex_;

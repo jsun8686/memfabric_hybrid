@@ -86,6 +86,11 @@ public:
 
     void SetRankId(const int32_t &rankId) noexcept override;
 
+    bool IsLeaderStore() const noexcept override
+    {
+        return isServer_;
+    }
+
     Result ReConnectAfterBroken(int reconnectRetryTimes) noexcept override;
     bool GetConnectStatus() noexcept override;
     void SetConnectStatus(bool status) noexcept override;

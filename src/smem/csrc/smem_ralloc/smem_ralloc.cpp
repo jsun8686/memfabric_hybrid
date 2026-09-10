@@ -10,7 +10,9 @@
  * See the Mulan PSL v2 for more details.
  */
 #include <algorithm>
+#include <chrono>
 #include <limits>
+#include <thread>
 #include "smem_common_includes.h"
 #include "hybm_big_mem.h"
 #include "smem_logger.h"
@@ -386,62 +388,99 @@ SMEM_API int32_t smem_ralloc_extend_remote_mem(smem_ralloc_t handle, smem_ralloc
         return SM_NOT_STARTED;
     }
 
-    /* 1. ask master to pick the contributor node (least loaded on the requested media, never the requester itself) */
-    SmemRallocRpcMsg placeMsg{};
-    placeMsg.op = SMEMRA_RPC_OP_PLACEMENT;
-    placeMsg.size = size;
-    placeMsg.memType = static_cast<uint32_t>(memType);
-    auto masterEp = manager.GetMasterEndpoint();
-    ret = rpc.SyncCall(masterEp, placeMsg);
-    if (ret == SM_NOT_CONNECTED) {
-        /* cached master endpoint may be stale (restart/failover), refresh and retry once */
-        manager.RefreshMasterEndpoint();
+    /* bounded re-placement: a chosen contributor may be dead (crashed after its last
+     * register); the master's store rank-down watch evicts it within seconds, so on a
+     * connection-level join failure just remember the rank -- if placement reuses it
+     * before the eviction lands, back off one beat and re-place */
+    constexpr uint32_t joinRounds = 4U;
+    constexpr uint32_t sameNodeBackoffSec = 2U;
+    Result lastErr = SM_ERROR;
+    uint32_t failedRank = SMEM_RALLOC_INVALID_RANK;
+    for (uint32_t round = 0; round < joinRounds; round++) {
+        /* 1. ask master to pick the contributor node (least loaded on the requested media, never
+         * the requester itself) */
+        SmemRallocRpcMsg placeMsg{};
+        placeMsg.op = SMEMRA_RPC_OP_PLACEMENT;
+        placeMsg.size = size;
+        placeMsg.memType = static_cast<uint32_t>(memType);
         ret = rpc.SyncCall(manager.GetMasterEndpoint(), placeMsg);
-    }
-    if (ret != SM_OK || placeMsg.result != SM_OK) {
-        SM_LOG_AND_SET_LAST_ERROR_CODE(ret != SM_OK ? ret : placeMsg.result,
-            "placement failed, ret: " << ret << " result: " << placeMsg.result);
-        return ret != SM_OK ? ret : placeMsg.result;
-    }
-
-    /* 2. ask the contributor to build/extend the pool, join on demand and return block gva */
-    SmemRallocRpcEndpoint node{};
-    node.rankId = placeMsg.nodeRank;
-    node.port = static_cast<uint16_t>(placeMsg.nodePort);
-    (void)strncpy(node.ip, placeMsg.nodeIp, sizeof(node.ip) - 1);
-
-    const auto &coreOptions = entry->GetCoreOptions();
-    SmemRallocRpcMsg allocMsg{};
-    allocMsg.op = SMEMRA_RPC_OP_JOIN_ALLOC;
-    allocMsg.poolId = entry->Id();
-    allocMsg.size = size;
-    allocMsg.maxDramSize = coreOptions.maxDRAMSize;
-    allocMsg.maxHbmSize = coreOptions.maxHBMSize;
-    allocMsg.dataOpType = SmemRallocHelper::TransSmemDataOpType(coreOptions.bmDataOpType);
-    allocMsg.flags = coreOptions.flags;
-    allocMsg.enable56BitsGva = coreOptions.enable56BitsGva;
-    allocMsg.memType = static_cast<uint32_t>(memType);
-    ret = rpc.SyncCall(node, allocMsg);
-    if (ret != SM_OK || allocMsg.result != SM_OK || allocMsg.gva == 0) {
-        SM_LOG_AND_SET_LAST_ERROR_CODE(ret != SM_OK ? ret : allocMsg.result,
-            "remote join alloc failed, ret: " << ret << " result: " << allocMsg.result
-                                              << " gva: " << allocMsg.gva);
-        if (ret != SM_OK) {
-            return ret;
+        if (ret == SM_NOT_CONNECTED) {
+            /* cached master endpoint may be stale (restart/failover), refresh and retry once */
+            manager.RefreshMasterEndpoint();
+            ret = rpc.SyncCall(manager.GetMasterEndpoint(), placeMsg);
         }
-        return allocMsg.result != SM_OK ? static_cast<Result>(allocMsg.result) : static_cast<Result>(SM_ERROR);
+        if (ret != SM_OK || placeMsg.result != SM_OK) {
+            /* placement failure is not contributor-related (no master / no candidate), re-placement
+             * within the same call would not help */
+            SM_LOG_AND_SET_LAST_ERROR_CODE(ret != SM_OK ? ret : placeMsg.result,
+                "placement failed, ret: " << ret << " result: " << placeMsg.result);
+            return ret != SM_OK ? ret : placeMsg.result;
+        }
+
+        if (placeMsg.nodeRank == failedRank) {
+            /* master has not observed the death yet (rank-down watch / heartbeat is
+             * seconds-scale): wait one beat and re-place instead of hammering the corpse */
+            SM_LOG_WARN("placement reused failed rank: " << failedRank << ", backing off "
+                          << sameNodeBackoffSec << "s for the master eviction to land");
+            std::this_thread::sleep_for(std::chrono::seconds(sameNodeBackoffSec));
+            continue;
+        }
+
+        /* 2. ask the contributor to build/extend the pool, join on demand and return block gva */
+        SmemRallocRpcEndpoint node{};
+        node.rankId = placeMsg.nodeRank;
+        node.port = static_cast<uint16_t>(placeMsg.nodePort);
+        (void)strncpy(node.ip, placeMsg.nodeIp, sizeof(node.ip) - 1);
+
+        const auto &coreOptions = entry->GetCoreOptions();
+        SmemRallocRpcMsg allocMsg{};
+        allocMsg.op = SMEMRA_RPC_OP_JOIN_ALLOC;
+        allocMsg.poolId = entry->Id();
+        allocMsg.size = size;
+        allocMsg.maxDramSize = coreOptions.maxDRAMSize;
+        allocMsg.maxHbmSize = coreOptions.maxHBMSize;
+        allocMsg.dataOpType = SmemRallocHelper::TransSmemDataOpType(coreOptions.bmDataOpType);
+        allocMsg.flags = coreOptions.flags;
+        allocMsg.enable56BitsGva = coreOptions.enable56BitsGva;
+        allocMsg.memType = static_cast<uint32_t>(memType);
+        ret = rpc.SyncCall(node, allocMsg);
+        if (ret == SM_OK && allocMsg.result == SM_OK && allocMsg.gva != 0) {
+            /* 3. deliver the block info, gva is usable at once: the contributor replies strictly
+             * after its GroupJoin/GroupUpdate barrier returned, by then this node has imported
+             * the block */
+            if (info != nullptr) {
+                info->rankId = allocMsg.ownerRank;
+                info->gva = reinterpret_cast<void *>(allocMsg.gva);
+            }
+            SM_LOG_INFO("remote block created, pool: " << entry->Id() << " ownerRank: " << allocMsg.ownerRank
+                                                       << " gva: " << reinterpret_cast<void *>(allocMsg.gva)
+                                                       << " size: " << size << " round: " << round);
+            return SM_OK;
+        }
+
+        lastErr = ret != SM_OK ? ret
+                               : (allocMsg.result != SM_OK ? static_cast<Result>(allocMsg.result)
+                                                           : static_cast<Result>(SM_ERROR));
+        if (ret == SM_NOT_CONNECTED || ret == SM_TIMEOUT) {
+            /* the contributor is likely dead: remember the rank, the master's rank-down
+             * watch drops it from the candidate table within seconds and the next
+             * placement picks another node */
+            SM_LOG_WARN("join alloc failed on likely-dead contributor, rank: " << node.rankId
+                          << " endpoint: " << node.ip << ":" << node.port << " ret: " << ret
+                          << " round: " << round << ", re-placing");
+            failedRank = node.rankId;
+            continue;
+        }
+
+        /* non-connection failure (param / pool state): another node would fail the same way */
+        SM_LOG_AND_SET_LAST_ERROR_CODE(lastErr, "remote join alloc failed, ret: " << ret
+                          << " result: " << allocMsg.result << " gva: " << allocMsg.gva);
+        return lastErr;
     }
 
-    /* 3. deliver the block info, gva is usable at once: the contributor replies strictly after
-     * its GroupJoin/GroupUpdate barrier returned, by then this node has imported the block */
-    if (info != nullptr) {
-        info->rankId = allocMsg.ownerRank;
-        info->gva = reinterpret_cast<void *>(allocMsg.gva);
-    }
-    SM_LOG_INFO("remote block created, pool: " << entry->Id() << " ownerRank: " << allocMsg.ownerRank
-                                               << " gva: " << reinterpret_cast<void *>(allocMsg.gva)
-                                               << " size: " << size);
-    return SM_OK;
+    SM_LOG_AND_SET_LAST_ERROR_CODE(lastErr, "remote join alloc failed after " << joinRounds
+                      << " rounds, no reachable contributor left");
+    return lastErr;
 }
 
 SMEM_API uint64_t smem_ralloc_get_mem_size_by_rank(smem_ralloc_t handle, uint32_t rank,

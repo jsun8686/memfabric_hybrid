@@ -82,7 +82,7 @@ Result SmemRallocEntryManager::Initialize(const std::string &storeURL, uint32_t 
     ret = StartControlPlane();
     SM_LOG_ERROR_RETURN_IT_IF_NOT_OK(ret, "start control plane failed: " << ret);
 
-    if (config_.role == SMEM_RALLOC_ROLE_FAR && !isStoreServer_) {
+    if (config_.role == SMEM_RALLOC_ROLE_FAR && !masterActivated_.load()) {
         (void)ReportCommittedBytes(SMEMRA_CANDIDATE_REGISTER_RETRY);
     }
 
@@ -110,8 +110,11 @@ int32_t SmemRallocEntryManager::PrepareStore()
     StoreFactory::SetTlsInfo(storeTls);
     if (!config_.autoRanking) {
         SM_ASSERT_RETURN(config_.rankId < worldSize_, SM_INVALID_PARAM);
-        isStoreServer_ = (config_.rankId == 0 && config_.startConfigStoreServer);
-        confStore_ = StoreFactory::CreateStoreByUrl(storeURL_, isStoreServer_, worldSize_, static_cast<int>(config_.rankId));
+        /* intent shaping stays engine-side: explicit rank-0 host for fixed-rank deployments,
+         * a misconfigured host (rank 0 not on the store url host) fails fast inside store
+         * creation; whether the intent is honored at all is the store layer's decision */
+        const bool isServer = (config_.rankId == 0 && config_.startConfigStoreServer);
+        confStore_ = StoreFactory::CreateStoreByUrl(storeURL_, isServer, worldSize_, static_cast<int>(config_.rankId));
         SM_ASSERT_RETURN(confStore_ != nullptr, StoreFactory::GetFailedReason());
     } else {
         if (config_.startConfigStoreServer) {
@@ -139,8 +142,10 @@ int32_t SmemRallocEntryManager::RacingForStoreServer()
 
     confStore_ = StoreFactory::CreateStoreByUrl(storeURL_, true, worldSize_);
     if (confStore_ != nullptr || StoreFactory::GetFailedReason() == SM_RESOURCE_IN_USE) {
-        /* confStore_ non-null means local process won the racing and hosts the store server */
-        isStoreServer_ = (confStore_ != nullptr);
+        /* confStore_ non-null means this process won the racing and hosts the store server
+         * (the outcome is queried later via IsLeaderStore, never cached here); a lost racing
+         * (RESOURCE_IN_USE, another local process won) falls through to plain client
+         * creation in PrepareStore */
         return SM_OK;
     }
 
@@ -270,6 +275,7 @@ Result SmemRallocEntryManager::StartControlPlane()
     localEp.rankId = config_.rankId;
     localEp.port = static_cast<uint16_t>(port);
     (void)strncpy(localEp.ip, localIp.c_str(), sizeof(localEp.ip) - 1);
+    localEp_ = localEp;
 
     {
         std::lock_guard<std::mutex> guard(masterMutex_);
@@ -285,36 +291,43 @@ Result SmemRallocEntryManager::StartControlPlane()
     ret = SmemRallocExecutor::Start();
     SM_LOG_ERROR_RETURN_IT_IF_NOT_OK(ret, "start executor failed: " << ret);
 
-    if (isStoreServer_) {
-        /* store server host activates the master service and publishes its rpc endpoint,
-         * seeds itself as placement candidate when its role is FAR */
-        ret = SmemRallocMasterService::Instance().Start(confStore_, localEp,
-                                                        config_.role == SMEM_RALLOC_ROLE_FAR);
-        SM_LOG_ERROR_RETURN_IT_IF_NOT_OK(ret, "start master service failed: " << ret);
-        std::lock_guard<std::mutex> guard(masterMutex_);
-        masterEp_ = localEp;
-        if (config_.role == SMEM_RALLOC_ROLE_FAR) {
-            /* FAR store host also contributes: its accounting is refreshed via loopback reports */
-            StartReporter();
+    {
+        auto mgr = Convert<ConfigStore, ConfigStoreManager>(confStore_);
+        if (mgr != nullptr) {
+            /* HA failover: re-election promotes a new store leader, this node then activates
+             * its ralloc master; the callback runs on the election thread, work is offloaded */
+            mgr->RegisterLeaderPromotionHandler([this]() { OnLeaderPromoted(); });
         }
-        return SM_OK;
+    }
+
+    {
+        auto mgr = Convert<ConfigStore, ConfigStoreManager>(confStore_);
+        if (mgr != nullptr && mgr->IsLeaderStore()) {
+            /* single activation source: this node currently hosts the store server. tcp
+             * stores answer from their fixed creation role (explicit rank-0 host / racing
+             * winner), HA stores from the election -- whose initial run happened synchronously
+             * inside store creation, before the handler above was registered, hence this
+             * one-shot query also catches up the missed initial promotion */
+            ret = ActivateMasterOnPromotion();
+            SM_LOG_ERROR_RETURN_IT_IF_NOT_OK(ret, "activate master failed: " << ret);
+            return SM_OK;
+        }
     }
 
     /* non-master node: discover master endpoint from store, needed by both roles
-     * (NEAR sends PLACEMENT to it, FAR registers with it) */
+     * (NEAR sends PLACEMENT to it, FAR registers with it). A miss is not fatal on HA:
+     * the master may activate later, the reporter refreshes the endpoint every cycle */
     std::vector<uint8_t> epData;
     ret = confStore_->Get(SMEMRA_RPC_MASTER_STORE_KEY, epData, SMEMRA_MASTER_DISCOVER_TIMEOUT_MS);
-    if (ret != SM_OK || epData.size() != sizeof(SmemRallocRpcEndpoint)) {
-        /* no master in this deployment, remote policies will be rejected at create time */
-        SM_LOG_WARN("master endpoint not found, ret: " << ret << " remote placement disabled");
-        return SM_OK;
-    }
-
-    SmemRallocRpcEndpoint masterEp{};
-    (void)memcpy(&masterEp, epData.data(), sizeof(SmemRallocRpcEndpoint));
-    {
-        std::lock_guard<std::mutex> guard(masterMutex_);
-        masterEp_ = masterEp;
+    if (ret == SM_OK && epData.size() == sizeof(SmemRallocRpcEndpoint)) {
+        SmemRallocRpcEndpoint masterEp{};
+        (void)memcpy(&masterEp, epData.data(), sizeof(SmemRallocRpcEndpoint));
+        {
+            std::lock_guard<std::mutex> guard(masterMutex_);
+            masterEp_ = masterEp;
+        }
+    } else {
+        SM_LOG_WARN("master endpoint not found, ret: " << ret << ", remote placement deferred");
     }
 
     if (config_.role != SMEM_RALLOC_ROLE_FAR) {
@@ -342,6 +355,80 @@ Result SmemRallocEntryManager::StartControlPlane()
 
 
     return SM_OK;
+}
+
+Result SmemRallocEntryManager::ActivateMasterOnPromotion()
+{
+    /* a promotion thread may still be in flight when the control plane is being torn down */
+    SM_ASSERT_RETURN(confStore_ != nullptr, SM_NOT_INITIALIZED);
+    SubscribeRankDownWatch();
+    bool expected = false;
+    if (!masterActivated_.compare_exchange_strong(expected, true)) {
+        /* already activated: re-publish the endpoint key only, so a failover recovery of this
+         * node overwrites the stale master entry possibly left by a dead previous leader */
+        std::vector<uint8_t> epData(reinterpret_cast<uint8_t *>(&localEp_),
+                                    reinterpret_cast<uint8_t *>(&localEp_) + sizeof(localEp_));
+        auto pubRet = confStore_->Set(SMEMRA_RPC_MASTER_STORE_KEY, epData);
+        SM_LOG_WARN("master already activated, re-publish master key ret: " << pubRet);
+        return pubRet;
+    }
+
+    /* store leader activates the master service and publishes its rpc endpoint,
+     * seeds itself as placement candidate when its role is FAR */
+    auto ret = SmemRallocMasterService::Instance().Start(confStore_, localEp_,
+                                                         config_.role == SMEM_RALLOC_ROLE_FAR);
+    SM_LOG_ERROR_RETURN_IT_IF_NOT_OK(ret, "start master service failed: " << ret);
+    {
+        std::lock_guard<std::mutex> guard(masterMutex_);
+        masterEp_ = localEp_;
+    }
+    if (config_.role == SMEM_RALLOC_ROLE_FAR) {
+        /* FAR store host also contributes: its accounting is refreshed via loopback reports */
+        StartReporter();
+    }
+    SM_LOG_INFO("master activated, rank: " << localEp_.rankId << " endpoint: " << localEp_.ip << ":"
+                                           << localEp_.port);
+    return SM_OK;
+}
+
+void SmemRallocEntryManager::OnLeaderPromoted()
+{
+    /* election thread contract: activation does synchronous store writes, keep them off
+     * the election loop; serialize promotions by chaining onto the previous thread */
+    std::lock_guard<std::mutex> guard(promotionThreadMutex_);
+    std::thread prev = std::move(promotionThread_);
+    promotionThread_ = std::thread([this, prev = std::move(prev)]() mutable {
+        if (prev.joinable()) {
+            prev.join();
+        }
+        (void)ActivateMasterOnPromotion();
+    });
+}
+
+void SmemRallocEntryManager::SubscribeRankDownWatch()
+{
+    /* the store pushes rank-down (link broken / heartbeat timeout) to every subscribed
+     * link and keeps the waiter alive across events; watches are NOT replayed after a
+     * store reconnect, hence this is re-armed on every promotion. The server rejects a
+     * duplicate rank watch on the same link, so a failed re-subscribe keeps the previous
+     * one (it is still delivering). Callback contract: erase-only, no rpc on this thread. */
+    uint32_t wid = UINT32_MAX;
+    auto ret = confStore_->Watch(
+        WATCH_RANK_LINK_DOWN,
+        [](WatchRankType type, uint32_t rank) {
+            if (type != WATCH_RANK_LINK_DOWN) {
+                return;
+            }
+            SmemRallocMasterService::Instance().OnRankDown(rank);
+        },
+        wid);
+    if (ret == SM_OK && wid != UINT32_MAX) {
+        rankWatchId_ = wid; /* any older subscription dies with its link, no explicit unwatch */
+        SM_LOG_INFO("rank-down watch subscribed, wid: " << wid);
+    } else {
+        SM_LOG_WARN("rank-down watch subscribe failed, ret: " << ret
+                      << ", stale-candidate eviction falls back to placement-time prune");
+    }
 }
 
 void SmemRallocEntryManager::OnMasterKeyChanged(int result, const std::vector<uint8_t> &value)
@@ -376,8 +463,8 @@ void SmemRallocEntryManager::PokeReporter()
 
 void SmemRallocEntryManager::RefreshMasterEndpoint()
 {
-    if (isStoreServer_) {
-        return; /* self hosts the store and the master, nothing to refresh */
+    if (masterActivated_.load()) {
+        return; /* self is the master (hosts the store server), nothing to refresh */
     }
     std::vector<uint8_t> epData;
     auto ret = confStore_->Get(SMEMRA_RPC_MASTER_STORE_KEY, epData, SMEMRA_MASTER_DISCOVER_TIMEOUT_MS);
@@ -411,6 +498,10 @@ void SmemRallocEntryManager::StopControlPlane()
         (void)confStore_->Unwatch(masterWatchId_);
         masterWatchId_ = UINT32_MAX;
     }
+    if (rankWatchId_ != UINT32_MAX && confStore_ != nullptr) {
+        (void)confStore_->Unwatch(rankWatchId_);
+        rankWatchId_ = UINT32_MAX;
+    }
     if (reporterThread_.joinable()) {
         reporterStop_.store(true);
         {
@@ -420,6 +511,13 @@ void SmemRallocEntryManager::StopControlPlane()
         reporterCv_.notify_all();
         reporterThread_.join();
     }
+    {
+        std::lock_guard<std::mutex> guard(promotionThreadMutex_);
+        if (promotionThread_.joinable()) {
+            promotionThread_.join();
+        }
+    }
+    masterActivated_.store(false);
     SmemRallocMasterService::Instance().Stop();
     SmemRallocExecutor::Stop();
     SmemRallocRpcService::Instance().Stop();
@@ -474,7 +572,12 @@ void SmemRallocEntryManager::ReporterLoop()
 bool SmemRallocEntryManager::ReportCommittedBytes(uint32_t retry)
 {
     if (!HasMaster()) {
-        return false;
+        /* master may activate later (HA election / init race): re-read before giving
+         * up this cycle so the reporter self-heals instead of dead-ending */
+        RefreshMasterEndpoint();
+        if (!HasMaster()) {
+            return false;
+        }
     }
     uint64_t total = 0;
     uint64_t deviceTotal = 0;
@@ -557,7 +660,6 @@ void SmemRallocEntryManager::Destroy()
     {
         std::lock_guard<std::mutex> guard(entryMutex_);
         inited_ = false;
-        isStoreServer_ = false;
     }
     confStore_ = nullptr;
     StoreFactory::DestroyStore(storeURL_);
