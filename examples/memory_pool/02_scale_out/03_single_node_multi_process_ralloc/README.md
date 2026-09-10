@@ -21,7 +21,8 @@ get_mem_size_by_rank / get_mem_ptr_by_rank / copy_data / wait(仅 device) / dest
 ## 必要条件
 - 已安装 memfabric_hybrid whl（含 ralloc 子模块）。
 - host 模式（默认）data_op_type=HOST_TCP：单机进程间走本地 TCP 路径，无需 NPU/RDMA；有 RDMA 环境可改 HOST_RDMA。
-- device 模式 data_op_type=SDMA|DEVICE_RDMA：需 NPU+CANN（ASCEND_NPU 构建）环境。
+- device 模式 data_op_type=SDMA|DEVICE_RDMA：需 NPU+CANN（ASCEND_NPU 构建）环境；预留 **HBM-only 窗**——
+  A2(910B) SoC 上 DRAM 窗与 SDMA 位互斥（hybm conn-based DRAM 段无设备坐标，SDMA 不可达；910C/GVA_V4 统一编址解除）。
 
 ## 验收标准
 - 输出 5/5 检查点全部通过，两子进程 exitcode=0。

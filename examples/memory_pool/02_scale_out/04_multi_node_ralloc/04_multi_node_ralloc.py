@@ -29,16 +29,18 @@ FAR_WAIT_RETRY_SEC = 5
 
 
 def _media_config(media):
-    """host (default): HOST media via HOST_RDMA; device: HBM media via SDMA|DEVICE_RDMA (NPU required)."""
+    """host (default): HOST media via HOST_RDMA; device: HBM media via SDMA|DEVICE_RDMA (NPU required).
+    The device variant reserves an HBM-only window: on A2(910B) SoCs a DRAM window cannot carry the
+    SDMA bit — the hybm conn-based dram segment is not sdma-reachable (910C/GVA_V4 unified VA除外)."""
     if media == "device":
-        mem_type = ralloc.RallocMemType.DEVICE
-        data_op = ralloc.RallocDataOpType.SDMA | ralloc.RallocDataOpType.DEVICE_RDMA
-        return mem_type, data_op, ONE_GIB
-    return ralloc.RallocMemType.HOST, ralloc.RallocDataOpType.HOST_RDMA, 0
+        return (ralloc.RallocMemType.DEVICE,
+                ralloc.RallocDataOpType.SDMA | ralloc.RallocDataOpType.DEVICE_RDMA,
+                0, ONE_GIB)
+    return ralloc.RallocMemType.HOST, ralloc.RallocDataOpType.HOST_RDMA, ONE_GIB, 0
 
 
 def _run_near(head_node_ip: str, media: str) -> None:
-    mem_type, data_op, max_hbm = _media_config(media)
+    mem_type, data_op, max_dram, max_hbm = _media_config(media)
     store_url = f"tcp://{head_node_ip}:{STORE_PORT}"
     mf.set_log_level(3)
     assert mf.initialize() == 0, "mf.initialize failed"
@@ -55,7 +57,7 @@ def _run_near(head_node_ip: str, media: str) -> None:
 
         handle = ralloc.create(
             id=0,
-            max_dram_size=ONE_GIB,
+            max_dram_size=max_dram,
             max_hbm_size=max_hbm,
             data_op_type=data_op,
         )

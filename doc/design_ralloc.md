@@ -456,3 +456,15 @@ src/hybm/
 
 - FAR 节点同构假设：不做 per-node HBM 容量过滤（后续按介质容量/余量扩展）
 - 一池双介质窗均全 rank 织造（与 host 窗同构）；非 NPU 构建下 HBM 池在 hybm device alloc 处自然报错（无 create 前置门，对齐 bm）
+
+### 11.7 A2(910B) SoC 的 DRAM×SDMA 互斥约束（机理）
+
+hybm InitDramSegment（hybm_entity_default.cpp:1140）在 SDMA 位置位时要求 DRAM 段 CheckSdmaReaches 为真。段实现分派（hybm_mem_segment.cpp:85-94）：
+
+| 段类型 | SoC 条件 | CheckSdmaReaches | 根因 |
+|---|---|---|---|
+| HybmConnBasedSegment | 910B 等（非 GVA_V4+910C） | 恒 false（基类默认） | 连接式模型：远端 DRAM 仅 mmap 进本进程 VA，数据走 hcom host 传输；段内无 serverId/superPodId 设备坐标，SDMA 设备引擎无设备侧地址/MR 可用 |
+| HybmVmmBasedSegment | GVA_V4 + 910C | 恒 true | 统一编址：host DRAM 进入设备可编址 GVA 空间，SDMA 天然可达 |
+| HybmDevLegacySegment（HBM） | — | 按 importMap_ 拓扑判定（同 server/同 superpod，910B 再限同 CONN 组） | HBM 有真实设备坐标 |
+
+推论：A2 类 SoC 上"DRAM 窗 + SDMA 位"物理不可实现，实体初始化 fail-fast；双介质池携带 SDMA 位须待 910C/GVA_V4。device 变体用例（03/04）因此预留 **HBM-only 窗**（max_dram=0）。
