@@ -38,7 +38,7 @@
 - master（rank0）日志含 `candidate rank-down, rank: <victim> existed: 1`；换点后 `rank_id == 存活 FAR`；
   组秩收缩至 `[0, 存活 FAR]`。
 - 全部日志不含 `already watched for rank state`；`placement reused failed rank` 为竞窗软指标（出现即报，不判失败）。
-- 失败时运行目录保留（`mf_05_eviction_*`），成功自动清理；被杀子进程的 SIGKILL 残留（如共享内存段）由 OS 兜底。
+- 失败时运行目录保留（`mf_05_eviction_*`），成功自动清理（`MF_KEEP_LOGS=1` 环境变量可让成功也保留 `log/`）；被杀子进程的 SIGKILL 残留（如共享内存段）由 OS 兜底。
 
 ## 运行
 ```bash

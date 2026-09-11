@@ -368,8 +368,8 @@ def main():
     except Exception as e:
         print(f"[parent] FAIL: {e} — logs kept in {run_dir}", flush=True)
         raise
-    if rc == 0:
-        shutil.rmtree(run_dir, ignore_errors=True)  # keep logs only on failure
+    if rc == 0 and not os.environ.get("MF_KEEP_LOGS"):
+        shutil.rmtree(run_dir, ignore_errors=True)  # keep logs only on failure (MF_KEEP_LOGS=1 keeps them)
 
 
 if __name__ == "__main__":

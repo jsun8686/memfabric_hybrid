@@ -38,7 +38,7 @@ etcd lease 5s 过期 → 幸存者健康检查发现 → 重选举（`Firing lea
   幸存者日志含 `master endpoint changed` 或 `master endpoint refreshed`；rank0 日志含 `Became leader`（基线）。
 - 换点 `rank_id == 2`、组秩收敛 `[1, 2]`、往返数据一致；全部日志不含 `already watched for rank state`。
 - 恢复时限 120s（lease 5s + 健康检查 4s + 选举退避 + FAR 重注册 ≤30s + 重试间隔）。
-- 失败时运行目录保留（`mf_06_ha_switchover_*`），成功自动清理；被杀进程残留由 OS 兜底。
+- 失败时运行目录保留（`mf_06_ha_switchover_*`），成功自动清理（`MF_KEEP_LOGS=1` 环境变量可让成功也保留 `log/`）；被杀进程残留由 OS 兜底。
 
 ## 运行
 ```bash
