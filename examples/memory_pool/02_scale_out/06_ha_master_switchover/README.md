@@ -17,7 +17,8 @@ etcd lease 5s 过期 → 幸存者健康检查发现 → 重选举（`Firing lea
 `ralloc.initialize / create / extend_local_mem / extend_remote_mem / get_group_ranks / copy_data / destroy`。
 
 ## 必要条件
-- 已安装同版本 memfabric_hybrid whl；单节点；`MF_TEST_NIC_IP` 可覆盖数据面 IP（默认取节点主 IP）。
+- 已安装同版本 memfabric_hybrid whl；单节点；数据面 IP 自动推导（`MF_TEST_NIC_IP` 环境变量 →
+  hostname 解析 → UDP connect 取出口 IP → 127.0.0.1 兜底，集群裸主机名不可解析时自动走后两级）。
 - **etcd 服务必须先启动**（单机即可）：
   ```bash
   etcd \

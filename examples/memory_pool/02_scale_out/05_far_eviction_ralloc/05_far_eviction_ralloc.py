@@ -57,8 +57,22 @@ MARK_BACKOFF = "placement reused failed rank"            # soft: race-window dep
 
 
 def _nic_ip():
-    """Data-plane NIC ip: env override wins, else the node's primary ip (like 03/04)."""
-    return os.environ.get("MF_TEST_NIC_IP", socket.gethostbyname(socket.gethostname()))
+    """Data-plane NIC ip: env override wins, else the node's primary ip (like 03/04).
+    gethostbyname needs a resolvable hostname (bare cluster hosts lack it), so fall
+    back to the no-packet UDP-connect trick, then loopback (single-node tests)."""
+    ip = os.environ.get("MF_TEST_NIC_IP")
+    if ip:
+        return ip
+    try:
+        return socket.gethostbyname(socket.gethostname())
+    except OSError:
+        pass
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))  # route lookup only, no packet is sent
+            return s.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
 
 
 def _wait_tcp(url, timeout_sec):
@@ -85,6 +99,43 @@ def _wait_file(path, timeout_sec):
                 return json.load(f)
         time.sleep(1.0)
     raise RuntimeError(f"file not produced within {timeout_sec}s: {path}")
+
+
+def _tcp_up(url):
+    host, port = url.split("://", 1)[1].rsplit(":", 1)
+    with socket.socket() as s:
+        return s.connect_ex((host, int(port))) == 0
+
+
+def _wait_alive(cond, timeout_sec, tag, procs, run_dir):
+    """Gate on cond() but fail fast when any watched child exits first — a dead child
+    would otherwise stall the gate for the full timeout with a misleading message."""
+    deadline = time.time() + timeout_sec
+    while True:
+        if cond():
+            return
+        for rank, p in procs.items():
+            if p.poll() is not None:
+                raise RuntimeError(
+                    f"{tag}: child rank {rank} exited (code {p.returncode}) — see {run_dir}")
+        if time.time() > deadline:
+            raise RuntimeError(f"{tag}: condition not met within {timeout_sec}s")
+        time.sleep(2)
+
+
+def _wait_file_alive(path, timeout_sec, tag, procs, run_dir):
+    deadline = time.time() + timeout_sec
+    while True:
+        if os.path.exists(path):
+            with open(path) as f:
+                return json.load(f)
+        for rank, p in procs.items():
+            if p.poll() is not None:
+                raise RuntimeError(
+                    f"{tag}: child rank {rank} exited (code {p.returncode}) — see {run_dir}")
+        if time.time() > deadline:
+            raise RuntimeError(f"{tag}: file not produced within {timeout_sec}s: {path}")
+        time.sleep(1.0)
 
 
 def _round_trip(handle, gva):
@@ -234,18 +285,22 @@ def _parent(store, etcd_url, run_dir):
     try:
         procs[RANK_NEAR], files[RANK_NEAR] = _spawn("near", run_dir, store, store_url, "rank0.log")
         rank0_log = os.path.join(run_dir, "rank0.log")
+        near_only = {RANK_NEAR: procs[RANK_NEAR]}
         if store == "tcp":
-            _wait_tcp(store_url, 60)
+            _wait_alive(lambda: _tcp_up(store_url), 60, "store up", near_only, run_dir)
         else:
             # gate the followers on a DETERMINISTIC first leader/master (election is
             # first-come-first-served with random backoff)
-            _retry_assert(lambda: _grep(rank0_log, MARK_BECAME_LEADER), 60, "rank0 becomes leader")
+            _wait_alive(lambda: _grep(rank0_log, MARK_BECAME_LEADER), 60, "rank0 becomes leader",
+                        near_only, run_dir)
 
         for rank, role, log in ((RANK_FAR1, "far1", "rank1.log"), (RANK_FAR2, "far2", "rank2.log")):
             procs[rank], files[rank] = _spawn(role, run_dir, store, store_url, log)
-            _wait_file(os.path.join(run_dir, f"far{rank}_ready.json"), 90)
+            _wait_file_alive(os.path.join(run_dir, f"far{rank}_ready.json"), 90, f"far{rank} ready",
+                             dict(procs), run_dir)
 
-        victim = _wait_file(os.path.join(run_dir, "near_acquired.json"), 180)["rank"]
+        victim = _wait_file_alive(os.path.join(run_dir, "near_acquired.json"), 180, "NEAR acquisition",
+                                  dict(procs), run_dir)["rank"]
         print(f"[parent] killing FAR rank {victim} (SIGKILL, mid-run)", flush=True)
         procs[victim].kill()  # true crash: no cleanup, the store link breaks abruptly
         procs[victim].wait(timeout=30)

@@ -59,7 +59,22 @@ RECOVERY_TIMEOUT_SEC = 120  # lease 5s + health check 4s + election backoff + FA
 
 
 def _nic_ip():
-    return os.environ.get("MF_TEST_NIC_IP", socket.gethostbyname(socket.gethostname()))
+    """Data-plane NIC ip: env override wins, else the node's primary ip (like 03/04).
+    gethostbyname needs a resolvable hostname (bare cluster hosts lack it), so fall
+    back to the no-packet UDP-connect trick, then loopback (single-node tests)."""
+    ip = os.environ.get("MF_TEST_NIC_IP")
+    if ip:
+        return ip
+    try:
+        return socket.gethostbyname(socket.gethostname())
+    except OSError:
+        pass
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))  # route lookup only, no packet is sent
+            return s.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
 
 
 def _wait_tcp(url, timeout_sec):
@@ -86,6 +101,37 @@ def _wait_file(path, timeout_sec):
                 return json.load(f)
         time.sleep(1.0)
     raise RuntimeError(f"file not produced within {timeout_sec}s: {path}")
+
+
+def _wait_alive(cond, timeout_sec, tag, procs, run_dir):
+    """Gate on cond() but fail fast when any watched child exits first — a dead child
+    would otherwise stall the gate for the full timeout with a misleading message."""
+    deadline = time.time() + timeout_sec
+    while True:
+        if cond():
+            return
+        for rank, p in procs.items():
+            if p.poll() is not None:
+                raise RuntimeError(
+                    f"{tag}: child rank {rank} exited (code {p.returncode}) — see {run_dir}")
+        if time.time() > deadline:
+            raise RuntimeError(f"{tag}: condition not met within {timeout_sec}s")
+        time.sleep(2)
+
+
+def _wait_file_alive(path, timeout_sec, tag, procs, run_dir):
+    deadline = time.time() + timeout_sec
+    while True:
+        if os.path.exists(path):
+            with open(path) as f:
+                return json.load(f)
+        for rank, p in procs.items():
+            if p.poll() is not None:
+                raise RuntimeError(
+                    f"{tag}: child rank {rank} exited (code {p.returncode}) — see {run_dir}")
+        if time.time() > deadline:
+            raise RuntimeError(f"{tag}: file not produced within {timeout_sec}s: {path}")
+        time.sleep(1.0)
 
 
 def _round_trip(handle, gva):
@@ -224,13 +270,16 @@ def _parent(store_url, run_dir):
         # rank0 alone first: the election is first-come-first-served, so a solo head
         # start makes the FIRST leader/master deterministic
         procs[RANK_FAR_A], files[RANK_FAR_A] = _spawn("far0", run_dir, store_url, "rank0.log")
-        _retry_assert(lambda: _grep(log[RANK_FAR_A], MARK_BECAME_LEADER), 60, "rank0 becomes leader")
+        _wait_alive(lambda: _grep(log[RANK_FAR_A], MARK_BECAME_LEADER), 60, "rank0 becomes leader",
+                    {RANK_FAR_A: procs[RANK_FAR_A]}, run_dir)
 
         procs[RANK_NEAR], files[RANK_NEAR] = _spawn("near", run_dir, store_url, "rank1.log")
         procs[RANK_FAR_B], files[RANK_FAR_B] = _spawn("far2", run_dir, store_url, "rank2.log")
-        _wait_file(os.path.join(run_dir, f"far{RANK_FAR_B}_ready.json"), 90)
+        _wait_file_alive(os.path.join(run_dir, f"far{RANK_FAR_B}_ready.json"), 90, "far2 ready",
+                         dict(procs), run_dir)
 
-        _wait_file(os.path.join(run_dir, "near_acquired.json"), 180)
+        _wait_file_alive(os.path.join(run_dir, "near_acquired.json"), 180, "NEAR acquisition",
+                         dict(procs), run_dir)
         print(f"[parent] killing rank {RANK_FAR_A} (store leader + master host, SIGKILL)", flush=True)
         procs[RANK_FAR_A].kill()  # true crash: lease expires, no clean handover
         procs[RANK_FAR_A].wait(timeout=30)
