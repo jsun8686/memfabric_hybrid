@@ -347,7 +347,9 @@ def main():
 
     store = args[0].lower() if args and args[0].lower() in ("tcp", "etcd") else "tcp"
     etcd_url = args[1] if len(args) > 1 else ETCD_STORE_URL
-    run_dir = tempfile.mkdtemp(prefix="mf_05_eviction_")
+    import os
+    run_dir = os.path.abspath("./log")
+    os.makedirs(run_dir, exist_ok=True)
     print(f"[parent] run dir: {run_dir} (store={store}, etcd={etcd_url if store == 'etcd' else 'n/a'})",
           flush=True)
     try:

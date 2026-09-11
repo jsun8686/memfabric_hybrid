@@ -324,7 +324,9 @@ def main():
         return
 
     store_url = args[0] if args else ETCD_STORE_URL
-    run_dir = tempfile.mkdtemp(prefix="mf_06_ha_switchover_")
+    import os
+    run_dir = os.path.abspath("./log")
+    os.makedirs(run_dir, exist_ok=True)
     print(f"[parent] run dir: {run_dir} (etcd={store_url})", flush=True)
     try:
         rc = _parent(store_url, run_dir)
