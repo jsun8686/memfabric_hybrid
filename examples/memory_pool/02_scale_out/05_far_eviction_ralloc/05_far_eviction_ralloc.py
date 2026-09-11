@@ -220,6 +220,12 @@ def _near_main(store_url, run_dir):
         for h in reversed(pools):
             h.destroy()
         assert mf.get_last_err_msg() == "", mf.get_last_err_msg()
+
+        # hold this process (it hosts the tcp store) alive until the survivor FAR has
+        # finished its clean uninitialize, which needs store access — exiting first
+        # would trap the FAR in an unbounded CAS retry against a dead store
+        _write(os.path.join(run_dir, "near_finished.json"), {})
+        _wait_file(os.path.join(run_dir, "near_exit.json"), 300)
     finally:
         if ralloc_inited:
             ralloc.uninitialize(0)
@@ -306,14 +312,19 @@ def _parent(store, etcd_url, run_dir):
         procs[victim].wait(timeout=30)
         _write(os.path.join(run_dir, "killed.json"), {"rank": victim})
 
-        procs[RANK_NEAR].wait(timeout=300)
+        # teardown ordering: the survivor FAR must uninitialize while the store is still
+        # alive, so NEAR (the tcp store host) signals completion and WAITS before exiting
+        survivor = RANK_FAR1 + RANK_FAR2 - victim
+        _wait_file_alive(os.path.join(run_dir, "near_finished.json"), 300, "NEAR assertions done",
+                         {RANK_NEAR: procs[RANK_NEAR], survivor: procs[survivor]}, run_dir)
+        _write(os.path.join(run_dir, "shutdown.json"), {})
+        procs[survivor].wait(timeout=90)
+        assert procs[survivor].returncode == 0, f"survivor FAR failed: {procs[survivor].returncode}"
+
+        _write(os.path.join(run_dir, "near_exit.json"), {})
+        procs[RANK_NEAR].wait(timeout=90)
         assert procs[RANK_NEAR].returncode == 0, \
             f"NEAR failed: exitcode {procs[RANK_NEAR].returncode} (see {run_dir})"
-
-        _write(os.path.join(run_dir, "shutdown.json"), {})
-        survivor = RANK_FAR1 + RANK_FAR2 - victim
-        procs[survivor].wait(timeout=60)
-        assert procs[survivor].returncode == 0, f"survivor FAR failed: {procs[survivor].returncode}"
 
         # ---- log assertions ----
         rank_down = _grep(rank0_log, f"{MARK_RANK_DOWN}{victim} ")

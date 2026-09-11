@@ -612,3 +612,9 @@ entry 的节点则反序，master 失聪；单进程多 entry 场景 R12-B 之�
   127.0.0.1 同机多进程勿用）；tcp+固定 ✅（连接时登记）；etcd+auto ✅（FindOrInsertRank 打到真 leader）；
   **etcd+固定 ✅（本轮修复：rankId 工厂透传 → 连接时登记 → rank 存活/watch 打通；master 激活经
   IsLeaderStore/promotion 不再绑死 rank0）**；dup-rank（两节点同 rankId）四组合均为用户配置责任，未处理
+- 05 tcp 首跑功能面全绿（多 waiter 3 订阅零冲突 / rank-down ~0.2s / 引擎并行扇出 / 换点 ~1s），暴露存量
+  产品缺口并**本轮已修复**：store 宿主死亡后幸存者 `uninitialize` 链上 `GroupLeave` 的组事件 CAS 曾无界
+  重试（100000 次 ≈ 28h，tcp 宿主 SPOF 拆场挂死进程）——现改有界双桶（engine:1404-1445）：冲突
+  （RESTORE，store 活着竞态）100 次 ~10s / 不可达（连接断等）5 次 ~5s，超限 ERROR"skip graceful
+  leave"返回错误（四栈 entry 调用方 WARN 后继续拆场），正确性由存活检测兜底收敛；测试侧拆场顺序
+  （NEAR/store 宿主等幸存 FAR 清场后再退，05/06 标记文件四步握手）保留——发布时消费者在线，语义更干净

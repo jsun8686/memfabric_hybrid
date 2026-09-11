@@ -1401,10 +1401,18 @@ Result SmemNetGroupEngine::GroupLeave()
     SM_LOG_INFO("do leave by user, rank:" << option_.rank);
 
     std::string old;
-    int retry_count = 0;
-    static constexpr int MAX_RETRY = 100000;
+    // Bounded retry: the graceful LEAVE event is a convergence hint, not a correctness
+    // requirement (peer liveness detection cleans the leaver up anyway). A CAS conflict
+    // (RESTORE) means the store is alive and racing -> retry generously; any other error
+    // means the store is unreachable (e.g. tcp store host died) -> give up quickly
+    // instead of hanging teardown for hours on a dead control plane.
+    static constexpr int MAX_RETRY_CONFLICT = 100;     // ~10s at 100ms spin
+    static constexpr int MAX_RETRY_UNREACHABLE = 5;    // ~5s, each attempt blocks ~1s in send
+    int conflictCnt = 0;
+    int unreachableCnt = 0;
+    bool published = false;
     localOpRet_ = SM_OK; // init ret
-    while (retry_count++ < MAX_RETRY) {
+    while (conflictCnt < MAX_RETRY_CONFLICT && unreachableCnt < MAX_RETRY_UNREACHABLE) {
         SmemGroupInfo info = GenerateInfo(LEAVE_EVENT, option_.rank, old);
         ClearBitmapForRank(info, option_.rank);
         std::string val((char *)&info, SMEM_GROUP_INFO_SIZE);
@@ -1413,15 +1421,28 @@ Result SmemNetGroupEngine::GroupLeave()
             auto ret = store_->Cas(SMEM_GROUP_LISTEN_EVENT_KEY, old, val, old);
             if (ret == SM_OK) {
                 lastSubmitVersion_.store(info.version);
+                published = true;
                 break;
+            }
+            if (ret == StoreErrorCode::RESTORE) {
+                conflictCnt++; // store alive, version raced: retry with the refreshed base
+            } else {
+                unreachableCnt++;
             }
         } else {
             TryCleanOldEvent();
+            conflictCnt++; // even-version protocol step, shares the spin budget
         }
         usleep(SMEM_GROUP_SLEEP_TIMEOUT);
     }
 
-    SM_VALIDATE_RETURN(retry_count <= MAX_RETRY, "do leave set key timeout!", SM_ERROR);
+    if (!published) {
+        SM_LOG_ERROR("leave event not published after bounded retries (conflicts: " << conflictCnt
+                     << ", unreachable: " << unreachableCnt << "), skip graceful leave, rank: " << option_.rank
+                     << "; peers will converge via liveness detection");
+        joined_ = false;
+        return SM_ERROR;
+    }
 
     TryRemovePrefixKey(option_.rank);
     // wait listen thread do leave

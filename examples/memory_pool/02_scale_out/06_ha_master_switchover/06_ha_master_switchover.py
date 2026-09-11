@@ -209,6 +209,12 @@ def _near_main(store_url, run_dir):
         mf.get_and_clear_last_err_msg()  # drain sticky retry errors (04 pattern)
         handle.destroy()
         assert mf.get_last_err_msg() == "", mf.get_last_err_msg()
+
+        # hold this process alive until the survivor FAR has finished its clean
+        # uninitialize — after HA re-election NEAR may itself host the store, and
+        # exiting first would trap the FAR in an unbounded CAS retry on a dead store
+        _write(os.path.join(run_dir, "near_finished.json"), {})
+        _wait_file(os.path.join(run_dir, "near_exit.json"), 300)
     finally:
         if ralloc_inited:
             ralloc.uninitialize(0)
@@ -285,13 +291,18 @@ def _parent(store_url, run_dir):
         procs[RANK_FAR_A].wait(timeout=30)
         _write(os.path.join(run_dir, "killed.json"), {"rank": RANK_FAR_A})
 
-        procs[RANK_NEAR].wait(timeout=300)
+        # teardown ordering: the survivor FAR must uninitialize while a store host is
+        # still alive; NEAR signals completion and WAITS before exiting
+        _wait_file_alive(os.path.join(run_dir, "near_finished.json"), 300, "NEAR assertions done",
+                         {RANK_NEAR: procs[RANK_NEAR], RANK_FAR_B: procs[RANK_FAR_B]}, run_dir)
+        _write(os.path.join(run_dir, "shutdown.json"), {})
+        procs[RANK_FAR_B].wait(timeout=90)
+        assert procs[RANK_FAR_B].returncode == 0, f"survivor FAR failed: {procs[RANK_FAR_B].returncode}"
+
+        _write(os.path.join(run_dir, "near_exit.json"), {})
+        procs[RANK_NEAR].wait(timeout=90)
         assert procs[RANK_NEAR].returncode == 0, \
             f"NEAR failed: exitcode {procs[RANK_NEAR].returncode} (see {run_dir})"
-
-        _write(os.path.join(run_dir, "shutdown.json"), {})
-        procs[RANK_FAR_B].wait(timeout=60)
-        assert procs[RANK_FAR_B].returncode == 0, f"survivor FAR failed: {procs[RANK_FAR_B].returncode}"
 
         # ---- log assertions ----
         promotions = [r for r in (RANK_NEAR, RANK_FAR_B) if _grep(log[r], MARK_PROMOTION)]
