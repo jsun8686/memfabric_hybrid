@@ -14,9 +14,15 @@
 #include <sys/types.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 #include <algorithm>
 #include <cstddef>
+#include <cstdio>
+#include <cstdlib>
+#include <fstream>
+#include <limits>
+#include <string>
 
 #include "hybm_logger.h"
 #include "hybm_ex_info_transfer.h"
@@ -24,6 +30,131 @@
 #include "dl_hal_api.h"
 
 using namespace ock::mf;
+
+// Pool DRAM NUMA affinity: on multi-socket hosts the hugetlb pages drawn at mmap time
+// may land on the NUMA node remote from the NPU, degrading DMA bandwidth (measured
+// -6% H2D / -19% D2H on a 2-socket 910B node). Bind the pool VMA to the NPU-local
+// node before the pages are faulted in. UAPI values from linux/mempolicy.h.
+namespace {
+constexpr int POOL_NUMA_AUTO = -1;
+constexpr int POOL_NUMA_OFF = -2;
+constexpr int MPOL_PREFERRED_LOCAL = 1;
+constexpr int MPOL_BIND_LOCAL = 2;
+
+int ReadIntFile(const char *path)
+{
+    std::ifstream f(path);
+    int v = 0;
+    if (!(f >> v)) {
+        return std::numeric_limits<int>::min();
+    }
+    return v;
+}
+
+int DetectNpuNumaNode(uint32_t logicDeviceId)
+{
+    char path[128];
+    if (snprintf(path, sizeof(path), "/sys/class/davinci_devices/device%u/numa_node", logicDeviceId) > 0) {
+        auto node = ReadIntFile(path);
+        if (node >= 0) {
+            return node;
+        }
+    }
+    return POOL_NUMA_AUTO; // single-socket, container without sysfs, or older driver
+}
+
+uint64_t NodeFreeHugepages(int node)
+{
+    char path[192];
+    if (snprintf(path, sizeof(path), "/sys/devices/system/node/node%d/hugepages/hugepages-2048kB/free_hugepages",
+                 node) <= 0) {
+        return 0;
+    }
+    auto v = ReadIntFile(path);
+    return (v == std::numeric_limits<int>::min()) ? 0 : static_cast<uint64_t>(v);
+}
+
+int PoolNumaTargetNode(uint32_t logicDeviceId)
+{
+    // MF_POOL_NUMA_NODE: -1 auto-detect (default), -2 disabled, >=0 forced node id
+    const char *env = getenv("MF_POOL_NUMA_NODE");
+    if (env != nullptr) {
+        int v = atoi(env);
+        if (v == POOL_NUMA_OFF || v >= 0) {
+            return v;
+        }
+    }
+    return DetectNpuNumaNode(logicDeviceId);
+}
+
+void BindPoolVmaNuma(void *addr, uint64_t size, bool hugepage, uint32_t logicDeviceId)
+{
+    auto node = PoolNumaTargetNode(logicDeviceId);
+    if (node == POOL_NUMA_OFF) {
+        return;
+    }
+    if (node == POOL_NUMA_AUTO) {
+        BM_LOG_INFO("pool numa affinity: NPU numa node not detectable, skipped"
+                    " (force with MF_POOL_NUMA_NODE=<node>)");
+        return;
+    }
+    int mode = MPOL_BIND_LOCAL;
+    if (hugepage) {
+        auto need = (size + HYBM_LARGE_PAGE_SIZE - 1) / HYBM_LARGE_PAGE_SIZE;
+        if (NodeFreeHugepages(node) < need) {
+            mode = MPOL_PREFERRED_LOCAL;
+            BM_LOG_WARN("pool numa affinity: free 2MB hugepages on node " << node << " < needed " << need
+                        << ", falling back to MPOL_PREFERRED (placement NOT guaranteed; reserve via"
+                        " /sys/devices/system/node/node" << node
+                        << "/hugepages/hugepages-2048kB/nr_hugepages)");
+        }
+    }
+    unsigned long nodemask = 1UL << node;
+    long rc = syscall(SYS_mbind, addr, size, static_cast<unsigned int>(mode), &nodemask,
+                      static_cast<unsigned long>(node + 1), 0UL);
+    if (rc != 0) {
+        BM_LOG_WARN("pool numa affinity: mbind(addr:" << addr << " size:" << size << " node:" << node
+                    << " mode:" << mode << ") failed: " << errno << ", " << SafeStrError(errno));
+    } else {
+        BM_LOG_INFO("pool numa affinity: pool VMA bound to node " << node << " (mode " << mode << ")");
+    }
+}
+
+void LogPoolNumaPlacement(void *addr)
+{
+    std::ifstream f("/proc/self/numa_maps");
+    std::string line;
+    char prefix[32];
+    if (snprintf(prefix, sizeof(prefix), "%llx-", static_cast<unsigned long long>(
+                   reinterpret_cast<uintptr_t>(addr))) <= 0) {
+        return;
+    }
+    while (std::getline(f, line)) {
+        if (line.rfind(prefix, 0) != 0) {
+            continue;
+        }
+        std::string placement;
+        size_t pos = 0;
+        while (pos < line.size()) {
+            auto end = line.find(' ', pos);
+            if (end == std::string::npos) {
+                end = line.size();
+            }
+            std::string tok = line.substr(pos, end - pos);
+            if ((tok.rfind("N", 0) == 0 && tok.find('=') != std::string::npos) ||
+                tok.rfind("bind:", 0) == 0 || tok.rfind("prefer:", 0) == 0) {
+                if (!placement.empty()) {
+                    placement += " ";
+                }
+                placement += tok;
+            }
+            pos = end + 1;
+        }
+        BM_LOG_INFO("pool numa placement after touch: " << placement);
+        return;
+    }
+}
+} // namespace
 
 Result HybmConnBasedSegment::ValidateOptions() noexcept
 {
@@ -360,6 +491,7 @@ Result HybmConnBasedSegment::MapSlice(void *&mapped, void *sliceAddr, uint64_t l
     }
 
     LvaShmReservePhysicalMemory(mapped, size);
+    LogPoolNumaPlacement(mapped);
     return BM_OK;
 }
 
@@ -375,6 +507,7 @@ void* HybmConnBasedSegment::AllocMemory(void *sliceAddr, uint64_t lvOffset, uint
     mapped = mmap(sliceAddr, size, prot, mmapFlags | MAP_HUGETLB, mmapFd, mmapOffset);
     if (mapped == sliceAddr) {
         BM_LOG_INFO("Successfully allocated " << size << " bytes DRAM hugepage via mmap. addr:" << mapped);
+        BindPoolVmaNuma(mapped, size, true, logicDeviceId_);
         allocMethod = MemAllocMethod::MMAP;
         return mapped;
     }
@@ -407,6 +540,7 @@ void* HybmConnBasedSegment::AllocMemory(void *sliceAddr, uint64_t lvOffset, uint
     mapped = mmap(sliceAddr, size, prot, mmapFlags, mmapFd, mmapOffset);
     if (mapped == sliceAddr) {
         BM_LOG_INFO("Successfully allocated " << size << " bytes DRAM 4K page via mmap. addr:" << mapped);
+        BindPoolVmaNuma(mapped, size, false, logicDeviceId_);
         allocMethod = MemAllocMethod::MMAP;
         return mapped;
     }
