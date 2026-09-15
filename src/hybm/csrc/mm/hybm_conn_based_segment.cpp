@@ -15,14 +15,20 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/utsname.h>
 #include <unistd.h>
 #include <algorithm>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
+#include <dirent.h>
+#include <cstring>
 #include <fstream>
 #include <limits>
+#include <sstream>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include "hybm_logger.h"
 #include "hybm_ex_info_transfer.h"
@@ -51,6 +57,103 @@ int ReadIntFile(const char *path)
     return v;
 }
 
+std::vector<std::pair<int, int>> ParseCpuRanges(const std::string &cpulist)
+{
+    std::vector<std::pair<int, int>> ranges;
+    std::istringstream ss(cpulist);
+    std::string item;
+    while (std::getline(ss, item, ',')) {
+        auto dash = item.find('-');
+        try {
+            if (dash == std::string::npos) {
+                int cpu = std::stoi(item);
+                ranges.emplace_back(cpu, cpu);
+            } else {
+                ranges.emplace_back(std::stoi(item.substr(0, dash)), std::stoi(item.substr(dash + 1)));
+            }
+        } catch (const std::exception &) {
+            return {};
+        }
+    }
+    return ranges;
+}
+
+int CpuToNumaNode(int cpu)
+{
+    if (cpu < 0) {
+        return POOL_NUMA_AUTO;
+    }
+    DIR *dir = opendir("/sys/devices/system/node");
+    if (dir == nullptr) {
+        return POOL_NUMA_AUTO;
+    }
+    struct dirent *ent = nullptr;
+    while ((ent = readdir(dir)) != nullptr) {
+        if (strncmp(ent->d_name, "node", 4) != 0) {
+            continue;
+        }
+        char path[160];
+        if (snprintf(path, sizeof(path), "/sys/devices/system/node/%s/cpulist", ent->d_name) <= 0) {
+            continue;
+        }
+        std::ifstream f(path);
+        std::string cpulist;
+        if (!(f >> cpulist)) {
+            continue;
+        }
+        for (const auto &range : ParseCpuRanges(cpulist)) {
+            if (cpu >= range.first && cpu <= range.second) {
+                closedir(dir);
+                return atoi(ent->d_name + 4);
+            }
+        }
+    }
+    closedir(dir);
+    return POOL_NUMA_AUTO;
+}
+
+// L2 detection: parse "npu-smi info -t topo" -- the row "NPU<x> ... <a-b>" gives the
+// NPU's CPU affinity range; map its first CPU to a NUMA node via node*/cpulist.
+int DetectViaNpuSmiTopo(uint32_t logicDeviceId)
+{
+    FILE *pipe = popen("npu-smi info -t topo 2>/dev/null", "r");
+    if (pipe == nullptr) {
+        return POOL_NUMA_AUTO;
+    }
+    std::string out;
+    char buf[4096];
+    while (fgets(buf, sizeof(buf), pipe) != nullptr) {
+        out += buf;
+    }
+    (void)pclose(pipe);
+
+    const std::string want = "NPU" + std::to_string(logicDeviceId);
+    std::istringstream lines(out);
+    std::string line;
+    while (std::getline(lines, line)) {
+        std::istringstream tokens(line);
+        std::string first;
+        std::string last;
+        std::string tok;
+        if (!(tokens >> first) || first != want) {
+            continue;
+        }
+        while (tokens >> tok) {
+            last = tok;
+        }
+        auto dash = last.find('-');
+        int cpu = -1;
+        try {
+            cpu = (dash == std::string::npos) ? (last.empty() ? -1 : std::stoi(last))
+                                              : std::stoi(last.substr(0, dash));
+        } catch (const std::exception &) {
+            continue;
+        }
+        return CpuToNumaNode(cpu);
+    }
+    return POOL_NUMA_AUTO;
+}
+
 int DetectNpuNumaNode(uint32_t logicDeviceId)
 {
     char path[128];
@@ -60,7 +163,7 @@ int DetectNpuNumaNode(uint32_t logicDeviceId)
             return node;
         }
     }
-    return POOL_NUMA_AUTO; // single-socket, container without sysfs, or older driver
+    return DetectViaNpuSmiTopo(logicDeviceId);
 }
 
 uint64_t NodeFreeHugepages(int node)
@@ -94,8 +197,8 @@ void BindPoolVmaNuma(void *addr, uint64_t size, bool hugepage, uint32_t logicDev
         return;
     }
     if (node == POOL_NUMA_AUTO) {
-        BM_LOG_INFO("pool numa affinity: NPU numa node not detectable, skipped"
-                    " (force with MF_POOL_NUMA_NODE=<node>)");
+        BM_LOG_INFO("pool numa affinity: NPU numa node not detectable, skipped; "
+                    "set MF_POOL_NUMA_NODE to force a node");
         return;
     }
     int mode = MPOL_BIND_LOCAL;
@@ -110,8 +213,24 @@ void BindPoolVmaNuma(void *addr, uint64_t size, bool hugepage, uint32_t logicDev
         }
     }
     unsigned long nodemask = 1UL << node;
-    long rc = syscall(SYS_mbind, addr, size, static_cast<unsigned int>(mode), &nodemask,
-                      static_cast<unsigned long>(node + 1), 0UL);
+    auto mbindCall = [&addr, &size, &nodemask, node](int m) {
+        errno = 0;
+        return syscall(SYS_mbind, addr, size, static_cast<unsigned int>(m), &nodemask,
+                       static_cast<unsigned long>(node + 1), 0UL);
+    };
+    long rc = mbindCall(mode);
+    if (rc != 0 && errno == EINVAL && mode == MPOL_BIND_LOCAL) {
+        // Observed on EulerOS vendor kernels (e.g. 5.10.0-*.euleros*): MPOL_BIND is
+        // rejected kernel-wide while MPOL_PREFERRED works. Fall back to best-effort.
+        mode = MPOL_PREFERRED_LOCAL;
+        rc = mbindCall(mode);
+        if (rc == 0) {
+            struct utsname uts;
+            std::string release = (uname(&uts) == 0) ? uts.release : "unknown";
+            BM_LOG_INFO("pool numa affinity: kernel " << release
+                        << " rejects MPOL_BIND, using MPOL_PREFERRED (best-effort placement)");
+        }
+    }
     if (rc != 0) {
         BM_LOG_WARN("pool numa affinity: mbind(addr:" << addr << " size:" << size << " node:" << node
                     << " mode:" << mode << ") failed: " << errno << ", " << SafeStrError(errno));
@@ -120,7 +239,7 @@ void BindPoolVmaNuma(void *addr, uint64_t size, bool hugepage, uint32_t logicDev
     }
 }
 
-void LogPoolNumaPlacement(void *addr)
+void LogPoolNumaPlacement(void *addr, int targetNode)
 {
     std::ifstream f("/proc/self/numa_maps");
     std::string line;
@@ -133,7 +252,10 @@ void LogPoolNumaPlacement(void *addr)
         if (line.rfind(prefix, 0) != 0) {
             continue;
         }
+        // collect policy token + per-node page counters, verify placement vs target
         std::string placement;
+        uint64_t pagesTotal = 0;
+        uint64_t pagesTarget = 0;
         size_t pos = 0;
         while (pos < line.size()) {
             auto end = line.find(' ', pos);
@@ -141,8 +263,22 @@ void LogPoolNumaPlacement(void *addr)
                 end = line.size();
             }
             std::string tok = line.substr(pos, end - pos);
-            if ((tok.rfind("N", 0) == 0 && tok.find('=') != std::string::npos) ||
-                tok.rfind("bind:", 0) == 0 || tok.rfind("prefer:", 0) == 0) {
+            bool keep = false;
+            if (tok.rfind("bind:", 0) == 0 || tok.rfind("prefer:", 0) == 0 ||
+                tok.rfind("interleave:", 0) == 0 || tok.rfind("default", 0) == 0) {
+                keep = true;
+            } else if (tok.rfind("N", 0) == 0) {
+                auto eq = tok.find('=');
+                if (eq != std::string::npos) {
+                    keep = true;
+                    uint64_t pages = strtoull(tok.c_str() + eq + 1, nullptr, 10);
+                    pagesTotal += pages;
+                    if (atoi(tok.c_str() + 1) == targetNode) {
+                        pagesTarget += pages;
+                    }
+                }
+            }
+            if (keep) {
                 if (!placement.empty()) {
                     placement += " ";
                 }
@@ -150,9 +286,20 @@ void LogPoolNumaPlacement(void *addr)
             }
             pos = end + 1;
         }
-        BM_LOG_INFO("pool numa placement after touch: " << placement);
+        if (placement.empty()) {
+            placement = "(no policy/N counters on numa_maps line)";
+        }
+        if (targetNode >= 0 && pagesTotal > 0 && pagesTarget < pagesTotal) {
+            BM_LOG_WARN("pool numa placement after touch: " << placement << " -- expected all pages on node "
+                        << targetNode << ", got " << pagesTarget << "/" << pagesTotal
+                        << "; pool is NOT NPU-local (check per-node free hugepages)");
+        } else {
+            BM_LOG_INFO("pool numa placement after touch: " << placement);
+        }
         return;
     }
+    BM_LOG_WARN("pool numa placement: numa_maps entry not found for addr 0x" << std::hex
+                << reinterpret_cast<uintptr_t>(addr) << std::dec << " (unexpected)");
 }
 } // namespace
 
@@ -491,7 +638,7 @@ Result HybmConnBasedSegment::MapSlice(void *&mapped, void *sliceAddr, uint64_t l
     }
 
     LvaShmReservePhysicalMemory(mapped, size);
-    LogPoolNumaPlacement(mapped);
+    LogPoolNumaPlacement(mapped, PoolNumaTargetNode(logicDeviceId_));
     return BM_OK;
 }
 
