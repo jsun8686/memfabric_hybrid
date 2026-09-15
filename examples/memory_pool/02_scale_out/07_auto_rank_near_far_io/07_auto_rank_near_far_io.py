@@ -100,6 +100,23 @@ def _store_precheck(store_url):
                                f"ps -ef | grep 07_auto_rank) or start with a fresh --store port")
 
 
+def _no_leftover_session():
+    """Refuse to run alongside leftover processes of this test on the same node: they squat
+    the node-local rpc ports (11100+rank) and, worse, a dying old session can be joined
+    mid-flight (cross-session race -> dead QP endpoints -> unrecoverable FAR group state)."""
+    try:
+        r = subprocess.run(["pgrep", "-f", os.path.basename(__file__)],
+                           capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return  # pgrep unavailable — skip silently
+    pids = {int(t) for t in r.stdout.split() if t.strip().isdigit()}
+    pids.discard(os.getpid())
+    if pids:
+        raise RuntimeError(f"leftover test processes still running on this node (pids "
+                           f"{sorted(pids)}) — kill them before starting a fresh session "
+                           f"(ps -ef | grep 07_auto_rank | grep -v grep)")
+
+
 def _write(path, obj):
     with open(path, "w") as f:
         json.dump(obj, f)
@@ -444,6 +461,7 @@ def main():
     run_dir = os.path.abspath(args.run_dir or "./log")
     os.makedirs(run_dir, exist_ok=True)
     _log(f"[{args.role}] run dir: {run_dir}, store: {args.store}, world: {args.world}")
+    _no_leftover_session()  # both roles: refuse to coexist with a previous session here
 
     if args.role == "far":
         _far_parent(args, run_dir)

@@ -26,10 +26,13 @@ FAR 节点（常驻守护，每节点一条命令）          NEAR 节点（测�
 两端一致：仅 `hccn_tool -i N -link -g` 报 `link status: UP` 的 NPU 参与；
 `--devs 0,3` 或环境变量 `MF_TEST_RDMA_DEVS` 可强制指定（被指定的卡若非 UP 直接报错退出）。
 
-## 启动步骤（跨节点手工分别启动）
+## 启动步骤（跨节点手工分别启动；**顺序是硬性要求**）
 
 ```bash
-# 1) 每个 FAR 节点各执行一次（store URL 指向第一个 FAR 节点 IP；常驻，Ctrl+C 或 shutdown 停止）
+# 0) 硬性前置：旧会话两端全停（脚本会自检本节点残留并拒绝启动，但看不到对端节点）
+ps -ef | grep 07_auto_rank | grep -v grep   # 两端各查一次，有则 kill 后再继续
+
+# 1) 每个 FAR 节点各执行一次；等到终端打印 "[far] resident contributors: ..." 才算就绪
 python3 07_auto_rank_near_far_io.py far  --store tcp://<far1_ip>:8587
 
 # 2) 每个 NEAR 节点各执行一次（等待 FAR 就绪后自动跑完退出，exit 0 = 通过）
@@ -39,6 +42,10 @@ python3 07_auto_rank_near_far_io.py near --store tcp://<far1_ip>:8587 \
 # 3) 停止 FAR 守护（或直接 Ctrl+C）
 touch log/shutdown.json
 ```
+
+> 时序违规的典型事故：NEAR 先于"旧 FAR 全停 + 新 FAR 就绪"启动，会加入尚存一息的旧会话；
+> 旧 FAR 被杀后跨节点 QP 全部落空（`WaitQpReady timeout`），且新 FAR 守护会进入不可自愈的
+> 坏状态（见排障·症状 C）。
 
 ## 参数
 | 参数 | 默认 | 说明 |
@@ -87,3 +94,10 @@ ss -lntp | grep -E '1110[0-9]|8587'; ps -ef | grep 07_auto_rank | grep -v grep  
 kill <残留PID们>   # 然后重跑 near；若残留不便清理，可整会话换用 --rpc-port-base 11200 避开
 ```
 注意换基址需 FAR 与 NEAR **同值**启动；rank 从 auto-rank 全局分配，端点随注册上报，与数据面无冲突。
+
+**症状 C：near 日志出现 `WaitQpReady timeout` / `connect failed: -7`，FAR 侧刷 `-2003`（`GroupUpdate Assert joined_`）与 `-601` 键轮询**
+跨会话互踩：NEAR 在"旧 FAR 全停 → 新 FAR 就绪"之间启动，先加入了垂死的旧会话；旧 FAR 进程被杀后，
+已导入的 slice 指向死端点，跨节点 QP 30s 超时，join barrier 失败；新 FAR 守护随之进入**不可自愈**的
+组状态（master 仍持续授予 placement，但每次 extend 都 -2003）。处置：两端全停（含 FAR 守护——
+它不会自己恢复），按启动步骤从第 0 步重来。脚本已加同节点残留自检（`pgrep` 本测试进程，发现即拒绝
+启动），但对端节点的残留仍需人工按第 0 步确认。
