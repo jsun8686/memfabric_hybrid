@@ -248,34 +248,38 @@ void BindPoolVmaNuma(void *addr, uint64_t size, bool hugepage, uint32_t logicDev
     }
 }
 
-// Layer 2: pin the calling thread to a CPU of the target node for the duration of the
-// pool first-touch, so pages faulted by the touch land on the NPU-local node. Required
-// on vendor kernels where mbind is ignored at fault time (verified EulerOS 5.10.0-*).
-bool PinThreadToNodeCpu(int node, cpu_set_t *saved)
+// Layer 2: pin the calling thread to a CPU of the target node BEFORE any pool page is
+// faulted, so both our first-touch and the device registration (GUP) faults land on the
+// NPU-local node. Required on vendor kernels where mbind is ignored at fault time
+// (verified EulerOS 5.10.0-*). Returns the pinned CPU or -1 on failure.
+int PinThreadToNodeCpu(int node, cpu_set_t *saved)
 {
     if (node < 0 || saved == nullptr) {
-        return false;
+        return -1;
     }
     char path[128];
     if (snprintf(path, sizeof(path), "/sys/devices/system/node/node%d/cpulist", node) <= 0) {
-        return false;
+        return -1;
     }
     std::ifstream f(path);
     std::string cpulist;
     if (!(f >> cpulist)) {
-        return false;
+        return -1;
     }
     auto ranges = ParseCpuRanges(cpulist);
     if (ranges.empty() || ranges.front().first < 0 || ranges.front().first >= CPU_SETSIZE) {
-        return false;
+        return -1;
     }
     if (sched_getaffinity(0, sizeof(*saved), saved) != 0) {
-        return false;
+        return -1;
     }
     cpu_set_t target;
     CPU_ZERO(&target);
     CPU_SET(ranges.front().first, &target);
-    return sched_setaffinity(0, sizeof(target), &target) == 0;
+    if (sched_setaffinity(0, sizeof(target), &target) != 0) {
+        return -1;
+    }
+    return ranges.front().first;
 }
 
 void RestoreThreadAffinity(const cpu_set_t *saved)
@@ -284,6 +288,18 @@ void RestoreThreadAffinity(const cpu_set_t *saved)
         (void)sched_setaffinity(0, sizeof(*saved), saved);
     }
 }
+
+// Restores the thread affinity mask on scope exit, including early returns.
+struct AffinityGuard {
+    cpu_set_t saved{};
+    bool armed{false};
+    ~AffinityGuard()
+    {
+        if (armed) {
+            RestoreThreadAffinity(&saved);
+        }
+    }
+};
 
 // Migrate pages to node via move_pages. Returns 0 on success, -1 on global syscall
 // failure (errno set), otherwise the number of pages reported not moved. Per-page
@@ -374,7 +390,7 @@ void MigratePoolPagesNuma(void *addr, uint64_t size, uint64_t pageSize, int node
 
 // Placement oracle: sample up to 32 pages via move_pages query mode (numa_maps lacks
 // hugetlb entries on some vendor kernels), log per-node distribution, WARN if off target.
-void LogPoolNumaPlacement(void *addr, uint64_t size, uint64_t pageSize, int targetNode)
+void LogPoolNumaPlacement(void *addr, uint64_t size, uint64_t pageSize, int targetNode, const char *phase)
 {
     const uint64_t totalPages = (size + pageSize - 1) / pageSize;
     const uint64_t samples = std::min<uint64_t>(totalPages, 32);
@@ -385,8 +401,8 @@ void LogPoolNumaPlacement(void *addr, uint64_t size, uint64_t pageSize, int targ
     }
     std::vector<int> status;
     if (QueryPagesNode(addrs, status) == -1) {
-        BM_LOG_WARN("pool numa placement: move_pages query failed: errno " << errno << ", "
-                    << SafeStrError(errno));
+        BM_LOG_WARN("pool numa placement (" << phase << "): move_pages query failed: errno " << errno
+                    << ", " << SafeStrError(errno));
         return;
     }
     std::vector<std::pair<int, uint64_t>> dist;
@@ -421,10 +437,11 @@ void LogPoolNumaPlacement(void *addr, uint64_t size, uint64_t pageSize, int targ
         placement += "N" + std::to_string(kv.first) + "=" + std::to_string(kv.second);
     }
     if (targetNode >= 0 && valid > 0 && onTarget == valid) {
-        BM_LOG_INFO("pool numa placement: " << placement << " (target node " << targetNode
-                    << ", sampled " << addrs.size() << "/" << totalPages << " pages)");
+        BM_LOG_INFO("pool numa placement (" << phase << "): " << placement << " (target node "
+                    << targetNode << ", sampled " << addrs.size() << "/" << totalPages << " pages)");
     } else {
-        BM_LOG_WARN("pool numa placement: " << (placement.empty() ? "no resident pages" : placement)
+        BM_LOG_WARN("pool numa placement (" << phase << "): "
+                    << (placement.empty() ? "no resident pages" : placement)
                     << " -- expected node " << targetNode << ", on-target " << onTarget << "/" << valid
                     << " sampled pages; pool is NOT NPU-local");
     }
@@ -747,6 +764,23 @@ Result HybmConnBasedSegment::MapSlice(void *&mapped, void *sliceAddr, uint64_t l
         return BM_ERROR;
     }
 
+    // Layer 2: pin to a CPU of the NPU-local node BEFORE any page is faulted -- both our
+    // first-touch and the device registration (GUP) faults must land on the local node.
+    // Pages already registered with the device are GUP-pinned and can never be migrated,
+    // so fault-time placement is the last controllable moment.
+    int numaNode = PoolNumaTargetNode(logicDeviceId_);
+    bool numaWork = numaNode >= 0 && allocMethod == MemAllocMethod::MMAP;
+    AffinityGuard affinityGuard;
+    if (numaWork) {
+        int cpu = PinThreadToNodeCpu(numaNode, &affinityGuard.saved);
+        affinityGuard.armed = (cpu >= 0);
+        BM_LOG_INFO("pool numa affinity: node " << numaNode << " first-touch "
+                    << (cpu >= 0 ? "pinned to cpu " + std::to_string(cpu)
+                                 : std::string("pin failed, placement not guaranteed")));
+    }
+
+    LvaShmReservePhysicalMemory(mapped, size);
+
     if (options_.dataOpType & HYBM_DOP_TYPE_DEVICE_RDMA) {
         auto ret = DlHalApi::HalHostRegister(mapped, size, HOST_MEM_MAP_DEV, logicDeviceId_, &dva);
         if (ret != BM_OK) {
@@ -754,6 +788,10 @@ Result HybmConnBasedSegment::MapSlice(void *&mapped, void *sliceAddr, uint64_t l
             FreeAllocatedMemory(mapped, size, allocMethod);
             return BM_ERROR;
         }
+    }
+    if (affinityGuard.armed) {
+        RestoreThreadAffinity(&affinityGuard.saved);
+        affinityGuard.armed = false;
     }
     int ret = HybmVaManager::GetInstance().AddVaInfo(
         {gva, (uint64_t)dva, (uint64_t)mapped, size, HYBM_MEM_TYPE_HOST}, options_.rankId);
@@ -766,21 +804,11 @@ Result HybmConnBasedSegment::MapSlice(void *&mapped, void *sliceAddr, uint64_t l
         return ret;
     }
 
-    // Layer 2: pin to NPU-local CPU so the first-touch below faults pages on that node
-    // (vendor kernels ignore mbind at fault time); restore right after the touch.
-    int numaNode = PoolNumaTargetNode(logicDeviceId_);
-    bool numaWork = numaNode >= 0 && allocMethod == MemAllocMethod::MMAP;
-    cpu_set_t savedMask;
-    bool pinned = numaWork ? PinThreadToNodeCpu(numaNode, &savedMask) : false;
-    LvaShmReservePhysicalMemory(mapped, size);
-    if (pinned) {
-        RestoreThreadAffinity(&savedMask);
-    }
-
     if (numaWork) {
-        // Layer 3: migrate pages faulted by others (e.g. device registration), then verify.
+        // Evidence before/after migration; L3 only helps pages NOT pinned by the device.
+        LogPoolNumaPlacement(mapped, size, pageSize, numaNode, "after-register");
         MigratePoolPagesNuma(mapped, size, pageSize, numaNode);
-        LogPoolNumaPlacement(mapped, size, pageSize, numaNode);
+        LogPoolNumaPlacement(mapped, size, pageSize, numaNode, "after-migrate");
     }
     return BM_OK;
 }
