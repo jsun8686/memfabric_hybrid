@@ -50,6 +50,7 @@ touch log/shutdown.json
 | `--sizes` | 64K,256K,1M,4M,16M | 粒度扫描列表（K/M/G 后缀） |
 | `--mb-per-size` | 256 | 每粒度每 worker 单向流量（MB） |
 | `--remote-mb` | 64 | 每 worker 申请的远端块大小（须 ≥ 最大粒度） |
+| `--rpc-port-base` | 11100 | 控制面 rpc 端口基址（端口 = 基址 + rank_id）；整会话保持一致 |
 | `MF_TEST_NIC_IP` | 自动 | 数据面 NIC IP 覆盖（同 03/04/05） |
 
 ## 必要条件
@@ -67,3 +68,22 @@ touch log/shutdown.json
 ## 判读
 - 小粒度（64K/256K）吞吐受单块时延主导（`us_per_block` 列），大粒度逼近 device RDMA 带宽
 - 多 worker 并发应摊满 NIC/链路带宽；若随 worker 数不增，检查交换机侧或同卡竞争
+
+## 排障（会话残留）
+控制面 rpc 端口 = `11100 + rank_id`（`smem_ralloc_def.h` 默认基址），**节点本地**——上一会话残留的同 rank 进程会蹲占完全相同的端口。两类典型症状与处置：
+
+**症状 A：`far` 启动即报 `stale store suspected`**
+上一会话的 store 进程仍在本机监听 8587。脚本已预检拦截（防静默接入旧 store 的脏 rank 计数与旧 master）。处置：
+```bash
+ss -lntp | grep 8587; ps -ef | grep 07_auto_rank | grep -v grep   # 找到残留
+kill <残留PID>; rm -rf log/; python3 07_auto_rank_near_far_io.py far --store tcp://<far1_ip>:8587
+```
+干净重启的特征：首个 fardev 日志无 `address in use`、rank 从 0 起、出现 `master activated`。
+
+**症状 B：near worker 报 `address in use for bind listen on <ip>:1110N` 后退出**
+本节点有残留 worker 蹲占 `11100+rank` 端口（新会话分到相同 rank 即相撞；NEAR 父进程失败时会自动收割本次的兄弟 worker，但对**上一会话**的残留无能为力）。处置：
+```bash
+ss -lntp | grep -E '1110[0-9]|8587'; ps -ef | grep 07_auto_rank | grep -v grep   # 两个节点都查
+kill <残留PID们>   # 然后重跑 near；若残留不便清理，可整会话换用 --rpc-port-base 11200 避开
+```
+注意换基址需 FAR 与 NEAR **同值**启动；rank 从 auto-rank 全局分配，端点随注册上报，与数据面无冲突。

@@ -36,7 +36,10 @@ import memfabric_hybrid as mf
 from memfabric_hybrid import ralloc
 
 DEFAULT_WORLD = 512          # declared world capacity, actual members join dynamically
-NIC_PORT_BASE = 10005        # executor rpc port = base + auto-assigned rankId
+NIC_PORT_BASE = 10005        # data-plane nic port base (set_nic); NOT the control rpc port
+RPC_PORT_BASE = 11100        # control rpc port = base + rankId (smem_ralloc_def.h default);
+                             # node-local: stale same-rank processes from a previous session
+                             # on the same node squat exactly this port -> bind failure
 HBM_WINDOW = 1 << 30         # 1GB HBM window slot per pool (device media)
 DEFAULT_SIZES = "64K,256K,1M,4M,16M"
 DEFAULT_MB_PER_SIZE = 256    # one-way traffic per size per worker
@@ -81,6 +84,20 @@ def _wait_tcp(url, timeout_sec):
                 return
         time.sleep(0.5)
     raise RuntimeError(f"endpoint not reachable within {timeout_sec}s: {url}")
+
+
+def _store_precheck(store_url):
+    """Fresh-session guard on the store-host node: the store port must be FREE before we
+    spawn children. An already-accepting store is a leftover from a previous run — silently
+    attaching to it would reuse its rank counter and its stale master/placement state."""
+    host, port = store_url.split("://", 1)[1].rsplit(":", 1)
+    if host not in (_nic_ip(), socket.gethostname()):
+        return  # the store lives on another node (multi-FAR topology) — nothing to guard
+    with socket.socket() as s:
+        if s.connect_ex((host, int(port))) == 0:
+            raise RuntimeError(f"stale store suspected: {store_url} is already accepting on "
+                               f"this node — kill the leftover process (ss -lntp | grep {port}, "
+                               f"ps -ef | grep 07_auto_rank) or start with a fresh --store port")
 
 
 def _write(path, obj):
@@ -172,7 +189,7 @@ def _rdma_up_devices(explicit):
 
 # ---------------------------------------------------------------- children ----
 
-def _fardev_main(dev, run_dir, store_url, world):
+def _fardev_main(dev, run_dir, store_url, world, rpc_base):
     mf.set_log_level(1)  # INFO and up so operators can trace placement/store markers
     assert mf.initialize() == 0, "mf.initialize failed"
     ralloc_inited = False
@@ -182,6 +199,7 @@ def _fardev_main(dev, run_dir, store_url, world):
         cfg.role = ralloc.RallocRole.FAR
         cfg.start_store = True  # store url lives on a FAR node; RacingForStoreServer
         cfg.dynamic_world_size = True  # NEAR workers join and leave while FARs stay
+        cfg.rpc_port_base = rpc_base
         cfg.set_nic(f"tcp://{_nic_ip()}:{NIC_PORT_BASE}")
         assert ralloc.initialize(store_url, world, dev, cfg) == 0, "ralloc.initialize failed"
         ralloc_inited = True
@@ -200,7 +218,7 @@ def _fardev_main(dev, run_dir, store_url, world):
         mf.uninitialize()
 
 
-def _nearworker_main(dev, idx, run_dir, store_url, world, sizes_str, mb_per_size, remote_mb):
+def _nearworker_main(dev, idx, run_dir, store_url, world, sizes_str, mb_per_size, remote_mb, rpc_base):
     sizes = [_parse_size(t) for t in sizes_str.split(",") if t.strip() != ""]
     if not sizes:
         raise RuntimeError("empty size list")
@@ -217,6 +235,7 @@ def _nearworker_main(dev, idx, run_dir, store_url, world, sizes_str, mb_per_size
         cfg.role = ralloc.RallocRole.NEAR
         cfg.start_store = False  # the store lives on the FAR side
         cfg.dynamic_world_size = True
+        cfg.rpc_port_base = rpc_base
         cfg.set_nic(f"tcp://{_nic_ip()}:{NIC_PORT_BASE}")
         assert ralloc.initialize(store_url, world, dev, cfg) == 0, "ralloc.initialize failed"
         ralloc_inited = True
@@ -293,12 +312,13 @@ def _spawn(role_argv, run_dir, log_name):
 
 
 def _far_parent(args, run_dir):
+    _store_precheck(args.store)  # abort early on a leftover store from a previous run
     devs = _rdma_up_devices(args.devs)
     procs, files = {}, {}
     try:
         for dev in devs:
             procs[dev], files[dev] = _spawn(
-                ["fardev", str(dev), run_dir, args.store, str(args.world)],
+                ["fardev", str(dev), run_dir, args.store, str(args.world), str(args.rpc_port_base)],
                 run_dir, f"far_dev{dev}.log")
         rank_map = {}
         for dev in devs:
@@ -346,7 +366,7 @@ def _near_parent(args, run_dir):
             dev = devs[idx % len(devs)]
             procs[idx], files[idx] = _spawn(
                 ["nearworker", str(dev), str(idx), run_dir, args.store, str(args.world),
-                 args.sizes, str(args.mb_per_size), str(args.remote_mb)],
+                 args.sizes, str(args.mb_per_size), str(args.remote_mb), str(args.rpc_port_base)],
                 run_dir, f"near_w{idx}.log")
             _log(f"[near] worker {idx} on npu {dev}")
 
@@ -383,6 +403,14 @@ def _near_parent(args, run_dir):
         _log(f"(workers={workers}, sizes={args.sizes}, FAR ranks hit={far_ranks})")
         print(f"({workers}/{workers}) 07_auto_rank_near_far_io: near IO matrix OK", flush=True)
     finally:
+        for p in procs.values():
+            if p.poll() is None:
+                p.terminate()  # reap sibling workers on failure / Ctrl+C — no orphans left behind
+        for p in procs.values():
+            try:
+                p.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                p.kill()
         for f in files.values():
             f.close()
 
@@ -406,6 +434,10 @@ def main():
                         help=f"NEAR: one-way MB per size per worker (default {DEFAULT_MB_PER_SIZE})")
     parser.add_argument("--remote-mb", type=int, default=64,
                         help="NEAR: remote block size in MB (default 64)")
+    parser.add_argument("--rpc-port-base", type=int, default=RPC_PORT_BASE,
+                        help=f"control rpc port base (port = base + rank_id, default {RPC_PORT_BASE}); "
+                             f"use to dodge stale same-rank processes on shared nodes — keep one "
+                             f"value for the whole session")
     parser.add_argument("--run-dir", default=None, help="marker/log dir (default ./log)")
     args = parser.parse_args()
 
@@ -430,10 +462,11 @@ if __name__ == "__main__":
     child_argv = sys.argv[1:]
     if child_argv and child_argv[0] in ("fardev", "nearworker"):  # child entry
         if child_argv[0] == "fardev":
-            _fardev_main(int(child_argv[1]), child_argv[2], child_argv[3], int(child_argv[4]))
+            _fardev_main(int(child_argv[1]), child_argv[2], child_argv[3], int(child_argv[4]),
+                         int(child_argv[5]))
         else:
             _nearworker_main(int(child_argv[1]), int(child_argv[2]), child_argv[3], child_argv[4],
                              int(child_argv[5]), child_argv[6], int(child_argv[7]),
-                             int(child_argv[8]))
+                             int(child_argv[8]), int(child_argv[9]))
         sys.exit(0)
     sys.exit(main())
