@@ -17,6 +17,7 @@
 #include <sys/syscall.h>
 #include <sys/utsname.h>
 #include <unistd.h>
+#include <sched.h>
 #include <algorithm>
 #include <cstddef>
 #include <cstdio>
@@ -37,10 +38,18 @@
 
 using namespace ock::mf;
 
-// Pool DRAM NUMA affinity: on multi-socket hosts the hugetlb pages drawn at mmap time
-// may land on the NUMA node remote from the NPU, degrading DMA bandwidth (measured
-// -6% H2D / -19% D2H on a 2-socket 910B node). Bind the pool VMA to the NPU-local
-// node before the pages are faulted in. UAPI values from linux/mempolicy.h.
+#ifndef SYS_move_pages
+#define SYS_move_pages 239 // aarch64 asm-generic (__NR_move_pages)
+#endif
+
+// Pool DRAM NUMA affinity: on multi-socket hosts the pool pages drawn at fault time
+// may land on a NUMA node remote from the NPU, degrading DMA bandwidth (measured
+// -6% H2D / -19% D2H on a 2-socket 910B node). Three best-effort layers, all optional:
+// L1 mbind PREFERRED/BIND on the pool VMA (BIND is banned and PREFERRED is silently
+// ignored on some vendor kernels, e.g. EulerOS 5.10.0-*); L2 pin the touching thread
+// to a CPU of the NPU-local node for the pool first-touch; L3 migrate already-faulted
+// pages to the target node via move_pages, then verify placement by sampling.
+// UAPI values from linux/mempolicy.h.
 namespace {
 constexpr int POOL_NUMA_AUTO = -1;
 constexpr int POOL_NUMA_OFF = -2;
@@ -239,67 +248,186 @@ void BindPoolVmaNuma(void *addr, uint64_t size, bool hugepage, uint32_t logicDev
     }
 }
 
-void LogPoolNumaPlacement(void *addr, int targetNode)
+// Layer 2: pin the calling thread to a CPU of the target node for the duration of the
+// pool first-touch, so pages faulted by the touch land on the NPU-local node. Required
+// on vendor kernels where mbind is ignored at fault time (verified EulerOS 5.10.0-*).
+bool PinThreadToNodeCpu(int node, cpu_set_t *saved)
 {
-    std::ifstream f("/proc/self/numa_maps");
-    std::string line;
-    char prefix[32];
-    if (snprintf(prefix, sizeof(prefix), "%llx-", static_cast<unsigned long long>(
-                   reinterpret_cast<uintptr_t>(addr))) <= 0) {
+    if (node < 0 || saved == nullptr) {
+        return false;
+    }
+    char path[128];
+    if (snprintf(path, sizeof(path), "/sys/devices/system/node/node%d/cpulist", node) <= 0) {
+        return false;
+    }
+    std::ifstream f(path);
+    std::string cpulist;
+    if (!(f >> cpulist)) {
+        return false;
+    }
+    auto ranges = ParseCpuRanges(cpulist);
+    if (ranges.empty() || ranges.front().first < 0 || ranges.front().first >= CPU_SETSIZE) {
+        return false;
+    }
+    if (sched_getaffinity(0, sizeof(*saved), saved) != 0) {
+        return false;
+    }
+    cpu_set_t target;
+    CPU_ZERO(&target);
+    CPU_SET(ranges.front().first, &target);
+    return sched_setaffinity(0, sizeof(target), &target) == 0;
+}
+
+void RestoreThreadAffinity(const cpu_set_t *saved)
+{
+    if (saved != nullptr) {
+        (void)sched_setaffinity(0, sizeof(*saved), saved);
+    }
+}
+
+// Migrate pages to node via move_pages. Returns 0 on success, -1 on global syscall
+// failure (errno set), otherwise the number of pages reported not moved. Per-page
+// errno is written into status.
+long MovePagesToNode(std::vector<void *> &addrs, int node, std::vector<int> &status)
+{
+    status.assign(addrs.size(), 0);
+    if (addrs.empty()) {
+        return 0;
+    }
+    std::vector<int> nodes(addrs.size(), node);
+    errno = 0;
+    long rc = syscall(SYS_move_pages, 0UL, static_cast<unsigned long>(addrs.size()), addrs.data(),
+                      nodes.data(), status.data(), 0UL);
+    if (rc == -1) {
+        return -1;
+    }
+    size_t stuck = 0;
+    for (auto s : status) {
+        if (s < 0) {
+            stuck++;
+        }
+    }
+    return static_cast<long>(stuck);
+}
+
+// Query current node of pages via move_pages (nodes == NULL). Returns 0 or -1 (errno).
+long QueryPagesNode(std::vector<void *> &addrs, std::vector<int> &status)
+{
+    status.assign(addrs.size(), 0);
+    if (addrs.empty()) {
+        return 0;
+    }
+    errno = 0;
+    return syscall(SYS_move_pages, 0UL, static_cast<unsigned long>(addrs.size()), addrs.data(), nullptr,
+                   status.data(), 0UL);
+}
+
+// Layer 3: post-fault migration. Fixes pages faulted by others (e.g. device
+// registration pinning) regardless of fault-time policy. Chunked, one retry pass.
+void MigratePoolPagesNuma(void *addr, uint64_t size, uint64_t pageSize, int node)
+{
+    const uint64_t chunkPages = 256;
+    const uint64_t totalPages = (size + pageSize - 1) / pageSize;
+    std::vector<void *> addrs;
+    std::vector<void *> failed;
+    uint64_t migrated = 0;
+    for (uint64_t base = 0; base < totalPages; base += chunkPages) {
+        uint64_t n = std::min(chunkPages, totalPages - base);
+        addrs.clear();
+        addrs.reserve(n);
+        for (uint64_t i = 0; i < n; i++) {
+            addrs.push_back(static_cast<char *>(addr) + (base + i) * pageSize);
+        }
+        std::vector<int> status;
+        if (MovePagesToNode(addrs, node, status) == -1) {
+            BM_LOG_WARN("pool numa affinity: move_pages failed: errno " << errno << ", "
+                        << SafeStrError(errno) << " (node " << node << ", pages " << addrs.size() << ")");
+            return;
+        }
+        for (size_t i = 0; i < addrs.size(); i++) {
+            if (status[i] < 0) {
+                failed.push_back(addrs[i]);
+            } else {
+                migrated++;
+            }
+        }
+    }
+    if (!failed.empty()) {
+        std::vector<int> status;
+        if (MovePagesToNode(failed, node, status) != -1) {
+            size_t stuck = 0;
+            for (auto s : status) {
+                if (s < 0) {
+                    stuck++;
+                }
+            }
+            migrated += failed.size() - stuck;
+            if (stuck > 0) {
+                BM_LOG_WARN("pool numa affinity: " << stuck << "/" << totalPages
+                            << " pool pages could not move to node " << node);
+            }
+        }
+    }
+    BM_LOG_INFO("pool numa affinity: migrated " << migrated << "/" << totalPages
+                << " pool pages to node " << node);
+}
+
+// Placement oracle: sample up to 32 pages via move_pages query mode (numa_maps lacks
+// hugetlb entries on some vendor kernels), log per-node distribution, WARN if off target.
+void LogPoolNumaPlacement(void *addr, uint64_t size, uint64_t pageSize, int targetNode)
+{
+    const uint64_t totalPages = (size + pageSize - 1) / pageSize;
+    const uint64_t samples = std::min<uint64_t>(totalPages, 32);
+    const uint64_t step = std::max<uint64_t>(totalPages / samples, 1);
+    std::vector<void *> addrs;
+    for (uint64_t i = 0; i < totalPages && addrs.size() < samples; i += step) {
+        addrs.push_back(static_cast<char *>(addr) + i * pageSize);
+    }
+    std::vector<int> status;
+    if (QueryPagesNode(addrs, status) == -1) {
+        BM_LOG_WARN("pool numa placement: move_pages query failed: errno " << errno << ", "
+                    << SafeStrError(errno));
         return;
     }
-    while (std::getline(f, line)) {
-        if (line.rfind(prefix, 0) != 0) {
+    std::vector<std::pair<int, uint64_t>> dist;
+    uint64_t onTarget = 0;
+    uint64_t valid = 0;
+    for (auto s : status) {
+        if (s < 0) {
             continue;
         }
-        // collect policy token + per-node page counters, verify placement vs target
-        std::string placement;
-        uint64_t pagesTotal = 0;
-        uint64_t pagesTarget = 0;
-        size_t pos = 0;
-        while (pos < line.size()) {
-            auto end = line.find(' ', pos);
-            if (end == std::string::npos) {
-                end = line.size();
-            }
-            std::string tok = line.substr(pos, end - pos);
-            bool keep = false;
-            if (tok.rfind("bind:", 0) == 0 || tok.rfind("prefer:", 0) == 0 ||
-                tok.rfind("interleave:", 0) == 0 || tok.rfind("default", 0) == 0) {
-                keep = true;
-            } else if (tok.rfind("N", 0) == 0) {
-                auto eq = tok.find('=');
-                if (eq != std::string::npos) {
-                    keep = true;
-                    uint64_t pages = strtoull(tok.c_str() + eq + 1, nullptr, 10);
-                    pagesTotal += pages;
-                    if (atoi(tok.c_str() + 1) == targetNode) {
-                        pagesTarget += pages;
-                    }
-                }
-            }
-            if (keep) {
-                if (!placement.empty()) {
-                    placement += " ";
-                }
-                placement += tok;
-            }
-            pos = end + 1;
+        valid++;
+        if (s == targetNode) {
+            onTarget++;
         }
-        if (placement.empty()) {
-            placement = "(no policy/N counters on numa_maps line)";
+        bool found = false;
+        for (auto &kv : dist) {
+            if (kv.first == s) {
+                kv.second++;
+                found = true;
+                break;
+            }
         }
-        if (targetNode >= 0 && pagesTotal > 0 && pagesTarget < pagesTotal) {
-            BM_LOG_WARN("pool numa placement after touch: " << placement << " -- expected all pages on node "
-                        << targetNode << ", got " << pagesTarget << "/" << pagesTotal
-                        << "; pool is NOT NPU-local (check per-node free hugepages)");
-        } else {
-            BM_LOG_INFO("pool numa placement after touch: " << placement);
+        if (!found) {
+            dist.emplace_back(s, 1);
         }
-        return;
     }
-    BM_LOG_WARN("pool numa placement: numa_maps entry not found for addr 0x" << std::hex
-                << reinterpret_cast<uintptr_t>(addr) << std::dec << " (unexpected)");
+    std::sort(dist.begin(), dist.end());
+    std::string placement;
+    for (auto &kv : dist) {
+        if (!placement.empty()) {
+            placement += " ";
+        }
+        placement += "N" + std::to_string(kv.first) + "=" + std::to_string(kv.second);
+    }
+    if (targetNode >= 0 && valid > 0 && onTarget == valid) {
+        BM_LOG_INFO("pool numa placement: " << placement << " (target node " << targetNode
+                    << ", sampled " << addrs.size() << "/" << totalPages << " pages)");
+    } else {
+        BM_LOG_WARN("pool numa placement: " << (placement.empty() ? "no resident pages" : placement)
+                    << " -- expected node " << targetNode << ", on-target " << onTarget << "/" << valid
+                    << " sampled pages; pool is NOT NPU-local");
+    }
 }
 } // namespace
 
@@ -611,7 +739,8 @@ Result HybmConnBasedSegment::MapSlice(void *&mapped, void *sliceAddr, uint64_t l
     }
 
     void *dva = nullptr;
-    mapped = AllocMemory(sliceAddr, lvOffset, size, allocMethod);
+    uint64_t pageSize = static_cast<uint64_t>(sysconf(_SC_PAGESIZE));
+    mapped = AllocMemory(sliceAddr, lvOffset, size, allocMethod, pageSize);
     if (mapped == MAP_FAILED) {
         BM_LOG_ERROR("Failed to alloc size:" << size << " addr:" << sliceAddr << " mapped:" << mapped
                                              << " error:" << errno << ", " << SafeStrError(errno));
@@ -637,12 +766,27 @@ Result HybmConnBasedSegment::MapSlice(void *&mapped, void *sliceAddr, uint64_t l
         return ret;
     }
 
+    // Layer 2: pin to NPU-local CPU so the first-touch below faults pages on that node
+    // (vendor kernels ignore mbind at fault time); restore right after the touch.
+    int numaNode = PoolNumaTargetNode(logicDeviceId_);
+    bool numaWork = numaNode >= 0 && allocMethod == MemAllocMethod::MMAP;
+    cpu_set_t savedMask;
+    bool pinned = numaWork ? PinThreadToNodeCpu(numaNode, &savedMask) : false;
     LvaShmReservePhysicalMemory(mapped, size);
-    LogPoolNumaPlacement(mapped, PoolNumaTargetNode(logicDeviceId_));
+    if (pinned) {
+        RestoreThreadAffinity(&savedMask);
+    }
+
+    if (numaWork) {
+        // Layer 3: migrate pages faulted by others (e.g. device registration), then verify.
+        MigratePoolPagesNuma(mapped, size, pageSize, numaNode);
+        LogPoolNumaPlacement(mapped, size, pageSize, numaNode);
+    }
     return BM_OK;
 }
 
-void* HybmConnBasedSegment::AllocMemory(void *sliceAddr, uint64_t lvOffset, uint64_t size, MemAllocMethod &allocMethod)
+void* HybmConnBasedSegment::AllocMemory(void *sliceAddr, uint64_t lvOffset, uint64_t size,
+                                        MemAllocMethod &allocMethod, uint64_t &pageSize)
 {
     void* mapped;
     auto prot = PROT_READ | PROT_WRITE;
@@ -656,6 +800,7 @@ void* HybmConnBasedSegment::AllocMemory(void *sliceAddr, uint64_t lvOffset, uint
         BM_LOG_INFO("Successfully allocated " << size << " bytes DRAM hugepage via mmap. addr:" << mapped);
         BindPoolVmaNuma(mapped, size, true, logicDeviceId_);
         allocMethod = MemAllocMethod::MMAP;
+        pageSize = HYBM_LARGE_PAGE_SIZE;
         return mapped;
     }
     BM_LOG_WARN("Failed to alloc size:" << size << " with hugepage via mmap, error: " << errno << ", "
@@ -677,6 +822,7 @@ void* HybmConnBasedSegment::AllocMemory(void *sliceAddr, uint64_t lvOffset, uint
                                                    << " bytes DRAM huge page memory");
         } else {
             allocMethod = MemAllocMethod::HAL_MEM_ALLOC;
+            pageSize = HYBM_LARGE_PAGE_SIZE;
             BM_LOG_INFO("Successfully allocated DRAM hugepage via halMemAlloc. "
                         "addr:" << halAllocPtr << " size:" << size);
             return halAllocPtr;
@@ -689,6 +835,7 @@ void* HybmConnBasedSegment::AllocMemory(void *sliceAddr, uint64_t lvOffset, uint
         BM_LOG_INFO("Successfully allocated " << size << " bytes DRAM 4K page via mmap. addr:" << mapped);
         BindPoolVmaNuma(mapped, size, false, logicDeviceId_);
         allocMethod = MemAllocMethod::MMAP;
+        pageSize = static_cast<uint64_t>(sysconf(_SC_PAGESIZE));
         return mapped;
     }
 
