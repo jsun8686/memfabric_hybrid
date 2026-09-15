@@ -204,6 +204,19 @@ def _rdma_up_devices(explicit):
     return up
 
 
+def _clear_stale_markers(run_dir, patterns):
+    """Remove marker files left by a previous run in the same dir: a stale shutdown.json
+    makes far daemons exit instantly after becoming ready; stale ready/done json files
+    fool the parents into reading last session's ranks/results."""
+    removed = []
+    for pat in patterns:
+        for path in glob.glob(os.path.join(run_dir, pat)):
+            os.remove(path)
+            removed.append(os.path.basename(path))
+    if removed:
+        _log("[setup] cleared stale markers from previous run: " + ", ".join(sorted(removed)))
+
+
 # ---------------------------------------------------------------- children ----
 
 def _fardev_main(dev, run_dir, store_url, world, rpc_base):
@@ -224,6 +237,8 @@ def _fardev_main(dev, run_dir, store_url, world, rpc_base):
         _log(f"[fardev npu {dev}] auto-ranked as rank {rank}, contributor ready")
         _write(os.path.join(run_dir, f"far_dev{dev}_ready.json"), {"dev": dev, "rank": rank})
 
+        if os.path.exists(os.path.join(run_dir, "shutdown.json")):  # double guard, see _clear_stale_markers
+            _log(f"[fardev npu {dev}] WARN: shutdown marker already present at startup")
         try:
             _wait_file(os.path.join(run_dir, "shutdown.json"), 7 * 24 * 3600)
         except KeyboardInterrupt:  # Ctrl+C hits the whole process group; exit cleanly
@@ -329,6 +344,7 @@ def _spawn(role_argv, run_dir, log_name):
 
 
 def _far_parent(args, run_dir):
+    _clear_stale_markers(run_dir, ["shutdown.json", "far_dev*_ready.json"])
     _store_precheck(args.store)  # abort early on a leftover store from a previous run
     devs = _rdma_up_devices(args.devs)
     procs, files = {}, {}
@@ -369,6 +385,7 @@ def _far_parent(args, run_dir):
 
 
 def _near_parent(args, run_dir):
+    _clear_stale_markers(run_dir, ["near_w*_done.json"])
     _wait_tcp(args.store, 30)  # the FAR-hosted store must accept first
     devs = _rdma_up_devices(args.devs)
     sizes = [_parse_size(t) for t in args.sizes.split(",") if t.strip() != ""]

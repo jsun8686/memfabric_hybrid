@@ -39,7 +39,8 @@ python3 07_auto_rank_near_far_io.py far  --store tcp://<far1_ip>:8587
 python3 07_auto_rank_near_far_io.py near --store tcp://<far1_ip>:8587 \
        --workers 4 --sizes 64K,256K,1M,4M,16M --mb-per-size 256
 
-# 3) 停止 FAR 守护（或直接 Ctrl+C）
+# 3) 停止 FAR 守护（或直接 Ctrl+C）；重启无需手动清 log/——脚本会自动清除上一轮的
+#    shutdown/ready/done 标记文件（打印 "cleared stale markers"）
 touch log/shutdown.json
 ```
 
@@ -101,3 +102,8 @@ kill <残留PID们>   # 然后重跑 near；若残留不便清理，可整会话
 组状态（master 仍持续授予 placement，但每次 extend 都 -2003）。处置：两端全停（含 FAR 守护——
 它不会自己恢复），按启动步骤从第 0 步重来。脚本已加同节点残留自检（`pgrep` 本测试进程，发现即拒绝
 启动），但对端节点的残留仍需人工按第 0 步确认。
+
+**症状 D（已修复，留作判读）：far 打印 resident 行后秒退、`all contributors exited cleanly`**
+上一轮停止时 `touch log/shutdown.json` 留下的标记未清，新 fardev 一 ready 就看到它随即退出。现脚本在
+父进程启动时自动清除陈旧 `shutdown.json`/`far_dev*_ready.json`/`near_w*_done.json`；若再见
+`WARN: shutdown marker already present at startup` 说明标记在启动后才被落下（人为 touch）。
