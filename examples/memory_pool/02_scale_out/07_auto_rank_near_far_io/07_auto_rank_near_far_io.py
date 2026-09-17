@@ -149,6 +149,7 @@ def _parse_size(tok):
 
 def _aligned_npu_tensor(nbytes, device, fill=False):
     """4K-aligned NPU tensor of exactly nbytes: handle.register() requires 4K alignment."""
+    import torch  # local import: only near workers need the torch backend
     buf = torch.empty((nbytes + 4096) // 4, dtype=torch.int32, device=device)
     off = ((-buf.data_ptr()) % 4096) // 4
     t = buf[off:off + nbytes // 4]
