@@ -109,9 +109,9 @@ Result SmemRallocMasterService::OnRegister(SmemRallocRpcMsg &msg)
         }
     }
 
-    SM_LOG_INFO("candidate registered, rank: " << msg.nodeRank << " endpoint: " << msg.nodeIp << ":"
-                                                << msg.nodePort << " committed: " << msg.size
-                                                << " deviceCommitted: " << msg.deviceCommittedBytes);
+    SM_LOG_DEBUG("candidate registered, rank: " << msg.nodeRank << " endpoint: " << msg.nodeIp << ":"
+                                                 << msg.nodePort << " committed: " << msg.size
+                                                 << " deviceCommitted: " << msg.deviceCommittedBytes);
     return SM_OK;
 }
 
