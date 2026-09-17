@@ -18,7 +18,7 @@ Topology (manual per-node launch):
   service) lands on the FAR side; FAR daemons keep running across NEAR runs.
 - NEAR nodes: one command per node; W independent nearworker children (auto-rank,
   one handle each, round-robin over the LINK UP cards) run a multi-granularity
-  copy matrix against a FAR-contributed remote HBM block and exit on completion.
+  copy matrix against a FAR-contributed remote DRAM block and exit on completion.
 
 Selection rule: only NPU devices whose hccn link is UP participate, on both sides.
 """
@@ -40,7 +40,7 @@ NIC_PORT_BASE = 10005        # data-plane nic port base (set_nic); NOT the contr
 RPC_PORT_BASE = 11100        # control rpc port = base + rankId (smem_ralloc_def.h default);
                              # node-local: stale same-rank processes from a previous session
                              # on the same node squat exactly this port -> bind failure
-HBM_WINDOW = 1 << 30         # 1GB HBM window slot per pool (device media)
+POOL_WINDOW = 1 << 30         # 1GB window slot per pool (dram media)
 DEFAULT_SIZES = "64K,256K,1M,4M,16M"
 DEFAULT_MB_PER_SIZE = 256    # one-way traffic per size per worker
 EXTEND_RETRY_SEC = 5
@@ -48,8 +48,8 @@ READY_TIMEOUT_SEC = 180      # per child init gate (ralloc init timeout defaults
 WORKER_TIMEOUT_SEC = 1800    # per worker completion gate
 GIB = 1 << 30
 
-DATA_OP = ralloc.RallocDataOpType.DEVICE_RDMA
-MEM_TYPE = ralloc.RallocMemType.DEVICE
+DATA_OP = ralloc.RallocDataOpType.DEVICE_RDMA   # dram media over the device-rdma transport
+MEM_TYPE = ralloc.RallocMemType.HOST
 
 
 def _log(msg):
@@ -145,6 +145,16 @@ def _parse_size(tok):
     if n <= 0:
         raise ValueError(f"bad size token: {tok}")
     return n * mult
+
+
+def _aligned_npu_tensor(nbytes, device, fill=False):
+    """4K-aligned NPU tensor of exactly nbytes: handle.register() requires 4K alignment."""
+    buf = torch.empty((nbytes + 4096) // 4, dtype=torch.int32, device=device)
+    off = ((-buf.data_ptr()) % 4096) // 4
+    t = buf[off:off + nbytes // 4]
+    if fill:
+        torch.arange(nbytes // 4, dtype=torch.int32, device=device, out=t)
+    return t
 
 
 # --------------------------------------------------------- rdma selection ----
@@ -273,7 +283,7 @@ def _nearworker_main(dev, idx, run_dir, store_url, world, sizes_str, mb_per_size
         ralloc_inited = True
         rank = ralloc.get_rank_id()
 
-        handle = ralloc.create(id=0, max_dram_size=0, max_hbm_size=HBM_WINDOW, data_op_type=DATA_OP)
+        handle = ralloc.create(id=0, max_dram_size=POOL_WINDOW, max_hbm_size=0, data_op_type=DATA_OP)
 
         # FAR contributors may still be registering; placement fails until then
         deadline = time.time() + 300
@@ -296,8 +306,12 @@ def _nearworker_main(dev, idx, run_dir, store_url, world, sizes_str, mb_per_size
         for size in sizes:
             if size > remote_bytes:
                 raise RuntimeError(f"size {size} exceeds remote block {remote_bytes}")
-            src = torch.arange(size // 4, dtype=torch.int32, device=device).contiguous()
-            dst = torch.empty_like(src)
+            src = _aligned_npu_tensor(size, device, fill=True)
+            dst = _aligned_npu_tensor(size, device)
+            # register user HBM into the pool so copy_data issues direct device-rdma
+            # on these buffers instead of staging through a pool bounce copy
+            assert handle.register(src.data_ptr(), size) == 0, "register src HBM failed"
+            assert handle.register(dst.data_ptr(), size) == 0, "register dst HBM failed"
             # untimed correctness probe for this granularity
             assert handle.copy_data(src.data_ptr(), gva, size, 0) == 0, "probe H2G"
             assert handle.copy_data(gva, dst.data_ptr(), size, 0) == 0, "probe G2H"
@@ -305,19 +319,28 @@ def _nearworker_main(dev, idx, run_dir, store_url, world, sizes_str, mb_per_size
 
             slots = remote_bytes // size
             blocks = (mb_per_size << 20) // size
+            one_way = blocks * size
             t0 = time.perf_counter()
             for i in range(blocks):
                 off = gva + (i % slots) * size
                 assert handle.copy_data(src.data_ptr(), off, size, 0) == 0, "H2G"
+            tw = time.perf_counter() - t0
+            t0 = time.perf_counter()
+            for i in range(blocks):
+                off = gva + (i % slots) * size
                 assert handle.copy_data(off, dst.data_ptr(), size, 0) == 0, "G2H"
-            dt = time.perf_counter() - t0
-            one_way = blocks * size
-            gbps = one_way / dt / GIB
-            us = dt / blocks * 1e6
-            results[str(size)] = {"blocks": blocks, "gbps": round(gbps, 2),
-                                  "us_per_block": round(us, 2)}
-            _log(f"[near w{idx}] size {size}: {blocks} blocks, {gbps:.2f} GB/s, "
-                 f"{us:.2f} us/block (round-trip)")
+            tr = time.perf_counter() - t0
+            wr_gbps = one_way / tw / GIB
+            rd_gbps = one_way / tr / GIB
+            results[str(size)] = {"blocks": blocks,
+                                  "write_gbps": round(wr_gbps, 2), "read_gbps": round(rd_gbps, 2),
+                                  "write_us_per_block": round(tw / blocks * 1e6, 2),
+                                  "read_us_per_block": round(tr / blocks * 1e6, 2)}
+            _log(f"[near w{idx}] size {size}: {blocks} blocks, "
+                 f"write {wr_gbps:.2f} GB/s ({tw / blocks * 1e6:.2f} us/block), "
+                 f"read {rd_gbps:.2f} GB/s ({tr / blocks * 1e6:.2f} us/block)")
+            assert handle.unregister(src.data_ptr()) == 0, "unregister src failed"
+            assert handle.unregister(dst.data_ptr()) == 0, "unregister dst failed"
 
         handle.destroy()
         mf.get_and_clear_last_err_msg()
@@ -423,14 +446,15 @@ def _near_parent(args, run_dir):
             if procs[idx].returncode != 0:
                 raise RuntimeError(f"worker {idx} failed: {procs[idx].returncode} — see {run_dir}")
 
-        _log("")
-        _log(f"{'size':>10s} " + " ".join(f"{'w' + str(i):>8s}" for i in range(workers)) +
-             f" {'min':>8s} {'avg':>8s} {'max':>8s}   GB/s (one-way, round-trip timed)")
-        for size in sizes:
-            key = str(size)
-            vals = [results[i]["results"][key]["gbps"] for i in range(workers)]
-            _log(f"{key:>10s} " + " ".join(f"{v:8.2f}" for v in vals) +
-                 f" {min(vals):8.2f} {sum(vals) / len(vals):8.2f} {max(vals):8.2f}")
+        for name, field in (("write (H2G)", "write_gbps"), ("read (G2H)", "read_gbps")):
+            _log("")
+            _log(f"{'size':>10s} " + " ".join(f"{'w' + str(i):>8s}" for i in range(workers)) +
+                 f" {'min':>8s} {'avg':>8s} {'max':>8s}   GB/s {name}, one-way")
+            for size in sizes:
+                key = str(size)
+                vals = [results[i]["results"][key][field] for i in range(workers)]
+                _log(f"{key:>10s} " + " ".join(f"{v:8.2f}" for v in vals) +
+                     f" {min(vals):8.2f} {sum(vals) / len(vals):8.2f} {max(vals):8.2f}")
         far_ranks = sorted({results[i]["far_rank"] for i in range(workers)})
         _log(f"(workers={workers}, sizes={args.sizes}, FAR ranks hit={far_ranks})")
         print(f"({workers}/{workers}) 07_auto_rank_near_far_io: near IO matrix OK", flush=True)
