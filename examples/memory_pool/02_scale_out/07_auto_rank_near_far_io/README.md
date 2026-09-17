@@ -19,8 +19,8 @@ FAR 节点（常驻守护，每节点一条命令）          NEAR 节点（测�
 ## 使用能力
 - auto_ranking 动态编队（`ralloc.get_rank_id()` 获取分配结果，rank 顺序即加入顺序）
 - store 服务端竞速（`start_store=True` + store URL 落在 FAR 节点 → store 主/master 在 FAR 侧）
-- device RDMA 媒体（`DEVICE + SDMA|DEVICE_RDMA`，HBM-only 窗口；910B 上 DRAM 窗口带不了 SDMA 位）
-- `extend_remote_mem` / `copy_data` / `wait` 多粒度矩阵 + 并发进程
+- device RDMA 媒体（`DEVICE + DEVICE_RDMA`，HBM-only 窗口；A2 上跨节点 SDMA 不可达——CQE `smmu return terminate`，且 `wait()` 仅有 SDMA 后端，故不带 SDMA 位、不调 `wait()`）
+- `extend_remote_mem` / `copy_data` 多粒度矩阵 + 并发进程（`copy_data` 在 DEVICE_RDMA 路径逐调用同步，完成即返回）
 
 ## 设备选取规则
 两端一致：仅 `hccn_tool -i N -link -g` 报 `link status: UP` 的 NPU 参与；

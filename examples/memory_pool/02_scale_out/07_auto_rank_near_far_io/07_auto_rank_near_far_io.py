@@ -48,7 +48,7 @@ READY_TIMEOUT_SEC = 180      # per child init gate (ralloc init timeout defaults
 WORKER_TIMEOUT_SEC = 1800    # per worker completion gate
 GIB = 1 << 30
 
-DATA_OP = ralloc.RallocDataOpType.SDMA | ralloc.RallocDataOpType.DEVICE_RDMA
+DATA_OP = ralloc.RallocDataOpType.DEVICE_RDMA
 MEM_TYPE = ralloc.RallocMemType.DEVICE
 
 
@@ -301,7 +301,6 @@ def _nearworker_main(dev, idx, run_dir, store_url, world, sizes_str, mb_per_size
             # untimed correctness probe for this granularity
             assert handle.copy_data(src.data_ptr(), gva, size, 0) == 0, "probe H2G"
             assert handle.copy_data(gva, dst.data_ptr(), size, 0) == 0, "probe G2H"
-            assert handle.wait() == 0, "probe wait"
             assert torch.equal(dst, src), "probe round-trip mismatch"
 
             slots = remote_bytes // size
@@ -311,7 +310,6 @@ def _nearworker_main(dev, idx, run_dir, store_url, world, sizes_str, mb_per_size
                 off = gva + (i % slots) * size
                 assert handle.copy_data(src.data_ptr(), off, size, 0) == 0, "H2G"
                 assert handle.copy_data(off, dst.data_ptr(), size, 0) == 0, "G2H"
-            assert handle.wait() == 0, "matrix wait"
             dt = time.perf_counter() - t0
             one_way = blocks * size
             gbps = one_way / dt / GIB
