@@ -551,7 +551,8 @@ Result AccStoreServer::WatchHandler(const ock::acc::AccTcpRequestContext &contex
 
     StoreWaitContext waitContext{-1L, key, context};
     auto linkId = context.Link()->Id();
-    watchWaiters_[key].insert_or_assign(linkId, waitContext);
+    watchWaiters_[key].erase(linkId);
+    watchWaiters_[key].emplace(linkId, waitContext);
     linkWatchList_[linkId].emplace_back(key);
     if (ret == SUCCESS) {
         responseMessage.values.push_back(oldValue);
