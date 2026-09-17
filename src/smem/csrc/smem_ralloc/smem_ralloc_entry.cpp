@@ -131,6 +131,15 @@ void SmemRallocEntry::UnInitialize()
             SM_LOG_WARN("group leave failed during uninitialize, ret: " << ret);
         }
     }
+    /* symmetric cleanup of the role key written at join time: a stale role key would
+     * poison the member-role seeding of the next pool lifecycle on this rank */
+    if (configStore_ != nullptr) {
+        std::string roleKey = std::string(SMEMRA_POOL_ROLE_KEY_PREFIX) + std::to_string(options_.rank);
+        auto rmRet = configStore_->Remove(roleKey, true);
+        if (rmRet != SM_OK) {
+            SM_LOG_WARN("remove role key during uninitialize failed, key: " << roleKey << " ret: " << rmRet);
+        }
+    }
     // Stop the group engine listen thread before releasing the entity.
     globalGroup_ = nullptr;
 

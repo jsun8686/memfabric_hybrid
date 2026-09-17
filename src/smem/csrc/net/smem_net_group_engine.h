@@ -164,6 +164,7 @@ private:
     int32_t JoinLeaveEventProcess();
     void RankLinkDownEventProcess(uint32_t rankId);
     void GroupWatchCb(int result, const std::string &key, const std::string &value);
+    void ResyncEventKey();
     void RemoteRankLinkDownCb(uint32_t remoteRankId);
     bool UpdateBitmapFromRank(SmemGroupInfo &info, uint32_t rankId);
     void GetAllRanksFromBitMap(std::vector<uint32_t> &rankIds);

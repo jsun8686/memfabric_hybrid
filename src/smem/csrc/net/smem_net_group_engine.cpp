@@ -685,13 +685,10 @@ uint32_t SmemNetGroupEngine::TryRemoveAllLeavedPrefixKey()
             RemoteRankLinkDownCb(rk);
             count++;
         } else {
-            std::string key = SMEM_EXCHANGE_INFO_KEY + std::to_string(rk);
-            std::string val;
-            ret = store_->Get(key, val, 0); // query whether the key is deleted
-            if (ret == NOT_EXIST) {
-                SM_LOG_INFO("rank:" << rk << " has removed");
-                count++;
-            }
+            /* a live process with a missing exchange key is NOT proof the member left:
+             * an in-flight joiner publishes its join event before writing its key, and a
+             * re-arming contributor rebuilds its key seconds after its placement grant.
+             * Only a dead process (QueryAlive == 0, handled above) may be counted here. */
         }
     }
     return count;
@@ -877,6 +874,9 @@ void SmemNetGroupEngine::GroupListenEvent()
             break;
         }
         if (ret != SM_OK) {
+            /* no watch push arrived this cycle: a pending self-submission whose push was
+             * lost would otherwise stall until the operation timeout */
+            ResyncEventKey();
             continue;
         }
 
@@ -900,7 +900,9 @@ void SmemNetGroupEngine::GroupListenEvent()
             int32_t ret2 = SM_OK;
             if (TryUpdateInfo(info) || redoLast) {
                 ret2 = JoinLeaveEventProcess();
-                canRemove = (ret == SM_OK);
+                /* judge by the PROCESSING result: BUSY means leave/link_down is pending
+                 * and the event must be redone, any other outcome consumes the event */
+                canRemove = (ret2 != SM_INNER_BUSY);
             }
             // remove now event if has leave event or do event success
             if (canRemove || currentLeaveCount_.load() > 0) {
@@ -912,7 +914,7 @@ void SmemNetGroupEngine::GroupListenEvent()
                 currentEvents.pop_front();
                 redoLast = false;
             } else {
-                redoLast = (ret == SM_INNER_BUSY); // groupInfo has updated, need redo next time
+                redoLast = true; // BUSY: reprocess once the pending leave/link_down settles
                 break;
             }
         }
@@ -1153,6 +1155,36 @@ void SmemNetGroupEngine::RemoteRankLinkDownCb(uint32_t remoteRankId)
             currentLinkDownCount_.fetch_add(1U);
         },
         true);
+}
+
+/* self-heal a lost watch push: if one of our own submitted events has not round-tripped
+ * through the store watch yet, actively re-read the event key and feed it into the
+ * normal processing path so the submitter's wait does not hit its full timeout */
+void SmemNetGroupEngine::ResyncEventKey()
+{
+    uint32_t submitted = lastSubmitVersion_.load();
+    if (submitted == 0U) {
+        return;
+    }
+    uint32_t applied;
+    {
+        std::shared_lock<std::shared_mutex> lock(groupInfoMutex_);
+        applied = groupInfo_.version;
+    }
+    if (submitted <= applied) {
+        return; /* nothing of ours pending */
+    }
+    std::string val;
+    auto ret = store_->Get(SMEM_GROUP_LISTEN_EVENT_KEY, val, 0);
+    if (ret != SM_OK || val.length() != SMEM_GROUP_INFO_SIZE) {
+        return;
+    }
+    auto info = reinterpret_cast<SmemGroupInfo *>(const_cast<char *>(val.c_str()));
+    if (info->version == 0U || info->version <= applied) {
+        return; /* store holds nothing newer than the applied state */
+    }
+    SM_LOG_INFO("watch push suspected lost, resync group event, ver: " << info->version << " applied: " << applied);
+    GroupWatchCb(SM_OK, SMEM_GROUP_LISTEN_EVENT_KEY, val);
 }
 
 void SmemNetGroupEngine::ClearBitmapForRank(SmemGroupInfo &info, uint32_t rankId)
@@ -1452,18 +1484,42 @@ Result SmemNetGroupEngine::GroupLeave()
         ret |= localOpRet_;
     }
 
-    SmemGroupInfo info = GenerateInfo(NULL_EVNET, option_.rank, old);
-    SM_LOG_DEBUG("generate info:" << info);
-    std::string str((char *)&info, SMEM_GROUP_INFO_SIZE);
-    auto ret2 = store_->Cas(SMEM_GROUP_LISTEN_EVENT_KEY, old, str, old);
-    if (ret2 != SM_OK) {
-        SM_LOG_ERROR("reset group event failed, ret: " << ret2 << " expect:" << info);
-    } else {
-        lastSubmitVersion_.store(info.version);
+    /* reset with the same bounded retry as the leave publish: an unresolved version
+     * conflict here would leave the event key holding a live-looking event value that
+     * the next pool lifecycle ingests as stale group state */
+    bool resetDone = false;
+    int resetConflictCnt = 0;
+    int resetUnreachableCnt = 0;
+    SmemGroupInfo resetInfo{};
+    while (resetConflictCnt < MAX_RETRY_CONFLICT && resetUnreachableCnt < MAX_RETRY_UNREACHABLE) {
+        resetInfo = GenerateInfo(NULL_EVNET, option_.rank, old);
+        SM_LOG_DEBUG("generate info:" << resetInfo);
+        std::string str((char *)&resetInfo, SMEM_GROUP_INFO_SIZE);
+        auto ret2 = store_->Cas(SMEM_GROUP_LISTEN_EVENT_KEY, old, str, old);
+        if (ret2 == SM_OK) {
+            lastSubmitVersion_.store(resetInfo.version);
+            resetDone = true;
+            break;
+        }
+        if (ret2 == StoreErrorCode::RESTORE) {
+            resetConflictCnt++; // store alive, version raced: retry with the refreshed base
+        } else {
+            resetUnreachableCnt++;
+        }
+        usleep(SMEM_GROUP_SLEEP_TIMEOUT);
     }
+    if (!resetDone) {
+        SM_LOG_ERROR("reset group event failed after bounded retries (conflicts: " << resetConflictCnt
+                     << ", unreachable: " << resetUnreachableCnt << "), rank: " << option_.rank);
+    }
+    /* NOTE: the event key is deliberately NOT deleted even when the last member leaves.
+     * The converged NULL_EVENT + empty-bitmap value is a benign tombstone that a fresh
+     * engine adopts harmlessly, while deleting the key races a concurrent joiner that
+     * re-created group state between our reset and the delete, permanently splitting
+     * the group's version lineage across two sub-groups. */
 
     joined_ = false;
-    return (ret | ret2) == SM_OK ? SM_OK : SM_ERROR;
+    return (ret == SM_OK && resetDone) ? SM_OK : SM_ERROR;
 }
 
 void SmemNetGroupEngine::GetMemberRanks(std::vector<uint32_t> &rankIds) const
