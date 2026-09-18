@@ -25,6 +25,10 @@ Selection rule: only NPU devices whose hccn link is UP participate, on both side
 Copy mode of the timed matrix: default = per-block copy_data loop; --batch = one
 copy_data_batch call per direction (the whole matrix is submitted, then a single wait),
 which saves N-1 per-block synchronizations.
+--sync-start holds workers at a file barrier until every worker has acquired its remote
+block: concurrent worker inits on one node serialize deep in the device driver for
+seconds, so without the barrier the per-worker timed phases do not overlap and the
+printed matrix is effectively W sequential single-worker runs.
 """
 import argparse
 import glob
@@ -266,7 +270,7 @@ def _fardev_main(dev, run_dir, store_url, world, rpc_base):
 
 
 def _nearworker_main(dev, idx, run_dir, store_url, world, sizes_str, mb_per_size, remote_mb, rpc_base,
-                     use_batch):
+                     use_batch, sync_start, workers_total):
     sizes = [_parse_size(t) for t in sizes_str.split(",") if t.strip() != ""]
     if not sizes:
         raise RuntimeError("empty size list")
@@ -306,6 +310,19 @@ def _nearworker_main(dev, idx, run_dir, store_url, world, sizes_str, mb_per_size
         mf.get_and_clear_last_err_msg()
         _log(f"[near w{idx} rank {rank}] remote block from FAR rank {far_rank} "
              f"(gva=0x{gva:x}, npu {dev})")
+
+        if sync_start:
+            _write(os.path.join(run_dir, f"near_w{idx}_ready.json"), {"idx": idx})
+            deadline = time.time() + 300
+            while True:
+                readies = glob.glob(os.path.join(run_dir, "near_w*_ready.json"))
+                if len(readies) >= workers_total:
+                    break
+                if time.time() > deadline:
+                    raise RuntimeError(f"sync-start barrier timeout: {len(readies)}/{workers_total} "
+                                       "workers ready — see sibling near_w*.log for the stuck one")
+                time.sleep(0.2)
+            _log(f"[near w{idx}] sync-start: all {workers_total} workers ready, starting matrix")
 
         device = f"npu:{dev}"
         results = {}
@@ -425,7 +442,7 @@ def _far_parent(args, run_dir):
 
 
 def _near_parent(args, run_dir):
-    _clear_stale_markers(run_dir, ["near_w*_done.json"])
+    _clear_stale_markers(run_dir, ["near_w*_done.json", "near_w*_ready.json"])
     _wait_tcp(args.store, 30)  # the FAR-hosted store must accept first
     devs = _rdma_up_devices(args.devs)
     sizes = [_parse_size(t) for t in args.sizes.split(",") if t.strip() != ""]
@@ -441,7 +458,8 @@ def _near_parent(args, run_dir):
             procs[idx], files[idx] = _spawn(
                 ["nearworker", str(dev), str(idx), run_dir, args.store, str(args.world),
                  args.sizes, str(args.mb_per_size), str(args.remote_mb), str(args.rpc_port_base),
-                 "batch" if args.batch else "loop"],
+                 "batch" if args.batch else "loop",
+                 "sync" if args.sync_start else "nosync", str(workers)],
                 run_dir, f"near_w{idx}.log")
             _log(f"[near] worker {idx} on npu {dev}")
 
@@ -513,6 +531,10 @@ def main():
     parser.add_argument("--batch", action="store_true",
                         help="NEAR: timed matrix uses one copy_data_batch per direction "
                              "(submit the whole matrix, single wait) instead of a copy_data loop")
+    parser.add_argument("--sync-start", action="store_true",
+                        help="NEAR: workers hold at a file barrier until every worker has acquired "
+                             "its remote block, then run the matrix concurrently (removes the "
+                             "driver-serialized init skew; required for aggregate bandwidth runs)")
     parser.add_argument("--rpc-port-base", type=int, default=RPC_PORT_BASE,
                         help=f"control rpc port base (port = base + rank_id, default {RPC_PORT_BASE}); "
                              f"use to dodge stale same-rank processes on shared nodes — keep one "
@@ -547,6 +569,7 @@ if __name__ == "__main__":
         else:
             _nearworker_main(int(child_argv[1]), int(child_argv[2]), child_argv[3], child_argv[4],
                              int(child_argv[5]), child_argv[6], int(child_argv[7]),
-                             int(child_argv[8]), int(child_argv[9]), child_argv[10] == "batch")
+                             int(child_argv[8]), int(child_argv[9]), child_argv[10] == "batch",
+                             child_argv[11] == "sync", int(child_argv[12]))
         sys.exit(0)
     sys.exit(main())
