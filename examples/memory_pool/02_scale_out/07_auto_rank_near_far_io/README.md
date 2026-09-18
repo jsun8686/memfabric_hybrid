@@ -1,7 +1,7 @@
 # 07_auto_rank_near_far_io
 
 ## 场景
-多物理节点 scale-out IO 矩阵：auto-rank 动态编队，**store 主与常驻贡献端在 FAR 侧**，NEAR 侧多进程并发、多粒度对远端 HBM 块做 device RDMA 拷贝矩阵，测完即退（FAR 不受影响，可承接下一轮 NEAR）。
+多物理节点 scale-out IO 矩阵：auto-rank 动态编队，**store 主与常驻贡献端在 FAR 侧**，NEAR 侧多进程并发、多粒度对远端 DRAM 块做 device RDMA 拷贝矩阵（本地 NPU HBM ↔ 远端 FAR DRAM，即 L2G/G2L），测完即退（FAR 不受影响，可承接下一轮 NEAR）。
 
 ## 拓扑与角色
 

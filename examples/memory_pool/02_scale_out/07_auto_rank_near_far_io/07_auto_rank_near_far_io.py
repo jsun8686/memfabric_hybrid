@@ -342,8 +342,8 @@ def _nearworker_main(dev, idx, run_dir, store_url, world, sizes_str, mb_per_size
             assert handle.register(src.data_ptr(), size) == 0, "register src HBM failed"
             assert handle.register(dst.data_ptr(), size) == 0, "register dst HBM failed"
             # untimed correctness probe for this granularity
-            assert handle.copy_data(src.data_ptr(), gva, size, 0) == 0, "probe H2G"
-            assert handle.copy_data(gva, dst.data_ptr(), size, 0) == 0, "probe G2H"
+            assert handle.copy_data(src.data_ptr(), gva, size, 0) == 0, "probe L2G"
+            assert handle.copy_data(gva, dst.data_ptr(), size, 0) == 0, "probe G2L"
             assert torch.equal(dst, src), "probe round-trip mismatch"
 
             slots = remote_bytes // size
@@ -356,20 +356,20 @@ def _nearworker_main(dev, idx, run_dir, store_url, world, sizes_str, mb_per_size
             t0 = time.perf_counter()
             if use_batch:
                 assert handle.copy_data_batch([src.data_ptr()] * blocks, dst_offs, sz_list,
-                                               blocks, 0) == 0, "H2G batch"
+                                               blocks, 0) == 0, "L2G batch"
             else:
                 for off in dst_offs:
-                    assert handle.copy_data(src.data_ptr(), off, size, 0) == 0, "H2G"
+                    assert handle.copy_data(src.data_ptr(), off, size, 0) == 0, "L2G"
             tw = time.perf_counter() - t0
             if sync_start:
                 _barrier(run_dir, idx, f"s{si}_r", workers_total)
             t0 = time.perf_counter()
             if use_batch:
                 assert handle.copy_data_batch(dst_offs, [dst.data_ptr()] * blocks, sz_list,
-                                               blocks, 0) == 0, "G2H batch"
+                                               blocks, 0) == 0, "G2L batch"
             else:
                 for off in dst_offs:
-                    assert handle.copy_data(off, dst.data_ptr(), size, 0) == 0, "G2H"
+                    assert handle.copy_data(off, dst.data_ptr(), size, 0) == 0, "G2L"
             tr = time.perf_counter() - t0
             if use_batch:
                 assert torch.equal(dst, src), "batch round-trip mismatch"
@@ -493,15 +493,17 @@ def _near_parent(args, run_dir):
             if procs[idx].returncode != 0:
                 raise RuntimeError(f"worker {idx} failed: {procs[idx].returncode} — see {run_dir}")
 
-        for name, field in (("write (H2G)", "write_gbps"), ("read (G2H)", "read_gbps")):
+        heads = [f"w{i}@npu{results[i]['dev']}" for i in range(workers)]
+        col = max(8, max(len(h) for h in heads))
+        for name, field in (("write (L2G)", "write_gbps"), ("read (G2L)", "read_gbps")):
             _log("")
-            _log(f"{'size':>10s} " + " ".join(f"{'w' + str(i):>8s}" for i in range(workers)) +
-                 f" {'min':>8s} {'avg':>8s} {'max':>8s}   GB/s {name}, one-way")
+            _log(f"{'size':>10s} " + " ".join(f"{h:>{col}s}" for h in heads) +
+                 f" {'min':>{col}s} {'avg':>{col}s} {'max':>{col}s}   GB/s {name}, one-way")
             for size in sizes:
                 key = str(size)
                 vals = [results[i]["results"][key][field] for i in range(workers)]
-                _log(f"{key:>10s} " + " ".join(f"{v:8.2f}" for v in vals) +
-                     f" {min(vals):8.2f} {sum(vals) / len(vals):8.2f} {max(vals):8.2f}")
+                _log(f"{key:>10s} " + " ".join(f"{v:{col}.2f}" for v in vals) +
+                     f" {min(vals):{col}.2f} {sum(vals) / len(vals):{col}.2f} {max(vals):{col}.2f}")
         if args.sync_start:
             _log("")
             _log(f"[near] aggregate one-way bandwidth ({workers} workers concurrent):")
@@ -511,8 +513,9 @@ def _near_parent(args, run_dir):
                 agg_w = sum(results[i]["results"][key]["write_gbps"] for i in range(workers))
                 agg_r = sum(results[i]["results"][key]["read_gbps"] for i in range(workers))
                 _log(f"{key:>10s} {agg_w:12.2f} {agg_r:12.2f}")
-        far_ranks = sorted({results[i]["far_rank"] for i in range(workers)})
-        _log(f"(workers={workers}, sizes={args.sizes}, FAR ranks hit={far_ranks})")
+        pairs = ", ".join(f"w{i}: npu{results[i]['dev']} -> FAR rank{results[i]['far_rank']}"
+                          for i in range(workers))
+        _log(f"(workers={workers}, sizes={args.sizes}; {pairs})")
         print(f"({workers}/{workers}) 07_auto_rank_near_far_io: near IO matrix OK", flush=True)
     finally:
         for p in procs.values():
