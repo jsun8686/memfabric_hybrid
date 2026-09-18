@@ -53,6 +53,8 @@ public:
 
     Result DataCopy(const void *src, void *dest, uint64_t size, uint32_t flags);
 
+    Result DataCopyBatch(smem_ralloc_batch_copy_params *params, uint32_t flags);
+
     Result Wait();
 
     Result RegisterMem(uint64_t addr, uint64_t size);

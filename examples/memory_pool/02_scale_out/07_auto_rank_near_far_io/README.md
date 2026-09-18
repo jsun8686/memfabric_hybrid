@@ -21,6 +21,7 @@ FAR 节点（常驻守护，每节点一条命令）          NEAR 节点（测�
 - store 服务端竞速（`start_store=True` + store URL 落在 FAR 节点 → store 主/master 在 FAR 侧）
 - device RDMA 媒体（`DEVICE + DEVICE_RDMA`，HBM-only 窗口；A2 上跨节点 SDMA 不可达——CQE `smmu return terminate`，且 `wait()` 仅有 SDMA 后端，故不带 SDMA 位、不调 `wait()`）
 - `extend_remote_mem` / `copy_data` 多粒度矩阵 + 并发进程（`copy_data` 在 DEVICE_RDMA 路径逐调用同步，完成即返回）
+- `copy_data_batch` 批量拷贝（`--batch` 开启；单方向整批一次提交 + 一次等待，方向按首对地址推断、整批须同方向；批后 `torch.equal` 校验内容）
 
 ## 设备选取规则
 两端一致：仅 `hccn_tool -i N -link -g` 报 `link status: UP` 的 NPU 参与；
@@ -56,8 +57,9 @@ touch log/shutdown.json
 | `--devs` | 自动 | 强制 NPU id 列表（默认自动探测 LINK UP） |
 | `--workers` | 4 | NEAR 并发 worker 进程数（上限即此值，轮转分卡） |
 | `--sizes` | 64K,256K,1M,4M,16M | 粒度扫描列表（K/M/G 后缀） |
-| `--mb-per-size` | 256 | 每粒度每 worker 单向流量（MB） |
+| `--mb-per-size` | 256 | 每粒度每 worker 单向流量（MB）；不足一个粒度时至少跑 1 块 |
 | `--remote-mb` | 64 | 每 worker 申请的远端块大小（须 ≥ 最大粒度） |
+| `--batch` | 关 | 计时矩阵改用每方向一次 `copy_data_batch`（整批一次提交 + 一次等待），默认为逐块 `copy_data` 循环 |
 | `--rpc-port-base` | 11100 | 控制面 rpc 端口基址（端口 = 基址 + rank_id）；整会话保持一致 |
 | `MF_TEST_NIC_IP` | 自动 | 数据面 NIC IP 覆盖（同 03/04/05） |
 
@@ -76,6 +78,7 @@ touch log/shutdown.json
 ## 判读
 - 小粒度（64K/256K）吞吐受单块时延主导（`us_per_block` 列），大粒度逼近 device RDMA 带宽
 - 多 worker 并发应摊满 NIC/链路带宽；若随 worker 数不增，检查交换机侧或同卡竞争
+- `--batch` 对比默认循环：批模式省去 N-1 次逐块同步等待，小粒度 `us_per_block` 的差值即单次等待开销（批模式日志带 `(batch)` 标记）
 
 ## 排障（会话残留）
 控制面 rpc 端口 = `11100 + rank_id`（`smem_ralloc_def.h` 默认基址），**节点本地**——上一会话残留的同 rank 进程会蹲占完全相同的端口。两类典型症状与处置：

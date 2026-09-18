@@ -117,6 +117,14 @@ typedef struct {
 } smem_ralloc_mem_info;
 typedef smem_ralloc_mem_info smem_ralloc_mem_info_t;
 
+typedef struct {
+    void **sources;            /* array of source addresses, local or global, batchSize entries */
+    void **destinations;       /* array of destination addresses, local or global, batchSize entries */
+    const uint64_t *dataSizes; /* array of data sizes in byte, batchSize entries */
+    uint32_t batchSize;        /* number of the copy pairs */
+} smem_ralloc_batch_copy_params;
+typedef smem_ralloc_batch_copy_params smem_ralloc_batch_copy_params_t;
+
 /**
  * @brief smem join/leave event type
  */

@@ -100,6 +100,20 @@ void smem_ralloc_destroy(smem_ralloc_t handle);
 int32_t smem_ralloc_copy(smem_ralloc_t handle, const void *src, void *dest, uint64_t size, uint32_t flags);
 
 /**
+ * @brief Copy multiple data blocks with one call. Direction is automatically selected
+ * by the address of the first pair and applied to the whole batch, so all pairs of
+ * one call must share the same direction. All blocks are submitted before one single
+ * wait, which saves the per-copy synchronization cost of repeated smem_ralloc_copy calls.
+ *
+ * @param handle           [in] ralloc object handle created by <i>smem_ralloc_create</i>
+ * @param params           [in] batch parameters: arrays of sources, destinations and
+ *                              dataSizes, batchSize entries each
+ * @param flags            [in] optional flags, e.g. ASYNC_COPY_FLAG
+ * @return 0 if successful
+ */
+int32_t smem_ralloc_copy_batch(smem_ralloc_t handle, smem_ralloc_batch_copy_params_t *params, uint32_t flags);
+
+/**
  * @brief Wait all asynchronous copy finished
  *
  * Applies to the SDMA asynchronous path only: HOST data paths (HOST_RDMA etc.) complete

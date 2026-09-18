@@ -21,6 +21,10 @@ Topology (manual per-node launch):
   copy matrix against a FAR-contributed remote DRAM block and exit on completion.
 
 Selection rule: only NPU devices whose hccn link is UP participate, on both sides.
+
+Copy mode of the timed matrix: default = per-block copy_data loop; --batch = one
+copy_data_batch call per direction (the whole matrix is submitted, then a single wait),
+which saves N-1 per-block synchronizations.
 """
 import argparse
 import glob
@@ -261,7 +265,8 @@ def _fardev_main(dev, run_dir, store_url, world, rpc_base):
         mf.uninitialize()
 
 
-def _nearworker_main(dev, idx, run_dir, store_url, world, sizes_str, mb_per_size, remote_mb, rpc_base):
+def _nearworker_main(dev, idx, run_dir, store_url, world, sizes_str, mb_per_size, remote_mb, rpc_base,
+                     use_batch):
     sizes = [_parse_size(t) for t in sizes_str.split(",") if t.strip() != ""]
     if not sizes:
         raise RuntimeError("empty size list")
@@ -319,25 +324,37 @@ def _nearworker_main(dev, idx, run_dir, store_url, world, sizes_str, mb_per_size
             assert torch.equal(dst, src), "probe round-trip mismatch"
 
             slots = remote_bytes // size
-            blocks = (mb_per_size << 20) // size
+            blocks = max(1, (mb_per_size << 20) // size)  # >=1 block even when size exceeds the budget
             one_way = blocks * size
-            t0 = time.perf_counter()
-            for i in range(blocks):
-                off = gva + (i % slots) * size
-                assert handle.copy_data(src.data_ptr(), off, size, 0) == 0, "H2G"
-            tw = time.perf_counter() - t0
-            t0 = time.perf_counter()
-            for i in range(blocks):
-                off = gva + (i % slots) * size
-                assert handle.copy_data(off, dst.data_ptr(), size, 0) == 0, "G2H"
-            tr = time.perf_counter() - t0
+            dst_offs = [gva + (i % slots) * size for i in range(blocks)]
+            if use_batch:
+                sz_list = [size] * blocks
+                t0 = time.perf_counter()
+                assert handle.copy_data_batch([src.data_ptr()] * blocks, dst_offs, sz_list,
+                                               blocks, 0) == 0, "H2G batch"
+                tw = time.perf_counter() - t0
+                t0 = time.perf_counter()
+                assert handle.copy_data_batch(dst_offs, [dst.data_ptr()] * blocks, sz_list,
+                                               blocks, 0) == 0, "G2H batch"
+                tr = time.perf_counter() - t0
+                assert torch.equal(dst, src), "batch round-trip mismatch"
+            else:
+                t0 = time.perf_counter()
+                for off in dst_offs:
+                    assert handle.copy_data(src.data_ptr(), off, size, 0) == 0, "H2G"
+                tw = time.perf_counter() - t0
+                t0 = time.perf_counter()
+                for off in dst_offs:
+                    assert handle.copy_data(off, dst.data_ptr(), size, 0) == 0, "G2H"
+                tr = time.perf_counter() - t0
+            mode_tag = "batch" if use_batch else "loop"
             wr_gbps = one_way / tw / GIB
             rd_gbps = one_way / tr / GIB
-            results[str(size)] = {"blocks": blocks,
+            results[str(size)] = {"blocks": blocks, "mode": mode_tag,
                                   "write_gbps": round(wr_gbps, 2), "read_gbps": round(rd_gbps, 2),
                                   "write_us_per_block": round(tw / blocks * 1e6, 2),
                                   "read_us_per_block": round(tr / blocks * 1e6, 2)}
-            _log(f"[near w{idx}] size {size}: {blocks} blocks, "
+            _log(f"[near w{idx}] size {size}: {blocks} blocks ({mode_tag}), "
                  f"write {wr_gbps:.2f} GB/s ({tw / blocks * 1e6:.2f} us/block), "
                  f"read {rd_gbps:.2f} GB/s ({tr / blocks * 1e6:.2f} us/block)")
             assert handle.unregister(src.data_ptr()) == 0, "unregister src failed"
@@ -347,7 +364,8 @@ def _nearworker_main(dev, idx, run_dir, store_url, world, sizes_str, mb_per_size
         mf.get_and_clear_last_err_msg()
         assert mf.get_last_err_msg() == "", mf.get_last_err_msg()
         _write(os.path.join(run_dir, f"near_w{idx}_done.json"),
-               {"idx": idx, "rank": rank, "dev": dev, "far_rank": far_rank, "results": results})
+               {"idx": idx, "rank": rank, "dev": dev, "far_rank": far_rank,
+                "copy_mode": "batch" if use_batch else "loop", "results": results})
         _log(f"[near w{idx}] worker finished, exiting")
     finally:
         if ralloc_inited:
@@ -422,7 +440,8 @@ def _near_parent(args, run_dir):
             dev = devs[idx % len(devs)]
             procs[idx], files[idx] = _spawn(
                 ["nearworker", str(dev), str(idx), run_dir, args.store, str(args.world),
-                 args.sizes, str(args.mb_per_size), str(args.remote_mb), str(args.rpc_port_base)],
+                 args.sizes, str(args.mb_per_size), str(args.remote_mb), str(args.rpc_port_base),
+                 "batch" if args.batch else "loop"],
                 run_dir, f"near_w{idx}.log")
             _log(f"[near] worker {idx} on npu {dev}")
 
@@ -491,6 +510,9 @@ def main():
                         help=f"NEAR: one-way MB per size per worker (default {DEFAULT_MB_PER_SIZE})")
     parser.add_argument("--remote-mb", type=int, default=64,
                         help="NEAR: remote block size in MB (default 64)")
+    parser.add_argument("--batch", action="store_true",
+                        help="NEAR: timed matrix uses one copy_data_batch per direction "
+                             "(submit the whole matrix, single wait) instead of a copy_data loop")
     parser.add_argument("--rpc-port-base", type=int, default=RPC_PORT_BASE,
                         help=f"control rpc port base (port = base + rank_id, default {RPC_PORT_BASE}); "
                              f"use to dodge stale same-rank processes on shared nodes — keep one "
@@ -525,6 +547,6 @@ if __name__ == "__main__":
         else:
             _nearworker_main(int(child_argv[1]), int(child_argv[2]), child_argv[3], child_argv[4],
                              int(child_argv[5]), child_argv[6], int(child_argv[7]),
-                             int(child_argv[8]), int(child_argv[9]))
+                             int(child_argv[8]), int(child_argv[9]), child_argv[10] == "batch")
         sys.exit(0)
     sys.exit(main())

@@ -292,6 +292,23 @@ SMEM_API int32_t smem_ralloc_copy(smem_ralloc_t handle, const void *src, void *d
     return entry->DataCopy(src, dest, size, flags);
 }
 
+SMEM_API int32_t smem_ralloc_copy_batch(smem_ralloc_t handle, smem_ralloc_batch_copy_params *params,
+                                        uint32_t flags)
+{
+    SM_VALIDATE_RETURN(handle != nullptr, "invalid param, handle is NULL", SM_INVALID_PARAM);
+    SM_VALIDATE_RETURN(params != nullptr, "params is null", SM_INVALID_PARAM);
+    SM_VALIDATE_RETURN(g_smemRallocInited, "smem ralloc not initialized yet", SM_NOT_INITIALIZED);
+
+    SmemRallocEntryPtr entry = nullptr;
+    auto ret = SmemRallocEntryManager::Instance().GetEntryByPtr(reinterpret_cast<uintptr_t>(handle), entry);
+    if (ret != SM_OK || entry == nullptr) {
+        SM_LOG_AND_SET_LAST_ERROR("input handle is invalid, result: " << ret);
+        return SM_INVALID_PARAM;
+    }
+
+    return entry->DataCopyBatch(params, flags);
+}
+
 SMEM_API int32_t smem_ralloc_wait(smem_ralloc_t handle)
 {
     SM_VALIDATE_RETURN(handle != nullptr, "invalid param, handle is NULL", SM_INVALID_PARAM);

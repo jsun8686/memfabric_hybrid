@@ -435,6 +435,29 @@ public:
                                 size, flags);
     }
 
+    int32_t CopyDataBatch(std::vector<uintptr_t> srcs, std::vector<uintptr_t> dsts, std::vector<size_t> sizes,
+                          uint32_t count, uint32_t flags)
+    {
+        if (count == 0 || srcs.size() != count || dsts.size() != count || sizes.size() != count) {
+            return SMEM_INVALID_PARAM;
+        }
+        void **ptr = new void *[count + count];
+        if (ptr == nullptr) {
+            throw std::runtime_error(std::string("alloc mem failed."));
+        }
+
+        void **sources = ptr;
+        void **destinations = ptr + count;
+        for (uint64_t i = 0; i < count; ++i) {
+            sources[i] = reinterpret_cast<void *>(srcs[i]);
+            destinations[i] = reinterpret_cast<void *>(dsts[i]);
+        }
+        smem_ralloc_batch_copy_params batch_params = {sources, destinations, sizes.data(), count};
+        auto ret = smem_ralloc_copy_batch(handle_, &batch_params, flags);
+        delete[] ptr;
+        return ret;
+    }
+
     int32_t Wait()
     {
         return smem_ralloc_wait(handle_);
@@ -1143,6 +1166,21 @@ Arguments:
     dst_ptr(int): destination address, local or global
     size(int):    size of data to be copied
     flags(int):   optional flags, e.g. ASYNC_COPY_FLAG
+Returns:
+    0 if successful)")
+        .def("copy_data_batch", &RallocPool::CopyDataBatch, py::call_guard<py::gil_scoped_release>(),
+             py::arg("src_addrs"), py::arg("dst_addrs"), py::arg("sizes"), py::arg("count"),
+             py::arg("flags") = 0, R"(
+Copy multiple data blocks with one call. Direction is automatically selected by the
+address of the first pair and applied to the whole batch, so all pairs of one call
+must share the same direction.
+
+Arguments:
+    src_addrs(list[int]): source addresses, local or global
+    dst_addrs(list[int]): destination addresses, local or global
+    sizes(list[int]):     sizes of data to be copied
+    count(int):           number of pairs, must equal len of the lists
+    flags(int):           optional flags, e.g. ASYNC_COPY_FLAG
 Returns:
     0 if successful)")
         .def("wait", &RallocPool::Wait, py::call_guard<py::gil_scoped_release>(), R"(
