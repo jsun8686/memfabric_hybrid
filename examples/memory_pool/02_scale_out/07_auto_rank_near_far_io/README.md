@@ -60,7 +60,7 @@ touch log/shutdown.json
 | `--mb-per-size` | 256 | 每粒度每 worker 单向流量（MB）；不足一个粒度时至少跑 1 块 |
 | `--remote-mb` | 64 | 每 worker 申请的远端块大小（须 ≥ 最大粒度） |
 | `--batch` | 关 | 计时矩阵改用每方向一次 `copy_data_batch`（整批一次提交 + 一次等待），默认为逐块 `copy_data` 循环 |
-| `--sync-start` | 关 | worker 在文件屏障处等齐（各自申请到远端块后互相等待）再同时开跑计时矩阵；测多 worker 聚合带宽必开 |
+| `--sync-start` | 关 | worker 在文件屏障处等齐（整轮 ready + 每 size、每方向各一次）再同时开跑对应计时段；结束时打印聚合总带宽表（Σ 各 worker 单向吞吐）；测多 worker 聚合带宽必开 |
 | `--rpc-port-base` | 11100 | 控制面 rpc 端口基址（端口 = 基址 + rank_id）；整会话保持一致 |
 | `MF_TEST_NIC_IP` | 自动 | 数据面 NIC IP 覆盖（同 03/04/05） |
 
@@ -80,7 +80,7 @@ touch log/shutdown.json
 - 小粒度（64K/256K）吞吐受单块时延主导（`us_per_block` 列），大粒度逼近 device RDMA 带宽
 - 多 worker 并发应摊满 NIC/链路带宽；若随 worker 数不增，检查交换机侧或同卡竞争
 - `--batch` 对比默认循环：批模式省去 N-1 次逐块同步等待，小粒度 `us_per_block` 的差值即单次等待开销（批模式日志带 `(batch)` 标记）
-- **多 worker 聚合带宽验证必须加 `--sync-start`**：同节点并发初始化在驱动层串行化（实测每多一个 worker 偏斜 ~7s），不加屏障时各 worker 计时相位不重叠，表中 w 列实为先后单独跑；加屏障后每列仍为该 worker 单向吞吐，聚合 = 各列之和
+- **多 worker 聚合带宽验证必须加 `--sync-start`**：各 worker 计时相位天然偏斜（初始化/extend 重试数秒），不加屏障时表中 w 列实为先后单独跑、聚合无意义；加屏障后每 size、每方向窗口严格对齐，末尾聚合表 = Σ 各 worker 单向吞吐（实测 2 worker 8M loop 聚合 ≈ 42.7 GB/s ≈ 2× 单 worker）
 
 ## 排障（会话残留）
 控制面 rpc 端口 = `11100 + rank_id`（`smem_ralloc_def.h` 默认基址），**节点本地**——上一会话残留的同 rank 进程会蹲占完全相同的端口。两类典型症状与处置：

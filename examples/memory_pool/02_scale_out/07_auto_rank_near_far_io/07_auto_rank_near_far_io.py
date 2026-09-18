@@ -25,9 +25,10 @@ Selection rule: only NPU devices whose hccn link is UP participate, on both side
 Copy mode of the timed matrix: default = per-block copy_data loop; --batch = one
 copy_data_batch call per direction (the whole matrix is submitted, then a single wait),
 which saves N-1 per-block synchronizations.
---sync-start holds workers at a file barrier until every worker has acquired its remote
-block: concurrent worker inits on one node serialize deep in the device driver for
-seconds, so without the barrier the per-worker timed phases do not overlap and the
+--sync-start holds workers at file barriers: one before the matrix plus one before every
+timed direction (write/read) of every size, so the per-worker timing windows are strictly
+aligned. The summary then also prints the per-size aggregate one-way bandwidth (sum over
+all workers). Without the barriers the per-worker timed phases do not overlap and the
 printed matrix is effectively W sequential single-worker runs.
 """
 import argparse
@@ -138,6 +139,20 @@ def _wait_file(path, timeout_sec):
                 return json.load(f)
         time.sleep(1.0)
     raise RuntimeError(f"file not produced within {timeout_sec}s: {path}")
+
+
+def _barrier(run_dir, idx, tag, workers_total, timeout_sec=300):
+    """File barrier over near_w*_{tag}.json: returns when every worker has written its file."""
+    _write(os.path.join(run_dir, f"near_w{idx}_{tag}.json"), {"idx": idx, "tag": tag})
+    deadline = time.time() + timeout_sec
+    while True:
+        readies = glob.glob(os.path.join(run_dir, f"near_w*_{tag}.json"))
+        if len(readies) >= workers_total:
+            return
+        if time.time() > deadline:
+            raise RuntimeError(f"sync barrier '{tag}' timeout: {len(readies)}/{workers_total} "
+                               "workers ready — see sibling near_w*.log for the stuck one")
+        time.sleep(0.2)
 
 
 def _parse_size(tok):
@@ -312,21 +327,12 @@ def _nearworker_main(dev, idx, run_dir, store_url, world, sizes_str, mb_per_size
              f"(gva=0x{gva:x}, npu {dev})")
 
         if sync_start:
-            _write(os.path.join(run_dir, f"near_w{idx}_ready.json"), {"idx": idx})
-            deadline = time.time() + 300
-            while True:
-                readies = glob.glob(os.path.join(run_dir, "near_w*_ready.json"))
-                if len(readies) >= workers_total:
-                    break
-                if time.time() > deadline:
-                    raise RuntimeError(f"sync-start barrier timeout: {len(readies)}/{workers_total} "
-                                       "workers ready — see sibling near_w*.log for the stuck one")
-                time.sleep(0.2)
+            _barrier(run_dir, idx, "ready", workers_total)
             _log(f"[near w{idx}] sync-start: all {workers_total} workers ready, starting matrix")
 
         device = f"npu:{dev}"
         results = {}
-        for size in sizes:
+        for si, size in enumerate(sizes):
             if size > remote_bytes:
                 raise RuntimeError(f"size {size} exceeds remote block {remote_bytes}")
             src = _aligned_npu_tensor(size, device, fill=True)
@@ -344,26 +350,29 @@ def _nearworker_main(dev, idx, run_dir, store_url, world, sizes_str, mb_per_size
             blocks = max(1, (mb_per_size << 20) // size)  # >=1 block even when size exceeds the budget
             one_way = blocks * size
             dst_offs = [gva + (i % slots) * size for i in range(blocks)]
+            sz_list = [size] * blocks
+            if sync_start:
+                _barrier(run_dir, idx, f"s{si}_w", workers_total)
+            t0 = time.perf_counter()
             if use_batch:
-                sz_list = [size] * blocks
-                t0 = time.perf_counter()
                 assert handle.copy_data_batch([src.data_ptr()] * blocks, dst_offs, sz_list,
                                                blocks, 0) == 0, "H2G batch"
-                tw = time.perf_counter() - t0
-                t0 = time.perf_counter()
-                assert handle.copy_data_batch(dst_offs, [dst.data_ptr()] * blocks, sz_list,
-                                               blocks, 0) == 0, "G2H batch"
-                tr = time.perf_counter() - t0
-                assert torch.equal(dst, src), "batch round-trip mismatch"
             else:
-                t0 = time.perf_counter()
                 for off in dst_offs:
                     assert handle.copy_data(src.data_ptr(), off, size, 0) == 0, "H2G"
-                tw = time.perf_counter() - t0
-                t0 = time.perf_counter()
+            tw = time.perf_counter() - t0
+            if sync_start:
+                _barrier(run_dir, idx, f"s{si}_r", workers_total)
+            t0 = time.perf_counter()
+            if use_batch:
+                assert handle.copy_data_batch(dst_offs, [dst.data_ptr()] * blocks, sz_list,
+                                               blocks, 0) == 0, "G2H batch"
+            else:
                 for off in dst_offs:
                     assert handle.copy_data(off, dst.data_ptr(), size, 0) == 0, "G2H"
-                tr = time.perf_counter() - t0
+            tr = time.perf_counter() - t0
+            if use_batch:
+                assert torch.equal(dst, src), "batch round-trip mismatch"
             mode_tag = "batch" if use_batch else "loop"
             wr_gbps = one_way / tw / GIB
             rd_gbps = one_way / tr / GIB
@@ -442,7 +451,7 @@ def _far_parent(args, run_dir):
 
 
 def _near_parent(args, run_dir):
-    _clear_stale_markers(run_dir, ["near_w*_done.json", "near_w*_ready.json"])
+    _clear_stale_markers(run_dir, ["near_w*_done.json", "near_w*_ready.json", "near_w*_s*_*.json"])
     _wait_tcp(args.store, 30)  # the FAR-hosted store must accept first
     devs = _rdma_up_devices(args.devs)
     sizes = [_parse_size(t) for t in args.sizes.split(",") if t.strip() != ""]
@@ -493,6 +502,15 @@ def _near_parent(args, run_dir):
                 vals = [results[i]["results"][key][field] for i in range(workers)]
                 _log(f"{key:>10s} " + " ".join(f"{v:8.2f}" for v in vals) +
                      f" {min(vals):8.2f} {sum(vals) / len(vals):8.2f} {max(vals):8.2f}")
+        if args.sync_start:
+            _log("")
+            _log(f"[near] aggregate one-way bandwidth ({workers} workers concurrent):")
+            _log(f"{'size':>10s} {'write GB/s':>12s} {'read GB/s':>12s}")
+            for size in sizes:
+                key = str(size)
+                agg_w = sum(results[i]["results"][key]["write_gbps"] for i in range(workers))
+                agg_r = sum(results[i]["results"][key]["read_gbps"] for i in range(workers))
+                _log(f"{key:>10s} {agg_w:12.2f} {agg_r:12.2f}")
         far_ranks = sorted({results[i]["far_rank"] for i in range(workers)})
         _log(f"(workers={workers}, sizes={args.sizes}, FAR ranks hit={far_ranks})")
         print(f"({workers}/{workers}) 07_auto_rank_near_far_io: near IO matrix OK", flush=True)
