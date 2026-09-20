@@ -15,6 +15,7 @@
 #include <chrono>
 #include <map>
 #include <mutex>
+#include <vector>
 
 #include "smem_config_store.h"
 #include "smem_ralloc_rpc_def.h"
@@ -27,8 +28,10 @@ namespace smem {
  * config store server activates the master role: on tcp stores that host is fixed at
  * init, on HA stores it follows the store leader election (promotion callback).
  * It publishes its rpc endpoint under the RA_ prefixed store, keeps the candidate
- * table of FAR nodes (with their last reported committed bytes and last-seen time)
- * and answers PLACEMENT with the least committed node. Dead candidates are dropped
+ * table of FAR nodes (with their last reported committed bytes, in-flight grants
+ * and last-seen time) and answers PLACEMENT with the least loaded node (reported
+ * committed bytes plus optimistically added in-flight grants, capacity-filtered
+ * against the requester pool window). Dead candidates are dropped
  * via the store rank-down watch (seconds) and the placement-time stale prune (90s).
  */
 class SmemRallocMasterService {
@@ -62,12 +65,28 @@ public:
     void OnRankDown(uint32_t rank);
 
 private:
+    /* one optimistically added placement grant: issued by OnPlacement, confirmed (dropped)
+     * by the growth of the candidate's next REGISTER report, expired by TTL when its
+     * executor-side extend failed and it will never land */
+    struct InflightGrant {
+        uint64_t size;                              /* granted bytes */
+        bool deviceMedia;                           /* grant media */
+        std::chrono::steady_clock::time_point at;   /* grant time */
+    };
+
     struct Candidate {
         SmemRallocRpcEndpoint ep{};
         uint64_t committedBytes = 0;       /* committed bytes on the HOST media, last reported value */
         uint64_t deviceCommittedBytes = 0; /* committed bytes on the DEVICE media, last reported value */
+        std::vector<InflightGrant> inflight; /* grants issued since the last report, see above */
         std::chrono::steady_clock::time_point lastSeen{}; /* refreshed by every periodic REGISTER */
     };
+
+    static uint64_t SumInflight(const std::vector<InflightGrant> &inflight, bool deviceMedia);
+
+    /* entries are append-ordered, drop the oldest media-matching grants first until the
+     * media sum fits keepSum */
+    static void ShrinkInflight(std::vector<InflightGrant> &inflight, bool deviceMedia, uint64_t keepSum);
 
     std::mutex mutex_;
     std::map<uint32_t, Candidate> candidates_;

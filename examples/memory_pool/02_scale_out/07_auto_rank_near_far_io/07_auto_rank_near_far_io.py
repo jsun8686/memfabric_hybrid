@@ -49,7 +49,7 @@ NIC_PORT_BASE = 10005        # data-plane nic port base (set_nic); NOT the contr
 RPC_PORT_BASE = 11100        # control rpc port = base + rankId (smem_ralloc_def.h default);
                              # node-local: stale same-rank processes from a previous session
                              # on the same node squat exactly this port -> bind failure
-POOL_WINDOW = 1 << 30         # 1GB window slot per pool (dram media)
+POOL_WINDOW = 4 << 30         # 4GB window slot per pool (dram media)
 DEFAULT_SIZES = "64K,256K,1M,4M,16M"
 DEFAULT_MB_PER_SIZE = 256    # one-way traffic per size per worker
 EXTEND_RETRY_SEC = 5

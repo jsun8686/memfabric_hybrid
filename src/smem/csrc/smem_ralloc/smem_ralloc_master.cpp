@@ -11,6 +11,7 @@
  */
 #include "smem_ralloc_master.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <vector>
@@ -23,6 +24,12 @@ namespace smem {
 /* a candidate that has not re-registered for this long is considered dead (reporter default
  * interval is 30s, 3 missed periods = death); false positives self-heal on next REGISTER */
 constexpr uint32_t SMEMRA_CANDIDATE_STALE_SEC = 90U;
+
+/* backstop lifetime of an in-flight grant: a grant that landed is confirmed by the poked
+ * REGISTER within a few seconds (2s poke throttle + transit), so an entry surviving this
+ * long is a grant whose executor-side extend failed (e.g. window guard) or whose report
+ * was lost; drop it instead of pinning the candidate load forever */
+constexpr uint32_t SMEMRA_INFLIGHT_GRANT_TTL_SEC = 15U;
 
 SmemRallocMasterService &SmemRallocMasterService::Instance()
 {
@@ -82,6 +89,31 @@ bool SmemRallocMasterService::IsRunning() const
     return running_;
 }
 
+uint64_t SmemRallocMasterService::SumInflight(const std::vector<InflightGrant> &inflight, bool deviceMedia)
+{
+    uint64_t sum = 0;
+    for (const auto &grant : inflight) {
+        if (grant.deviceMedia == deviceMedia) {
+            sum += grant.size;
+        }
+    }
+    return sum;
+}
+
+void SmemRallocMasterService::ShrinkInflight(std::vector<InflightGrant> &inflight, bool deviceMedia,
+                                             uint64_t keepSum)
+{
+    auto sum = SumInflight(inflight, deviceMedia);
+    for (auto grant = inflight.begin(); grant != inflight.end() && sum > keepSum;) {
+        if (grant->deviceMedia != deviceMedia) {
+            ++grant;
+            continue;
+        }
+        sum -= grant->size;
+        grant = inflight.erase(grant);
+    }
+}
+
 Result SmemRallocMasterService::OnRegister(SmemRallocRpcMsg &msg)
 {
     SM_VALIDATE_RETURN(msg.nodeRank != SMEM_RALLOC_INVALID_RANK, "register with invalid rank", SM_INVALID_PARAM);
@@ -96,16 +128,28 @@ Result SmemRallocMasterService::OnRegister(SmemRallocRpcMsg &msg)
     {
         std::lock_guard<std::mutex> guard(mutex_);
         /* overwrite accounting with the authoritative value reported by the node itself */
+        auto it = candidates_.find(msg.nodeRank);
         Candidate candidate{};
         candidate.ep = ep;
         candidate.committedBytes = msg.size;
         candidate.deviceCommittedBytes = msg.deviceCommittedBytes;
         candidate.lastSeen = std::chrono::steady_clock::now();
-        auto it = candidates_.find(msg.nodeRank);
         if (it != candidates_.end()) {
-            it->second = candidate;
+            /* reconcile the optimistic ledger: growth of the report confirms the oldest
+             * grants have landed on the FAR, drop them; grants still inside the executor
+             * keep their reservation, a shrinking report (pool reaped) keeps them all */
+            candidate.inflight = std::move(it->second.inflight);
+            const uint64_t hostInflight = SumInflight(candidate.inflight, false);
+            const uint64_t hostConfirmed = msg.size > it->second.committedBytes
+                                               ? msg.size - it->second.committedBytes : 0U;
+            ShrinkInflight(candidate.inflight, false, hostInflight - std::min(hostConfirmed, hostInflight));
+            const uint64_t devInflight = SumInflight(candidate.inflight, true);
+            const uint64_t devConfirmed = msg.deviceCommittedBytes > it->second.deviceCommittedBytes
+                                              ? msg.deviceCommittedBytes - it->second.deviceCommittedBytes : 0U;
+            ShrinkInflight(candidate.inflight, true, devInflight - std::min(devConfirmed, devInflight));
+            it->second = std::move(candidate);
         } else {
-            candidates_.emplace(msg.nodeRank, candidate);
+            candidates_.emplace(msg.nodeRank, std::move(candidate));
         }
     }
 
@@ -135,23 +179,52 @@ Result SmemRallocMasterService::OnPlacement(SmemRallocRpcMsg &msg)
                 ++it;
             }
         }
-        /* pick the least committed candidate of the requested media (last reported value), never
-         * place on the requester itself; accounting is overwrite-style, no optimistic add here */
+        /* pick the least loaded candidate of the requested media, never place on the
+         * requester itself; load = last reported committed bytes plus grants issued since
+         * (optimistic in-flight add, reconciled by the next REGISTER): concurrent
+         * placements no longer stack on a stale view, and the map-order tie-break only
+         * decides genuinely equal loads */
         const bool deviceMedia = msg.memType == SMEM_RALLOC_MEM_TYPE_DEVICE;
+        const uint64_t window = deviceMedia ? msg.maxHbmSize : msg.maxDramSize;
         uint32_t chosen = SMEM_RALLOC_INVALID_RANK;
         uint64_t chosenLoad = UINT64_MAX;
+        uint32_t alive = 0;
         for (auto &it : candidates_) {
             if (it.first == msg.reqRank) {
                 continue;
             }
-            auto load = deviceMedia ? it.second.deviceCommittedBytes : it.second.committedBytes;
+            ++alive;
+            /* expire grants that never landed (executor failure / lost report) */
+            for (auto grant = it.second.inflight.begin(); grant != it.second.inflight.end();) {
+                if (now - grant->at > std::chrono::seconds(SMEMRA_INFLIGHT_GRANT_TTL_SEC)) {
+                    grant = it.second.inflight.erase(grant);
+                } else {
+                    ++grant;
+                }
+            }
+            auto load = (deviceMedia ? it.second.deviceCommittedBytes : it.second.committedBytes) +
+                        SumInflight(it.second.inflight, deviceMedia);
+            /* capacity filter mirroring the executor window guard: a full contributor is
+             * skipped instead of granted and failed; window == 0 (requester did not fill
+             * the field, old binary) disables the filter */
+            if (window != 0 && load + msg.size > window) {
+                SM_LOG_DEBUG("candidate rank: " << it.first << " filtered by window, load: " << load
+                                                << " size: " << msg.size << " window: " << window);
+                continue;
+            }
             if (load < chosenLoad) {
                 chosen = it.first;
                 chosenLoad = load;
             }
         }
         if (chosen == SMEM_RALLOC_INVALID_RANK) {
-            SM_LOG_ERROR("no candidate for placement, requester rank: " << msg.reqRank);
+            if (alive != 0) {
+                SM_LOG_ERROR("no candidate with spare capacity for placement, requester rank: " << msg.reqRank
+                             << " size: " << msg.size << " window: " << window
+                             << " alive candidates: " << alive);
+            } else {
+                SM_LOG_ERROR("no candidate for placement, requester rank: " << msg.reqRank);
+            }
             return SM_OBJECT_NOT_EXISTS;
         }
 
@@ -160,12 +233,15 @@ Result SmemRallocMasterService::OnPlacement(SmemRallocRpcMsg &msg)
         msg.nodePort = it->second.ep.port;
         (void)memset(msg.nodeIp, 0, sizeof(msg.nodeIp));
         (void)strncpy(msg.nodeIp, it->second.ep.ip, sizeof(msg.nodeIp) - 1);
+        /* reserve the grant optimistically so placements granted before the next report
+         * see it in the load above */
+        it->second.inflight.push_back(InflightGrant{msg.size, deviceMedia, now});
     }
 
     SM_LOG_INFO("placement granted, requester: " << msg.reqRank << " memType: " << msg.memType
-                                                 << " size: " << msg.size << " -> rank: "
-                                                 << msg.nodeRank << " endpoint: " << msg.nodeIp << ":"
-                                                 << msg.nodePort);
+                                                 << " size: " << msg.size << " load: " << chosenLoad
+                                                 << " -> rank: " << msg.nodeRank << " endpoint: "
+                                                 << msg.nodeIp << ":" << msg.nodePort);
     return SM_OK;
 }
 

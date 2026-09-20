@@ -58,8 +58,10 @@ struct SmemRallocRpcMsg {
     uint32_t nodePort;     /* [resp][register] endpoint port */
     uint32_t reserved1;
     uint64_t size;         /* requested region size in byte, reused as the HOST committed bytes in REGISTER */
-    uint64_t maxDramSize;  /* window slot size of the pool, HOST media */
-    uint64_t maxHbmSize;   /* window slot size of the pool, DEVICE media, 0 when the pool has no HBM window */
+    uint64_t maxDramSize;  /* [placement|join_alloc] window slot size of the pool, HOST media; in PLACEMENT
+                              0 (requester did not fill it) disables the master capacity filter */
+    uint64_t maxHbmSize;   /* [placement|join_alloc] window slot size of the pool, DEVICE media, 0 when the
+                              pool has no HBM window */
     uint64_t gva;          /* [resp] global virtual address of the region */
     uint64_t deviceCommittedBytes; /* [register] committed bytes on the DEVICE media */
     char nodeIp[SMEMRA_RPC_MASTER_KEY_MAX_LEN]; /* [resp][register] endpoint ip */

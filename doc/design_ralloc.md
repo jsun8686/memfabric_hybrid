@@ -59,10 +59,10 @@ rankId：**三角色统一由 init 分配**（`autoRanking` 从 store 原子取�
 | 项 | 设计 |
 |---|---|
 | RPC | acc_links（acc_tcp）封装，进程级单例 server + 帧内 poolId 复用（对齐 hcom 进程单例模式） |
-| opcode | `REGISTER{endpoint,committedBytes}`（覆盖式记账）/ `PLACEMENT{size}→{target}` / `JOIN_ALLOC{poolId,memType,size,...}→{gva,ownerRank}`（create-or-extend 二合一）/ `PING` |
+| opcode | `REGISTER{endpoint,committedBytes}`（权威覆盖 + 在途账对账）/ `PLACEMENT{size,maxDram/maxHbm 池窗口}→{target}` / `JOIN_ALLOC{poolId,memType,size,...}→{gva,ownerRank}`（create-or-extend 二合一）/ `PING` |
 | handler 注册 | **四 op 全员注册**于 RpcService::Start（防切主后无 handler）；REGISTER/PLACEMENT 仅 master 激活时服务（IsRunning 门，未激活回 SM_NOT_STARTED），PING 恒应答 |
 | 端口 | basePort + rankId，错开 store 8572 / hcom 10005 / net 9980 |
-| master 候选表 | 内存表：`{rankId → endpoint, committedBytes}`；**覆盖式记账**：FAR 上报权威值（Σ entry 提交量），30s 周期 `MF_RALLOC_REPORT_INTERVAL_SEC` + 三类事件即时触发（master 变更 watch poke / JOIN_ALLOC 成功 poke / 组空自毁后），无乐观累加 |
+| master 候选表 | 内存表：`{rankId → endpoint, committedBytes, 在途 grants}`；**权威覆盖 + 乐观在途**：FAR 上报权威值（Σ entry 提交量），30s 周期 `MF_RALLOC_REPORT_INTERVAL_SEC` + 三类事件即时触发（master 变更 watch poke / JOIN_ALLOC 成功 poke / 组空自毁后）；PLACEMENT 授予即记在途账（并发请求立刻可见，防陈旧视图下压叠同一节点），REGISTER 增长量对账落地账、失败授予 15s TTL 过期；请求带池窗口做容量过滤（窗口 0 不过滤，兼容旧端） |
 | TLS | 复用 acc_tcp_ssl_helper，与 store 开关对齐 |
 
 ## 5. 主链路时序
@@ -191,8 +191,8 @@ sequenceDiagram
     participant S as "S(store)"
     participant X as "X(FAR 被选者)"
     participant Others as "全组(A/B…)"
-    A->>M: PLACEMENT{size}
-    M->>M: 候选表选 least committedBytes ≠ 请求者
+    A->>M: PLACEMENT{size, maxDramSize/maxHbmSize(池窗口)}
+    M->>M: 候选表选 least load(=committedBytes+在途 grants) ≠ 请求者<br/>按池窗口容量过滤(窗口 0 不过滤)；授予即记在途账
     M-->>A: {target=X endpoint}
     alt SM_NOT_CONNECTED（端点陈旧）
         A->>S: Get(MASTER 键) 刷新端点→重试 PLACEMENT 一次
@@ -413,7 +413,7 @@ src/hybm/
 | **create 的 localDRAMSize/出参 info**（B' 裁剪） | 角色模型下本地提交需求=该节点应为 FAR（FAR 无 handle）；create 退化为纯对齐，出参恒 {INVALID,null} 无存在价值 |
 | **entry 属主标记（appOwned/executorOwned）** | FAR 禁 create 后"FAR entry ⟺ executor 属有"由构造保证，角色即属主 |
 | **槽字节数推导贡献者**（GetMemSizeByRank>0 ⟺ FAR） | 会被 extend_local（NEAR 本地提交）污染；改显式角色键 RA_ROLE_ |
-| **master 乐观记账**（PLACEMENT 时 committedBytes += size） | 覆盖式权威上报取代：计数漂移/destroy 虚高/切主候选表重建三问题一并消解 |
+| **master 乐观记账**（PLACEMENT 时 committedBytes += size） | v11 重引入为**有界在途账**：per-grant 台账（非累加计数），REGISTER 权威值增长对账消减、15s TTL 过期、切主候选表重建即清零——旧方案的三问题（计数漂移/destroy 虚高/切主残留）由对账+TTL 消解，同时解决并发冷启动放置压叠同一 FAR |
 | **handler 仅 master 注册** | 四 op 全员注册+IsRunning 激活门：切主后 handler 不缺位，PING 对任意节点可探活 |
 
 
@@ -435,8 +435,8 @@ src/hybm/
 
 ### 11.3 分介质 LB 记账
 
-- REGISTER 双桶：Candidate{committedBytes(host), deviceCommittedBytes}，覆盖式权威上报（ reporter/PokeReporter 三触发不变）
-- PLACEMENT 按请求介质取对应桶选 least-loaded，仍永不选 requester
+- REGISTER 双桶：Candidate{committedBytes(host), deviceCommittedBytes}，权威覆盖上报（reporter/PokeReporter 三触发不变）+ 在途账按介质对账
+- PLACEMENT 按请求介质取对应桶（含在途）选 least-loaded，按池窗口容量过滤，仍永不选 requester
 
 ### 11.4 分层落点
 

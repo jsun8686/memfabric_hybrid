@@ -413,13 +413,17 @@ SMEM_API int32_t smem_ralloc_extend_remote_mem(smem_ralloc_t handle, smem_ralloc
     constexpr uint32_t sameNodeBackoffSec = 2U;
     Result lastErr = SM_ERROR;
     uint32_t failedRank = SMEM_RALLOC_INVALID_RANK;
+    const auto &coreOptions = entry->GetCoreOptions();
     for (uint32_t round = 0; round < joinRounds; round++) {
         /* 1. ask master to pick the contributor node (least loaded on the requested media, never
-         * the requester itself) */
+         * the requester itself); the pool window rides along so the master can capacity-filter
+         * candidates, 0 (old binary) disables the filter */
         SmemRallocRpcMsg placeMsg{};
         placeMsg.op = SMEMRA_RPC_OP_PLACEMENT;
         placeMsg.size = size;
         placeMsg.memType = static_cast<uint32_t>(memType);
+        placeMsg.maxDramSize = coreOptions.maxDRAMSize;
+        placeMsg.maxHbmSize = coreOptions.maxHBMSize;
         ret = rpc.SyncCall(manager.GetMasterEndpoint(), placeMsg);
         if (ret == SM_NOT_CONNECTED) {
             /* cached master endpoint may be stale (restart/failover), refresh and retry once */
@@ -449,7 +453,6 @@ SMEM_API int32_t smem_ralloc_extend_remote_mem(smem_ralloc_t handle, smem_ralloc
         node.port = static_cast<uint16_t>(placeMsg.nodePort);
         (void)strncpy(node.ip, placeMsg.nodeIp, sizeof(node.ip) - 1);
 
-        const auto &coreOptions = entry->GetCoreOptions();
         SmemRallocRpcMsg allocMsg{};
         allocMsg.op = SMEMRA_RPC_OP_JOIN_ALLOC;
         allocMsg.poolId = entry->Id();
