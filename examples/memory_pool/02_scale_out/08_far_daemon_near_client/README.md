@@ -46,7 +46,9 @@ kill -TERM <daemon_pid>        # pgrep -f memfabric_daemon 找 pid
 - 客户端 create → extend → copy → destroy 全链路自清理；退出无需通知守护
 - 守护停止：SIGTERM / Ctrl+C → 子进程走 `ralloc.uninitialize` 干净路径，守护收割校验退出码
 - 守护被 `kill -9`：子进程通过父 pid 探测（1s 周期）自行干净退出，不残留
-- 每次守护启动以 `"w"` 截断重写 `log/far_dev{N}.log`
+- 每次守护启动以 `"w"` 截断重写 `log/far_dev{N}.log`；客户端每次运行以 `"w"` 截断重写
+  `log/near_dev{N}.log`（与守护同机制：python 输出、mf 原生日志、完整 traceback 全部落盘），
+  交互跟踪用 `tail -f log/near_dev{N}.log`
 
 ## 参数
 
@@ -73,6 +75,7 @@ kill -TERM <daemon_pid>        # pgrep -f memfabric_daemon 找 pid
 | `--batch-mode` | 关 | 计时段改用每方向一次 `copy_data_batch`（整批一次提交 + 一次等待） |
 | `--world` | 512 | 同守护 |
 | `--rpc-port-base` | 11100 | 同守护 |
+| `--run-dir` | ./log | 客户端日志目录（`near_dev{dev}.log`，每次运行重写） |
 
 ## 必要条件
 - 指定的 NPU 卡 device RDMA 链路 UP 且两端接在同一台交换机（跨节点可达）
@@ -81,9 +84,9 @@ kill -TERM <daemon_pid>        # pgrep -f memfabric_daemon 找 pid
 ## 验收标准
 - 守护侧：banner 打印 contributor 数与 `npu X->rank Y` 映射；停止后打印
   `[daemon] all contributors stopped cleanly`
-- 客户端侧：每粒度一行含 `[round-trip OK]`，末行 `(1/1) memfabric_client: client OK`，exit 0
+- 客户端侧：每粒度一行含 `[round-trip OK]`，末行 `[client] all sizes OK, client finished cleanly`，exit 0
 - **连跑两轮客户端**，第二轮仍成功（守护复用范式）
-- 日志：`./log/far_dev*.log`（每次守护启动重写）；客户端日志直打 stdout
+- 日志：守护 `./log/far_dev*.log`、客户端 `./log/near_dev*.log`（均每次启动/运行重写，输出全部落盘）
 
 ## 判读
 - 单客户端吞吐为可信参考（每 far NIC 一流时 ≈ perftest 线速的 ~97%）；多个客户端共享

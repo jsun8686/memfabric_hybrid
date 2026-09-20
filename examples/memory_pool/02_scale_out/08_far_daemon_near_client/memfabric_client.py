@@ -3,6 +3,7 @@
 # Copyright: (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
 
 import argparse
+import os
 import socket
 import sys
 import time
@@ -89,7 +90,15 @@ def main():
                         help=f"declared world capacity (default {DEFAULT_WORLD})")
     parser.add_argument("--rpc-port-base", type=int, default=RPC_PORT_BASE,
                         help=f"control rpc port base (default {RPC_PORT_BASE}); must match the daemon's value")
+    parser.add_argument("--run-dir", default=None, help="client log dir (default ./log)")
     args = parser.parse_args()
+
+    run_dir = os.path.abspath(args.run_dir or "./log")
+    os.makedirs(run_dir, exist_ok=True)
+    log = open(os.path.join(run_dir, f"near_dev{args.dev}.log"), "w")
+    os.dup2(log.fileno(), 1)
+    os.dup2(log.fileno(), 2)
+    _log(f"[client] run dir: {run_dir}, store: {args.store}, world: {args.world}, dev: {args.dev}")
 
     sizes = [_parse_size(t) for t in args.io_sizes.split(",") if t.strip() != ""]
     if not sizes:
@@ -187,7 +196,7 @@ def main():
         if ralloc_inited:
             ralloc.uninitialize(0)
         mf.uninitialize()
-    print("(1/1) memfabric_client: client OK", flush=True)
+    _log("[client] all sizes OK, client finished cleanly")
     return 0
 
 
