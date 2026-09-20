@@ -1,26 +1,7 @@
 #!/usr/bin/env python3
 # coding=utf-8
 # Copyright: (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
-# MemFabric_Hybrid is licensed under Mulan PSL v2.
-# You can use this software according to the terms and conditions of the Mulan PSL v2.
-# You may obtain a copy of Mulan PSL v2 at:
-#          http://license.coscl.org.cn/PSL2
-# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT ANY KIND OF EITHER EXPRESS OR
-# IMPLIED, INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY OR FITNESS
-# FOR A PARTICULAR PURPOSE.
-# See the Mulan PSL v2 for more details.
-"""08: FAR-side resident memory daemon.
 
-One command per FAR node: --devs lists the NPU cards to contribute (one
-contributor child per card, multiprocessing spawn). The store server and the
-ralloc master service land on the FAR side (start_store=True races among
-contributors); contributors stay resident and serve any number of NEAR clients
-that come and go (08_near_memory_client.py).
-
-Stop with Ctrl+C or `kill -TERM <pid>`: children tear their ralloc session down
-cleanly, the daemon reaps them and exits. If the daemon itself is killed hard,
-children detect the lost parent pid and exit on their own — no orphans.
-"""
 import argparse
 import multiprocessing as mp
 import os
@@ -45,18 +26,18 @@ def _log(msg):
 
 
 def _contributor_main(dev, run_dir, store_url, world, rpc_base, ready_q, stop_event):
-    log = open(os.path.join(run_dir, f"far_dev{dev}.log"), "w")  # "w": fresh logs per daemon start
+    log = open(os.path.join(run_dir, f"far_dev{dev}.log"), "w")
     os.dup2(log.fileno(), 1)
     os.dup2(log.fileno(), 2)
-    mf.set_log_level(1)  # INFO and up so operators can trace placement/store markers
+    mf.set_log_level(1)
     assert mf.initialize() == 0, "mf.initialize failed"
     ralloc_inited = False
     try:
         cfg = ralloc.RallocConfig()
         cfg.auto_ranking = True
         cfg.role = ralloc.RallocRole.FAR
-        cfg.start_store = True  # store url lives on this FAR node; RacingForStoreServer
-        cfg.dynamic_world_size = True  # NEAR clients join and leave while this daemon stays
+        cfg.start_store = True
+        cfg.dynamic_world_size = True
         cfg.rpc_port_base = rpc_base
         cfg.set_nic(f"tcp://{socket.gethostbyname(socket.gethostname())}:{NIC_PORT_BASE}")
         assert ralloc.initialize(store_url, world, dev, cfg) == 0, "ralloc.initialize failed"
@@ -67,10 +48,10 @@ def _contributor_main(dev, run_dir, store_url, world, rpc_base, ready_q, stop_ev
 
         parent_pid = os.getppid()
         while not stop_event.wait(timeout=1.0):
-            if os.getppid() != parent_pid:  # daemon killed hard -> self-exit, no orphans
+            if os.getppid() != parent_pid:
                 _log(f"[far npu {dev}] daemon gone, exiting")
                 break
-    except KeyboardInterrupt:  # Ctrl+C hits the whole process group; exit cleanly
+    except KeyboardInterrupt:
         pass
     finally:
         if ralloc_inited:
@@ -80,7 +61,6 @@ def _contributor_main(dev, run_dir, store_url, world, rpc_base, ready_q, stop_ev
 
 
 def _collect_ready(ready_q, procs, devs, timeout_sec):
-    """Collect one ready message per contributor; fail fast if one dies first."""
     got = {}
     deadline = time.time() + timeout_sec
     while len(got) < len(devs):
@@ -120,7 +100,7 @@ def main():
     os.makedirs(run_dir, exist_ok=True)
     _log(f"[daemon] run dir: {run_dir}, store: {args.store}, world: {args.world}, devs: {devs}")
 
-    ctx = mp.get_context("spawn")  # NOT fork: CANN/hccp driver threads must not be forked
+    ctx = mp.get_context("spawn")
     ready_q = ctx.Queue()
     stop_event = ctx.Event()
     procs = [ctx.Process(target=_contributor_main, name=f"far-npu{dev}",
@@ -137,7 +117,7 @@ def main():
         got = _collect_ready(ready_q, procs, devs, READY_TIMEOUT_SEC)
         pairs = ", ".join(f"npu{dev}->rank{got[dev]['rank']}" for dev in devs)
         _log(f"[daemon] {len(devs)} memory contributors serving ({pairs})")
-        _log(f"[daemon] try the client:  python3 08_near_memory_client.py --store {args.store} --dev <npu_id>")
+        _log(f"[daemon] try the client:  python3 memfabric_client.py --store {args.store} --dev <npu_id>")
         _log(f"[daemon] per-contributor logs: {run_dir}/far_dev<N>.log")
         _log(f"[daemon] stop with Ctrl+C or:  kill -TERM {os.getpid()}")
         warned = set()
