@@ -165,6 +165,7 @@ Result SmemRallocMasterService::OnPlacement(SmemRallocRpcMsg &msg)
     SM_VALIDATE_RETURN(msg.memType == SMEM_RALLOC_MEM_TYPE_HOST || msg.memType == SMEM_RALLOC_MEM_TYPE_DEVICE,
         "placement with invalid mem type", SM_INVALID_PARAM);
 
+    uint64_t chosenLoad = UINT64_MAX;
     {
         std::lock_guard<std::mutex> guard(mutex_);
         /* prune candidates whose reporter went silent (crashed node): placement must never
@@ -187,7 +188,6 @@ Result SmemRallocMasterService::OnPlacement(SmemRallocRpcMsg &msg)
         const bool deviceMedia = msg.memType == SMEM_RALLOC_MEM_TYPE_DEVICE;
         const uint64_t window = deviceMedia ? msg.maxHbmSize : msg.maxDramSize;
         uint32_t chosen = SMEM_RALLOC_INVALID_RANK;
-        uint64_t chosenLoad = UINT64_MAX;
         uint32_t alive = 0;
         for (auto &it : candidates_) {
             if (it.first == msg.reqRank) {
