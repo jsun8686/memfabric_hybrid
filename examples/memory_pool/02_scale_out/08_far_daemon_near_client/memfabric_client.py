@@ -26,8 +26,13 @@ DATA_OP = ralloc.RallocDataOpType.DEVICE_RDMA
 MEM_TYPE = ralloc.RallocMemType.HOST
 
 
+_term_fd = None
+
+
 def _log(msg):
     print(msg, flush=True)
+    if _term_fd is not None:
+        os.write(_term_fd, (msg + "\n").encode("utf-8", "replace"))
 
 
 def _wait_tcp(url, timeout_sec):
@@ -93,9 +98,11 @@ def main():
     parser.add_argument("--run-dir", default=None, help="client log dir (default ./log)")
     args = parser.parse_args()
 
+    global _term_fd
     run_dir = os.path.abspath(args.run_dir or "./log")
     os.makedirs(run_dir, exist_ok=True)
     log = open(os.path.join(run_dir, f"near_dev{args.dev}.log"), "w")
+    _term_fd = os.dup(1)
     os.dup2(log.fileno(), 1)
     os.dup2(log.fileno(), 2)
     _log(f"[client] run dir: {run_dir}, store: {args.store}, world: {args.world}, dev: {args.dev}")

@@ -47,8 +47,8 @@ kill -TERM <daemon_pid>        # pgrep -f memfabric_daemon 找 pid
 - 守护停止：SIGTERM / Ctrl+C → 子进程走 `ralloc.uninitialize` 干净路径，守护收割校验退出码
 - 守护被 `kill -9`：子进程通过父 pid 探测（1s 周期）自行干净退出，不残留
 - 每次守护启动以 `"w"` 截断重写 `log/far_dev{N}.log`；客户端每次运行以 `"w"` 截断重写
-  `log/near_dev{N}.log`（与守护同机制：python 输出、mf 原生日志、完整 traceback 全部落盘），
-  交互跟踪用 `tail -f log/near_dev{N}.log`
+  `log/near_dev{N}.log`（与守护同机制：python 输出、mf 原生日志、完整 traceback 全部落盘）；
+  统计/关键行同步回显终端，mf 原生日志与 traceback 只进日志，交互跟踪用 `tail -f log/near_dev{N}.log`
 
 ## 参数
 
@@ -86,7 +86,8 @@ kill -TERM <daemon_pid>        # pgrep -f memfabric_daemon 找 pid
   `[daemon] all contributors stopped cleanly`
 - 客户端侧：每粒度一行含 `[round-trip OK]`，末行 `[client] all sizes OK, client finished cleanly`，exit 0
 - **连跑两轮客户端**，第二轮仍成功（守护复用范式）
-- 日志：守护 `./log/far_dev*.log`、客户端 `./log/near_dev*.log`（均每次启动/运行重写，输出全部落盘）
+- 日志：守护 `./log/far_dev*.log`、客户端 `./log/near_dev*.log`（均每次启动/运行重写，输出全部落盘）；
+  客户端统计行实时回显终端
 
 ## 判读
 - 单客户端吞吐为可信参考（每 far NIC 一流时 ≈ perftest 线速的 ~97%）；多个客户端共享
