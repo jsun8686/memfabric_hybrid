@@ -14,7 +14,7 @@ from memfabric_hybrid import ralloc
 DEFAULT_WORLD = 512          # declared world capacity, actual members join dynamically
 NIC_PORT_BASE = 10005        # data-plane nic port base (set_nic); NOT the control rpc port
 RPC_PORT_BASE = 11100        # control rpc port = base + rankId (smem_ralloc_def.h default)
-DEFAULT_SIZES = "1M,8M"
+DEFAULT_SIZES = "1M,2M,4M,8M"
 DEFAULT_BATCH_SIZE = "64M"       # one-way copy volume per granularity
 DEFAULT_REAL_POOL_SIZE = "64M"   # remote block size (must cover the largest granularity)
 DEFAULT_MAX_POOL_SIZE = "4G"     # pool window declared to the FAR placement master
