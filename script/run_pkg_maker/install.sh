@@ -328,7 +328,7 @@ function try_install_extend()
     fi
 
     cd ${script_dir}/../copy_extend
-    bisheng -x asc hybm_copy_kernel.cpp -shared -g -o libmf_hybm_copy_extend.so ${cce_param}
+    bisheng -x asc hybm_copy_kernel.cpp -shared -fPIC -g -o libmf_hybm_copy_extend.so ${cce_param}
     exit_code=$?
 
     if [ $exit_code -eq 0 ]; then
