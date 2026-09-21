@@ -92,6 +92,13 @@ Result SmemRallocExecutor::OnJoinAlloc(SmemRallocRpcMsg &msg)
 
     hybm_options options{};
     options.bmType = HYBM_TYPE_HOST_INITIATE;
+    if ((msg.dataOpType & SMEMRA_DATA_OP_DEVICE_SCHEDULE) != 0U) {
+        if ((msg.dataOpType & SMEMRA_DATA_OP_DEVICE_RDMA) == 0U) {
+            SM_LOG_ERROR("join alloc entry(" << msg.poolId << ") failed, DEVICE_SCHEDULE without DEVICE_RDMA");
+            return SM_INVALID_PARAM;
+        }
+        options.bmType = HYBM_TYPE_AI_CORE_INITIATE;
+    }
     options.memType = SmemRallocHelper::TransHybmMemType(msg.maxDramSize, msg.maxHbmSize);
     options.bmDataOpType = SmemRallocHelper::TransHybmDataOpType(
         static_cast<smem_ralloc_data_op_type>(msg.dataOpType));

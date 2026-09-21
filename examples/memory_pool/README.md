@@ -27,6 +27,7 @@
 15. 05_observability/02_opentelemetry
 16. 05_observability/03_dashboards
 17. 02_scale_out/08_far_daemon_near_client
+18. 02_scale_out/09_near_device_scheduled_rdma
 
 ## 统一约束
 - 所有样例仅使用内存池接口。

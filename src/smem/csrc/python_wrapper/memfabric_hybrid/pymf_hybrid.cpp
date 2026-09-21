@@ -484,6 +484,25 @@ public:
         return ptr == nullptr ? 0 : (uint64_t)(ptrdiff_t)ptr;
     }
 
+    uint32_t GetEntityId() noexcept
+    {
+        return smem_ralloc_get_entity_id(handle_);
+    }
+
+    int32_t SubmitDeviceWrite(uint32_t dstRank, uint64_t srcOffset, uint64_t dstOffset, uint64_t size, uint32_t iters,
+                              uintptr_t stream) noexcept
+    {
+        return smem_ralloc_device_write_run_submit(handle_, dstRank, srcOffset, dstOffset, size, iters,
+                                                   reinterpret_cast<void *>(stream));
+    }
+
+    int32_t SubmitDeviceRead(uint32_t srcRank, uint64_t srcOffset, uint64_t dstOffset, uint64_t size,
+                             uintptr_t stream) noexcept
+    {
+        return smem_ralloc_device_read_run_submit(handle_, srcRank, srcOffset, dstOffset, size,
+                                                  reinterpret_cast<void *>(stream));
+    }
+
     std::vector<uint32_t> GetGroupRanks()
     {
         auto count = smem_ralloc_get_group_ranks(handle_, nullptr, 0);
@@ -1047,7 +1066,9 @@ void DefineRallocConfig(py::module_ &m)
         .value("HOST_TCP", SMEMRA_DATA_OP_HOST_TCP, "data operation done by host TCP")
         .value("DEVICE_RDMA", SMEMRA_DATA_OP_DEVICE_RDMA, "data operation done by device RDMA")
         .value("HOST_URMA", SMEMRA_DATA_OP_HOST_URMA, "data operation done by host URMA")
-        .value("HOST_SHM", SMEMRA_DATA_OP_HOST_SHM, "same-node host shared memory (no network transport)");
+        .value("HOST_SHM", SMEMRA_DATA_OP_HOST_SHM, "same-node host shared memory (no network transport)")
+        .value("DEVICE_SCHEDULE", SMEMRA_DATA_OP_DEVICE_SCHEDULE,
+               "ralloc-only modifier: pool is scheduled from the AICore, combine with DEVICE_RDMA");
 
     py::enum_<smem_ralloc_group_event_t>(m, "RallocGroupEvent")
         .value("JOIN_EVENT", SMEM_RALLOC_GROUP_EVENT_JOIN, "join event")
@@ -1222,6 +1243,47 @@ Arguments:
     mem_type(RallocMemType): memory type of the window the slot belongs to, default HOST
 Returns:
     slot base address, 0 if failed)")
+        .def("get_entity_id", &RallocPool::GetEntityId, py::call_guard<py::gil_scoped_release>(), R"(
+Get the entity id of the pool inside the fixed device meta window. Kernels included from
+smem_ralloc_aicore_base_rdma.h use this id to self-discover the pool context (rank, QP
+rings, MR table) from device memory. Only meaningful for device-scheduled pools.
+
+Returns:
+    entity id, UINT32_MAX if failed)")
+        .def("submit_device_write", &RallocPool::SubmitDeviceWrite, py::call_guard<py::gil_scoped_release>(),
+             py::arg("dst_rank"), py::arg("src_offset"), py::arg("dst_offset"), py::arg("size"),
+             py::arg("iters") = 1, py::arg("stream") = 0, R"(
+Submit a device-scheduled RDMA WRITE job: the kernel posts `iters` one-sided writes of
+`size` bytes from the local device slot to the dst_rank device slot and quiets the
+connection, all on the AICore. The launcher only enqueues the kernel, no host
+synchronization is involved, so the whole job is NPU graph capturable. The pool must be
+created with DEVICE_SCHEDULE | DEVICE_RDMA.
+
+Arguments:
+    dst_rank(int):     destination rank of the pool
+    src_offset(int):   offset inside the local device slot
+    dst_offset(int):   offset inside the dst_rank device slot
+    size(int):         bytes to write per iteration
+    iters(int):        write iterations per submission, default 1
+    stream(int):       aclrt stream pointer, 0 uses the default stream, default 0
+Returns:
+    0 if successful)")
+        .def("submit_device_read", &RallocPool::SubmitDeviceRead, py::call_guard<py::gil_scoped_release>(),
+             py::arg("src_rank"), py::arg("src_offset"), py::arg("dst_offset"), py::arg("size"),
+             py::arg("stream") = 0, R"(
+Submit a device-scheduled RDMA READ job: the kernel issues one one-sided READ of `size`
+bytes from the src_rank device slot into the local device slot and quiets the connection,
+all on the AICore. Same graph-capture properties as submit_device_write. Typically used
+to verify data written by submit_device_write.
+
+Arguments:
+    src_rank(int):     source rank of the pool
+    src_offset(int):   offset inside the src_rank device slot
+    dst_offset(int):   offset inside the local device slot
+    size(int):         bytes to read
+    stream(int):       aclrt stream pointer, 0 uses the default stream, default 0
+Returns:
+    0 if successful)")
         .def("get_group_ranks", &RallocPool::GetGroupRanks, py::call_guard<py::gil_scoped_release>(), R"(
 Get the ranks currently in the pool's dynamic group, a snapshot including the local rank.
 Members joined before the event handler registration are only discoverable this way.

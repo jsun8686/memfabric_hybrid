@@ -65,6 +65,10 @@ public:
 
     uint32_t Id() const;
 
+    uint32_t GetRankId() const;
+
+    uint32_t GetEntityId() const;
+
     uint32_t GetRankIdByGva(void *gva);
 
     const hybm_options &GetCoreOptions() const;
@@ -148,6 +152,16 @@ using SmemRallocEntryPtr = SmRef<SmemRallocEntry>;
 inline uint32_t SmemRallocEntry::Id() const
 {
     return options_.id;
+}
+
+inline uint32_t SmemRallocEntry::GetRankId() const
+{
+    return options_.rank;
+}
+
+inline uint32_t SmemRallocEntry::GetEntityId() const
+{
+    return (Id() << 1U) + 1U;
 }
 
 inline const hybm_options &SmemRallocEntry::GetCoreOptions() const

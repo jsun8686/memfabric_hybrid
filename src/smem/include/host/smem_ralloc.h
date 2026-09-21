@@ -228,6 +228,57 @@ uint32_t smem_ralloc_get_group_ranks(smem_ralloc_t handle, uint32_t *rankIds, ui
  */
 int32_t smem_ralloc_set_group_event_handler(smem_ralloc_t handle, smem_ralloc_group_event_cb cb, void *context);
 
+/**
+ * @brief Get the entity id of the pool inside the fixed device meta window. Kernels included
+ * from smem_ralloc_aicore_base_rdma.h use this id to self-discover the pool context (rank,
+ * QP rings, MR table) from device memory. Only meaningful for device-scheduled pools, i.e.
+ * pools created with SMEMRA_DATA_OP_DEVICE_SCHEDULE | SMEMRA_DATA_OP_DEVICE_RDMA.
+ *
+ * @param handle           [in] ralloc object handle created by <i>smem_ralloc_create</i>
+ * @return entity id, UINT32_MAX if failed
+ */
+uint32_t smem_ralloc_get_entity_id(smem_ralloc_t handle);
+
+/**
+ * @brief Submit a device-scheduled RDMA WRITE job: the kernel posts `iters` one-sided writes of
+ * `size` bytes from the local device slot (srcOffset) to the dstRank device slot (dstOffset)
+ * and quiets the connection, all on the AICore. The launcher only enqueues the kernel on the
+ * given stream and contains no host synchronization, so the whole job is NPU graph capturable.
+ * The kernel library (libmf_smem_ralloc_device_rdma.so) is built at install time, the call
+ * fails if it is missing.
+ *
+ * @param handle           [in] ralloc object handle created by <i>smem_ralloc_create</i> with
+ *                            SMEMRA_DATA_OP_DEVICE_SCHEDULE | SMEMRA_DATA_OP_DEVICE_RDMA
+ * @param dstRank          [in] destination rank of the pool
+ * @param srcOffset        [in] offset inside the local device slot
+ * @param dstOffset        [in] offset inside the dstRank device slot
+ * @param size             [in] bytes to write per iteration
+ * @param iters            [in] write iterations per submission
+ * @param stream           [in] aclrt stream, null uses the default stream
+ * @return 0 if successful
+ */
+int32_t smem_ralloc_device_write_run_submit(smem_ralloc_t handle, uint32_t dstRank, uint64_t srcOffset,
+                                            uint64_t dstOffset, uint64_t size, uint32_t iters, void *stream);
+
+/**
+ * @brief Submit a device-scheduled RDMA READ job: the kernel issues one one-sided READ of
+ * `size` bytes from the srcRank device slot (srcOffset) into the local device slot (dstOffset)
+ * and quiets the connection, all on the AICore. Same graph-capture properties as
+ * <i>smem_ralloc_device_write_run_submit</i>. Typically used to verify data written by the
+ * WRITE job without any host-side copy engine.
+ *
+ * @param handle           [in] ralloc object handle created by <i>smem_ralloc_create</i> with
+ *                            SMEMRA_DATA_OP_DEVICE_SCHEDULE | SMEMRA_DATA_OP_DEVICE_RDMA
+ * @param srcRank          [in] source rank of the pool
+ * @param srcOffset        [in] offset inside the srcRank device slot
+ * @param dstOffset        [in] offset inside the local device slot
+ * @param size             [in] bytes to read
+ * @param stream           [in] aclrt stream, null uses the default stream
+ * @return 0 if successful
+ */
+int32_t smem_ralloc_device_read_run_submit(smem_ralloc_t handle, uint32_t srcRank, uint64_t srcOffset,
+                                           uint64_t dstOffset, uint64_t size, void *stream);
+
 #ifdef __cplusplus
 }
 #endif

@@ -20,6 +20,7 @@
 #include "smem_ralloc_entry.h"
 #include "smem_ralloc_helper.h"
 #include "smem_ralloc_rpc.h"
+#include "smem_ralloc_device_rdma.h"
 #include "mf_rwlock.h"
 #include "smem_ralloc.h"
 
@@ -127,7 +128,8 @@ SMEM_API uint32_t smem_ralloc_get_rank_id(void)
 static inline int32_t SmemRallocDataOpCheck(smem_ralloc_data_op_type dataOpType)
 {
     constexpr uint32_t dataOpTypeMask = SMEMRA_DATA_OP_SDMA | SMEMRA_DATA_OP_HOST_RDMA | SMEMRA_DATA_OP_HOST_URMA |
-                                        SMEMRA_DATA_OP_HOST_TCP | SMEMRA_DATA_OP_DEVICE_RDMA;
+                                        SMEMRA_DATA_OP_HOST_TCP | SMEMRA_DATA_OP_DEVICE_RDMA |
+                                        SMEMRA_DATA_OP_DEVICE_SCHEDULE;
     return (dataOpType & dataOpTypeMask) != 0;
 }
 
@@ -166,6 +168,12 @@ static int32_t smem_ralloc_create_inner(uint32_t id, const smem_ralloc_create_op
         SM_LOG_AND_SET_LAST_ERROR_CODE(SM_INVALID_PARAM, "HOST_SHM op type is not supported by ralloc");
         return SM_INVALID_PARAM;
     }
+    if ((option->dataOpType & SMEMRA_DATA_OP_DEVICE_SCHEDULE) != 0U &&
+        (option->dataOpType & SMEMRA_DATA_OP_DEVICE_RDMA) == 0U) {
+        SM_LOG_AND_SET_LAST_ERROR_CODE(SM_INVALID_PARAM,
+            "DEVICE_SCHEDULE must be combined with DEVICE_RDMA, pool: " << id);
+        return SM_INVALID_PARAM;
+    }
 
     SmemRallocEntryPtr entry;
     auto ret = manager.CreateEntryById(id, entry);
@@ -182,6 +190,9 @@ static int32_t smem_ralloc_create_inner(uint32_t id, const smem_ralloc_create_op
 
     hybm_options options{};
     options.bmType = HYBM_TYPE_HOST_INITIATE;
+    if ((option->dataOpType & SMEMRA_DATA_OP_DEVICE_SCHEDULE) != 0U) {
+        options.bmType = HYBM_TYPE_AI_CORE_INITIATE;
+    }
     options.memType = SmemRallocHelper::TransHybmMemType(option->maxDramSize, option->maxHbmSize);
     options.bmDataOpType = SmemRallocHelper::TransHybmDataOpType(option->dataOpType);
 #if !defined(ASCEND_NPU)
@@ -460,6 +471,9 @@ SMEM_API int32_t smem_ralloc_extend_remote_mem(smem_ralloc_t handle, smem_ralloc
         allocMsg.maxDramSize = coreOptions.maxDRAMSize;
         allocMsg.maxHbmSize = coreOptions.maxHBMSize;
         allocMsg.dataOpType = SmemRallocHelper::TransSmemDataOpType(coreOptions.bmDataOpType);
+        if (coreOptions.bmType == HYBM_TYPE_AI_CORE_INITIATE) {
+            allocMsg.dataOpType |= SMEMRA_DATA_OP_DEVICE_SCHEDULE;
+        }
         allocMsg.flags = coreOptions.flags;
         allocMsg.enable56BitsGva = coreOptions.enable56BitsGva;
         allocMsg.memType = static_cast<uint32_t>(memType);
@@ -571,4 +585,101 @@ SMEM_API int32_t smem_ralloc_set_group_event_handler(smem_ralloc_t handle, smem_
     }
 
     return entry->SetGroupEventHandler(cb, context);
+}
+
+SMEM_API uint32_t smem_ralloc_get_entity_id(smem_ralloc_t handle)
+{
+    SM_VALIDATE_RETURN(handle != nullptr, "invalid param, handle is NULL", UINT32_MAX);
+    SM_VALIDATE_RETURN(g_smemRallocInited, "smem ralloc not initialized yet", UINT32_MAX);
+
+    SmemRallocEntryPtr entry = nullptr;
+    auto ret = SmemRallocEntryManager::Instance().GetEntryByPtr(reinterpret_cast<uintptr_t>(handle), entry);
+    if (ret != SM_OK || entry == nullptr) {
+        SM_LOG_AND_SET_LAST_ERROR("input handle is invalid, result: " << ret);
+        return UINT32_MAX;
+    }
+
+    return entry->GetEntityId();
+}
+
+static int32_t SmemRallocDeviceRunCheck(smem_ralloc_t handle, uint32_t peerRank, uint64_t localOffset,
+                                        uint64_t peerOffset, uint64_t size, SmemRallocEntryPtr &outEntry,
+                                        void *&outLocalBase, void *&outPeerBase)
+{
+    SM_VALIDATE_RETURN(handle != nullptr, "invalid param, handle is NULL", SM_INVALID_PARAM);
+    SM_VALIDATE_RETURN(g_smemRallocInited, "smem ralloc not initialized yet", SM_NOT_INITIALIZED);
+    SM_VALIDATE_RETURN(size > 0UL, "invalid param, size is 0", SM_INVALID_PARAM);
+
+    SmemRallocEntryPtr entry = nullptr;
+    auto ret = SmemRallocEntryManager::Instance().GetEntryByPtr(reinterpret_cast<uintptr_t>(handle), entry);
+    if (ret != SM_OK || entry == nullptr) {
+        SM_LOG_AND_SET_LAST_ERROR("input handle is invalid, result: " << ret);
+        return SM_INVALID_PARAM;
+    }
+
+    if (entry->GetCoreOptions().bmType != HYBM_TYPE_AI_CORE_INITIATE) {
+        SM_LOG_AND_SET_LAST_ERROR_CODE(SM_NOT_SUPPORTED,
+            "pool is not device-scheduled, create it with DEVICE_SCHEDULE | DEVICE_RDMA");
+        return SM_NOT_SUPPORTED;
+    }
+
+    auto localRank = entry->GetRankId();
+    auto localBase = entry->GetMemPtrByRank(localRank, SMEM_RALLOC_MEM_TYPE_DEVICE);
+    auto peerBase = entry->GetMemPtrByRank(peerRank, SMEM_RALLOC_MEM_TYPE_DEVICE);
+    if (localBase == nullptr || peerBase == nullptr) {
+        SM_LOG_AND_SET_LAST_ERROR_CODE(SM_ERROR,
+            "device slot not ready, local: " << localBase << " peer(" << peerRank << "): " << peerBase);
+        return SM_ERROR;
+    }
+    if (localOffset + size > entry->GetMemSizeByRank(localRank, SMEM_RALLOC_MEM_TYPE_DEVICE) ||
+        peerOffset + size > entry->GetMemSizeByRank(peerRank, SMEM_RALLOC_MEM_TYPE_DEVICE)) {
+        SM_LOG_AND_SET_LAST_ERROR_CODE(SM_INVALID_PARAM, "copy range exceeds the committed device slot");
+        return SM_INVALID_PARAM;
+    }
+
+    if (!DlSmemRallocDeviceApi::TryLoadLibrary()) {
+        SM_LOG_AND_SET_LAST_ERROR_CODE(SM_ERROR,
+            "device rdma kernel library (libmf_smem_ralloc_device_rdma.so) is not available");
+        return SM_ERROR;
+    }
+    outEntry = entry;
+    outLocalBase = localBase;
+    outPeerBase = peerBase;
+    return SM_OK;
+}
+
+SMEM_API int32_t smem_ralloc_device_write_run_submit(smem_ralloc_t handle, uint32_t dstRank, uint64_t srcOffset,
+                                                     uint64_t dstOffset, uint64_t size, uint32_t iters, void *stream)
+{
+    SM_VALIDATE_RETURN(iters > 0U, "invalid param, iters is 0", SM_INVALID_PARAM);
+
+    SmemRallocEntryPtr entry = nullptr;
+    void *localBase = nullptr;
+    void *remoteBase = nullptr;
+    auto ret = SmemRallocDeviceRunCheck(handle, dstRank, srcOffset, dstOffset, size, entry, localBase, remoteBase);
+    if (ret != SM_OK) {
+        return ret;
+    }
+
+    auto submit = DlSmemRallocDeviceApi::GetWriteRunSubmit();
+    submit(entry->GetEntityId(), dstRank, static_cast<uint8_t *>(remoteBase) + dstOffset,
+           static_cast<uint8_t *>(localBase) + srcOffset, size, iters, 1U, stream);
+    return SM_OK;
+}
+
+SMEM_API int32_t smem_ralloc_device_read_run_submit(smem_ralloc_t handle, uint32_t srcRank, uint64_t srcOffset,
+                                                    uint64_t dstOffset, uint64_t size, void *stream)
+{
+    SmemRallocEntryPtr entry = nullptr;
+    void *localBase = nullptr;
+    void *remoteBase = nullptr;
+    auto ret = SmemRallocDeviceRunCheck(handle, srcRank, dstOffset, srcOffset, size, entry, localBase, remoteBase);
+    if (ret != SM_OK) {
+        return ret;
+    }
+
+    auto submit = DlSmemRallocDeviceApi::GetReadRunSubmit();
+    submit(entry->GetEntityId(), srcRank, static_cast<uint8_t *>(localBase) + dstOffset,
+           static_cast<uint8_t *>(remoteBase) + srcOffset, size, 1U, 1U, stream);
+    return SM_OK;
 }

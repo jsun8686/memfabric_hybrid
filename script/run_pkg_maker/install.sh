@@ -339,6 +339,32 @@ function try_install_extend()
     fi
 }
 
+function try_install_ralloc_device_rdma()
+{
+    bisheng_path=$(which bisheng 2>/dev/null)
+    if [ -z "${bisheng_path}" ]; then
+        print "WARNING" "bisheng Not Found, skip install ralloc device rdma lib."
+        return
+    fi
+
+    cce_param="--cce-aicore-arch=dav-c220"
+    if [ "${ascend_version}" == "A5" ]; then
+        cce_param="--cce-aicore-arch=dav-c310"
+    fi
+
+    cd ${script_dir}/../smem_ralloc_device
+    bisheng -x asc smem_ralloc_device_kernel.cpp -shared -fPIC -g -I../include/smem/device \
+        -o libmf_smem_ralloc_device_rdma.so ${cce_param}
+    exit_code=$?
+
+    if [ $exit_code -eq 0 ]; then
+        cp ./*.so ${install_dir}//${pkg_arch}-${os1}/lib64
+        print "INFO" "install smem ralloc device rdma lib success"
+    else
+        print "WARNING" "install ralloc device rdma lib failed, maybe cann version is old, least 8.3.RC1"
+    fi
+}
+
 function install_to_path()
 {
     install_dir=${default_install_dir}/${version1}
@@ -396,6 +422,7 @@ function install_process()
     print "INFO" "memfabric_hybrid start install into ${default_install_dir}"
     install_to_path
     try_install_extend
+    try_install_ralloc_device_rdma
     generate_set_env
 }
 

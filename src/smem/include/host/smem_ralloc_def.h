@@ -42,6 +42,7 @@ typedef enum {
     SMEMRA_DATA_OP_DEVICE_RDMA = 1U << 3, /* data operation done by device RDMA */
     SMEMRA_DATA_OP_HOST_URMA = 1U << 4,   /* data operation done by host URMA */
     SMEMRA_DATA_OP_HOST_SHM = 1U << 5,    /* same-node host shared memory (no network transport) */
+    SMEMRA_DATA_OP_DEVICE_SCHEDULE = 1U << 6, /* data operation done by device RDMA and scheduled from the AICore */
     SMEMRA_DATA_OP_BUTT
 } smem_ralloc_data_op_type;
 typedef smem_ralloc_data_op_type smem_ralloc_data_op_type_t;
