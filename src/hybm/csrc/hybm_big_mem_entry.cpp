@@ -230,6 +230,27 @@ HYBM_API int32_t hybm_set_extra_context(hybm_entity_t e, const void *context, ui
     return entity->SetExtraContext(context, size);
 }
 
+HYBM_API int32_t hybm_query_memory_key(hybm_entity_t e, uint64_t addr, uint64_t *mrAddr, uint64_t *size,
+                                        uint32_t *lkey, uint32_t *rkey)
+{
+    BM_ASSERT_RETURN(e != nullptr, BM_INVALID_PARAM);
+    auto entity = MemEntityFactory::Instance().FindEngineByPtr(e);
+    BM_ASSERT_RETURN(entity != nullptr, BM_INVALID_PARAM);
+    BM_ASSERT_RETURN(mrAddr != nullptr && size != nullptr && lkey != nullptr && rkey != nullptr, BM_INVALID_PARAM);
+    uint64_t mr = 0;
+    uint64_t sz = 0;
+    uint32_t lk = 0;
+    uint32_t rk = 0;
+    auto ret = entity->QueryMemoryKey(addr, mr, sz, lk, rk);
+    if (ret == BM_OK) {
+        *mrAddr = mr;
+        *size = sz;
+        *lkey = lk;
+        *rkey = rk;
+    }
+    return ret;
+}
+
 HYBM_API void hybm_unmap(hybm_entity_t e, uint32_t flags)
 {
     BM_ASSERT_RET_VOID(e != nullptr);

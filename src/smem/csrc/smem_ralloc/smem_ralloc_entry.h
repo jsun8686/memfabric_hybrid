@@ -61,6 +61,8 @@ public:
 
     Result UnRegisterMem(uint64_t addr);
 
+    bool IsUserRegistered(uint64_t addr, uint64_t size);
+
     Result SetGroupEventHandler(smem_ralloc_group_event_cb cb, void *context);
 
     uint32_t Id() const;
@@ -104,6 +106,8 @@ private:
 
     bool AddrInDeviceGva(const void *address, uint64_t size);
 
+    Result PublishUserMrTable();
+
     Result CheckJoined() const;
 
     Result CreateGlobalTeam(uint32_t rankSize, uint32_t rankId);
@@ -135,6 +139,14 @@ private:
     std::vector<hybm_mem_slice_t> slices_;
     std::vector<hybm_exchange_info> sliceInfos_;
     std::map<uint64_t, std::pair<uint64_t, hybm_mem_slice_t>> registedSlice_;
+
+    struct UserMrInfo {
+        uint64_t devAddr;
+        uint64_t size;
+        uint32_t lkey;
+        uint32_t rkey;
+    };
+    std::map<uint64_t, UserMrInfo> userMrs_;
 
     std::mutex eventCbMutex_;
     smem_ralloc_group_event_cb eventCb_ = nullptr;

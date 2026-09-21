@@ -49,6 +49,12 @@ public:
 
     virtual int32_t SetExtraContext(const void *context, uint32_t size) noexcept = 0;
 
+    /* query the device-rdma key of one registered local memory region: mrAddr is the
+     * device-dma-visible address (gva for pool memory, original address for user HBM),
+     * lkey/rkey are the RDMA memory region keys, size is the registered size */
+    virtual int32_t QueryMemoryKey(uint64_t addr, uint64_t &mrAddr, uint64_t &size, uint32_t &lkey,
+                                   uint32_t &rkey) noexcept = 0;
+
     virtual void Unmap() noexcept = 0;
     virtual int32_t Mmap() noexcept = 0;
     virtual bool SdmaReaches(uint32_t remoteRank) const noexcept = 0;

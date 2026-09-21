@@ -602,9 +602,8 @@ SMEM_API uint32_t smem_ralloc_get_entity_id(smem_ralloc_t handle)
     return entry->GetEntityId();
 }
 
-static int32_t SmemRallocDeviceRunCheck(smem_ralloc_t handle, uint32_t peerRank, uint64_t localOffset,
-                                        uint64_t peerOffset, uint64_t size, SmemRallocEntryPtr &outEntry,
-                                        void *&outLocalBase, void *&outPeerBase)
+static int32_t SmemRallocDeviceSegCheck(smem_ralloc_t handle, const void *src, const void *dst, uint64_t size,
+                                        SmemRallocEntryPtr &outEntry, uint32_t &outPeerRank, bool &outWrite)
 {
     SM_VALIDATE_RETURN(handle != nullptr, "invalid param, handle is NULL", SM_INVALID_PARAM);
     SM_VALIDATE_RETURN(g_smemRallocInited, "smem ralloc not initialized yet", SM_NOT_INITIALIZED);
@@ -624,17 +623,83 @@ static int32_t SmemRallocDeviceRunCheck(smem_ralloc_t handle, uint32_t peerRank,
     }
 
     auto localRank = entry->GetRankId();
-    auto localBase = entry->GetMemPtrByRank(localRank, SMEM_RALLOC_MEM_TYPE_DEVICE);
-    auto peerBase = entry->GetMemPtrByRank(peerRank, SMEM_RALLOC_MEM_TYPE_DEVICE);
-    if (localBase == nullptr || peerBase == nullptr) {
-        SM_LOG_AND_SET_LAST_ERROR_CODE(SM_ERROR,
-            "device slot not ready, local: " << localBase << " peer(" << peerRank << "): " << peerBase);
-        return SM_ERROR;
-    }
-    if (localOffset + size > entry->GetMemSizeByRank(localRank, SMEM_RALLOC_MEM_TYPE_DEVICE) ||
-        peerOffset + size > entry->GetMemSizeByRank(peerRank, SMEM_RALLOC_MEM_TYPE_DEVICE)) {
-        SM_LOG_AND_SET_LAST_ERROR_CODE(SM_INVALID_PARAM, "copy range exceeds the committed device slot");
+    enum class DevEndType { INVALID, LOCAL_POOL, PEER_POOL, USER };
+    auto classifyEnd = [entry, localRank](const void *addr, uint64_t len, DevEndType &type,
+                                          uint32_t &rank) -> int32_t {
+        rank = entry->GetRankIdByGva(const_cast<void *>(addr));
+        if (rank != UINT32_MAX) {
+            type = (rank == localRank) ? DevEndType::LOCAL_POOL : DevEndType::PEER_POOL;
+            return SM_OK;
+        }
+        if (entry->IsUserRegistered(reinterpret_cast<uint64_t>(addr), len)) {
+            type = DevEndType::USER;
+            return SM_OK;
+        }
+        type = DevEndType::INVALID;
+        SM_LOG_AND_SET_LAST_ERROR_CODE(SM_INVALID_PARAM,
+            "copy endpoint falls neither into the pool device window nor a registered user region: " << addr);
         return SM_INVALID_PARAM;
+    };
+    DevEndType srcType = DevEndType::INVALID;
+    DevEndType dstType = DevEndType::INVALID;
+    uint32_t srcRank = UINT32_MAX;
+    uint32_t dstRank = UINT32_MAX;
+    ret = classifyEnd(src, size, srcType, srcRank);
+    if (ret != SM_OK) {
+        return ret;
+    }
+    ret = classifyEnd(dst, size, dstType, dstRank);
+    if (ret != SM_OK) {
+        return ret;
+    }
+
+    bool write = false;
+    uint32_t peerRank = UINT32_MAX;
+    if (srcType == DevEndType::LOCAL_POOL && dstType == DevEndType::PEER_POOL) {
+        write = true;
+        peerRank = dstRank;
+    } else if (srcType == DevEndType::PEER_POOL && dstType == DevEndType::LOCAL_POOL) {
+        write = false;
+        peerRank = srcRank;
+    } else if (srcType == DevEndType::USER && dstType == DevEndType::PEER_POOL) {
+        write = true;
+        peerRank = dstRank;
+    } else if (srcType == DevEndType::PEER_POOL && dstType == DevEndType::USER) {
+        write = false;
+        peerRank = srcRank;
+    } else {
+        SM_LOG_AND_SET_LAST_ERROR_CODE(SM_INVALID_PARAM,
+            "device copy needs one local endpoint (pool slot or registered user memory) and one peer pool "
+            "slot, srcType: " << static_cast<int32_t>(srcType) << " dstType: " << static_cast<int32_t>(dstType));
+        return SM_INVALID_PARAM;
+    }
+
+    auto checkRange = [entry](uint32_t rank, const void *addr, uint64_t len) -> int32_t {
+        auto base = entry->GetMemPtrByRank(rank, SMEM_RALLOC_MEM_TYPE_DEVICE);
+        if (base == nullptr) {
+            SM_LOG_AND_SET_LAST_ERROR_CODE(SM_ERROR, "device slot of rank " << rank << " not ready");
+            return SM_ERROR;
+        }
+        auto offset = static_cast<uint64_t>(reinterpret_cast<const uint8_t *>(addr) -
+                                            static_cast<const uint8_t *>(base));
+        if (offset + len > entry->GetMemSizeByRank(rank, SMEM_RALLOC_MEM_TYPE_DEVICE)) {
+            SM_LOG_AND_SET_LAST_ERROR_CODE(SM_INVALID_PARAM,
+                "copy range exceeds the committed device slot of rank " << rank);
+            return SM_INVALID_PARAM;
+        }
+        return SM_OK;
+    };
+    if (srcType != DevEndType::USER) {
+        ret = checkRange(srcRank, src, size);
+        if (ret != SM_OK) {
+            return ret;
+        }
+    }
+    if (dstType != DevEndType::USER) {
+        ret = checkRange(dstRank, dst, size);
+        if (ret != SM_OK) {
+            return ret;
+        }
     }
 
     if (!DlSmemRallocDeviceApi::TryLoadLibrary()) {
@@ -643,43 +708,68 @@ static int32_t SmemRallocDeviceRunCheck(smem_ralloc_t handle, uint32_t peerRank,
         return SM_ERROR;
     }
     outEntry = entry;
-    outLocalBase = localBase;
-    outPeerBase = peerBase;
+    outPeerRank = peerRank;
+    outWrite = write;
     return SM_OK;
 }
 
-SMEM_API int32_t smem_ralloc_device_write_run_submit(smem_ralloc_t handle, uint32_t dstRank, uint64_t srcOffset,
-                                                     uint64_t dstOffset, uint64_t size, uint32_t iters, void *stream)
+SMEM_API int32_t smem_ralloc_device_copy(smem_ralloc_t handle, const void *src, void *dest, uint64_t size,
+                                         void *stream)
 {
-    SM_VALIDATE_RETURN(iters > 0U, "invalid param, iters is 0", SM_INVALID_PARAM);
-
     SmemRallocEntryPtr entry = nullptr;
-    void *localBase = nullptr;
-    void *remoteBase = nullptr;
-    auto ret = SmemRallocDeviceRunCheck(handle, dstRank, srcOffset, dstOffset, size, entry, localBase, remoteBase);
+    uint32_t peerRank = UINT32_MAX;
+    bool write = false;
+    auto ret = SmemRallocDeviceSegCheck(handle, src, dest, size, entry, peerRank, write);
     if (ret != SM_OK) {
         return ret;
     }
 
-    auto submit = DlSmemRallocDeviceApi::GetWriteRunSubmit();
-    submit(entry->GetEntityId(), dstRank, static_cast<uint8_t *>(remoteBase) + dstOffset,
-           static_cast<uint8_t *>(localBase) + srcOffset, size, iters, 1U, stream);
+    if (write) {
+        auto submit = DlSmemRallocDeviceApi::GetWriteRunSubmit();
+        submit(entry->GetEntityId(), peerRank, dest, const_cast<void *>(src), size, stream);
+    } else {
+        auto submit = DlSmemRallocDeviceApi::GetReadRunSubmit();
+        submit(entry->GetEntityId(), peerRank, dest, const_cast<void *>(src), size, stream);
+    }
     return SM_OK;
 }
 
-SMEM_API int32_t smem_ralloc_device_read_run_submit(smem_ralloc_t handle, uint32_t srcRank, uint64_t srcOffset,
-                                                    uint64_t dstOffset, uint64_t size, void *stream)
+SMEM_API int32_t smem_ralloc_device_copy_batch(smem_ralloc_t handle, smem_ralloc_batch_copy_params_t *params,
+                                               void *stream)
 {
-    SmemRallocEntryPtr entry = nullptr;
-    void *localBase = nullptr;
-    void *remoteBase = nullptr;
-    auto ret = SmemRallocDeviceRunCheck(handle, srcRank, dstOffset, srcOffset, size, entry, localBase, remoteBase);
-    if (ret != SM_OK) {
-        return ret;
-    }
+    SM_VALIDATE_RETURN(params != nullptr, "invalid param, params is NULL", SM_INVALID_PARAM);
+    SM_VALIDATE_RETURN(params->sources != nullptr && params->destinations != nullptr &&
+                           params->dataSizes != nullptr,
+                       "invalid param, batch arrays are NULL", SM_INVALID_PARAM);
+    SM_VALIDATE_RETURN(params->batchSize > 0U, "invalid param, batchSize is 0", SM_INVALID_PARAM);
 
-    auto submit = DlSmemRallocDeviceApi::GetReadRunSubmit();
-    submit(entry->GetEntityId(), srcRank, static_cast<uint8_t *>(localBase) + dstOffset,
-           static_cast<uint8_t *>(remoteBase) + srcOffset, size, 1U, 1U, stream);
+    std::vector<SmemRallocEntryPtr> entries(params->batchSize);
+    std::vector<uint32_t> peers(params->batchSize);
+    std::vector<bool> writes(params->batchSize);
+    for (uint32_t i = 0; i < params->batchSize; i++) {
+        auto ret = SmemRallocDeviceSegCheck(handle, params->sources[i], params->destinations[i],
+                                            params->dataSizes[i], entries[i], peers[i], writes[i]);
+        if (ret != SM_OK) {
+            return ret;
+        }
+    }
+    auto entityId = entries[0]->GetEntityId();
+
+    struct smem_ralloc_device_batch_args args{};
+    auto submit = DlSmemRallocDeviceApi::GetBatchRunSubmit();
+    for (uint32_t base = 0; base < params->batchSize; base += SMEM_RALLOC_DEVICE_COPY_BATCH_SEG_MAX) {
+        auto n = std::min(static_cast<uint32_t>(SMEM_RALLOC_DEVICE_COPY_BATCH_SEG_MAX),
+                          params->batchSize - base);
+        args.count = n;
+        args.entityId = entityId;
+        for (uint32_t i = 0; i < n; i++) {
+            args.segs[i].src = reinterpret_cast<uint64_t>(params->sources[base + i]);
+            args.segs[i].dst = reinterpret_cast<uint64_t>(params->destinations[base + i]);
+            args.segs[i].size = params->dataSizes[base + i];
+            args.segs[i].peerRank = peers[base + i];
+            args.segs[i].isWrite = writes[base + i] ? 1U : 0U;
+        }
+        submit(&args, stream);
+    }
     return SM_OK;
 }

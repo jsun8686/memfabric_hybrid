@@ -489,18 +489,34 @@ public:
         return smem_ralloc_get_entity_id(handle_);
     }
 
-    int32_t SubmitDeviceWrite(uint32_t dstRank, uint64_t srcOffset, uint64_t dstOffset, uint64_t size, uint32_t iters,
-                              uintptr_t stream) noexcept
+    int32_t DeviceCopy(uint64_t src, uint64_t dst, uint64_t size, uintptr_t stream) noexcept
     {
-        return smem_ralloc_device_write_run_submit(handle_, dstRank, srcOffset, dstOffset, size, iters,
-                                                   reinterpret_cast<void *>(stream));
+        return smem_ralloc_device_copy(handle_, reinterpret_cast<const void *>(src), reinterpret_cast<void *>(dst),
+                                       size, reinterpret_cast<void *>(stream));
     }
 
-    int32_t SubmitDeviceRead(uint32_t srcRank, uint64_t srcOffset, uint64_t dstOffset, uint64_t size,
-                             uintptr_t stream) noexcept
+    int32_t DeviceCopyBatch(std::vector<uintptr_t> srcs, std::vector<uintptr_t> dsts, std::vector<uint64_t> sizes,
+                            uintptr_t stream)
     {
-        return smem_ralloc_device_read_run_submit(handle_, srcRank, srcOffset, dstOffset, size,
-                                                  reinterpret_cast<void *>(stream));
+        auto count = srcs.size();
+        if (count == 0 || dsts.size() != count || sizes.size() != count) {
+            return SMEM_INVALID_PARAM;
+        }
+        void **ptr = new void *[count + count];
+        if (ptr == nullptr) {
+            throw std::runtime_error(std::string("alloc mem failed."));
+        }
+
+        void **sources = ptr;
+        void **destinations = ptr + count;
+        for (uint64_t i = 0; i < count; ++i) {
+            sources[i] = reinterpret_cast<void *>(srcs[i]);
+            destinations[i] = reinterpret_cast<void *>(dsts[i]);
+        }
+        smem_ralloc_batch_copy_params params = {sources, destinations, sizes.data(), static_cast<uint32_t>(count)};
+        auto ret = smem_ralloc_device_copy_batch(handle_, &params, reinterpret_cast<void *>(stream));
+        delete[] ptr;
+        return ret;
     }
 
     std::vector<uint32_t> GetGroupRanks()
@@ -1250,38 +1266,41 @@ rings, MR table) from device memory. Only meaningful for device-scheduled pools.
 
 Returns:
     entity id, UINT32_MAX if failed)")
-        .def("submit_device_write", &RallocPool::SubmitDeviceWrite, py::call_guard<py::gil_scoped_release>(),
-             py::arg("dst_rank"), py::arg("src_offset"), py::arg("dst_offset"), py::arg("size"),
-             py::arg("iters") = 1, py::arg("stream") = 0, R"(
-Submit a device-scheduled RDMA WRITE job: the kernel posts `iters` one-sided writes of
-`size` bytes from the local device slot to the dst_rank device slot and quiets the
-connection, all on the AICore. The launcher only enqueues the kernel, no host
-synchronization is involved, so the whole job is NPU graph capturable. The pool must be
-created with DEVICE_SCHEDULE | DEVICE_RDMA.
+        .def("device_copy", &RallocPool::DeviceCopy, py::call_guard<py::gil_scoped_release>(), py::arg("src_ptr"),
+             py::arg("dst_ptr"), py::arg("size"), py::arg("stream") = 0, R"(
+Submit a device-scheduled one-sided copy between device window slots, the counterpart of
+copy_data for pools created with DEVICE_RDMA | DEVICE_SCHEDULE. The direction is derived
+from the addresses: local -> peer issues an AICore RDMA WRITE, peer -> local issues an
+AICore RDMA READ. A local endpoint may also be user HBM registered via register() on this
+pool (P1): the registered region's lkey is looked up on device from the user MR table, so
+NPU-managed tensors can be DMA sources/sinks without a card-internal staging copy. The
+launcher only enqueues the kernel, no host synchronization is involved, so the whole job
+is NPU graph capturable. Completion is observed by synchronizing the stream (or replaying
+the graph). The pool must be created with DEVICE_SCHEDULE | DEVICE_RDMA. register()/
+unregister() must happen before graph capture (the MR table is frozen as a snapshot).
 
 Arguments:
-    dst_rank(int):     destination rank of the pool
-    src_offset(int):   offset inside the local device slot
-    dst_offset(int):   offset inside the dst_rank device slot
-    size(int):         bytes to write per iteration
-    iters(int):        write iterations per submission, default 1
-    stream(int):       aclrt stream pointer, 0 uses the default stream, default 0
+    src_ptr(int):  source address, local or peer device window slot, or registered user HBM
+    dst_ptr(int):  destination address, peer or local device window slot, or registered user HBM
+    size(int):     bytes to copy
+    stream(int):   aclrt stream pointer, 0 uses the default stream, default 0
 Returns:
     0 if successful)")
-        .def("submit_device_read", &RallocPool::SubmitDeviceRead, py::call_guard<py::gil_scoped_release>(),
-             py::arg("src_rank"), py::arg("src_offset"), py::arg("dst_offset"), py::arg("size"),
-             py::arg("stream") = 0, R"(
-Submit a device-scheduled RDMA READ job: the kernel issues one one-sided READ of `size`
-bytes from the src_rank device slot into the local device slot and quiets the connection,
-all on the AICore. Same graph-capture properties as submit_device_write. Typically used
-to verify data written by submit_device_write.
+        .def("device_copy_batch", &RallocPool::DeviceCopyBatch, py::call_guard<py::gil_scoped_release>(),
+             py::arg("src_addrs"), py::arg("dst_addrs"), py::arg("sizes"), py::arg("stream") = 0, R"(
+Submit a batch of device-scheduled one-sided copies, the counterpart of copy_data_batch
+for device-scheduled pools. Same address semantics as device_copy (including registered
+user HBM endpoints, P1), applied per segment:
+the direction of every segment is derived from its own addresses and mixed WRITE/READ
+segments are allowed. All segments are prechecked before anything is enqueued, then
+driven in chunks of at most 16 segments per kernel launch, each chunk quiets every peer
+it touched exactly once. register()/unregister() must happen before graph capture.
 
 Arguments:
-    src_rank(int):     source rank of the pool
-    src_offset(int):   offset inside the src_rank device slot
-    dst_offset(int):   offset inside the local device slot
-    size(int):         bytes to read
-    stream(int):       aclrt stream pointer, 0 uses the default stream, default 0
+    src_addrs(list[int]): source addresses, local or peer device window slots
+    dst_addrs(list[int]): destination addresses, peer or local device window slots
+    sizes(list[int]):     sizes of the segments
+    stream(int):          aclrt stream pointer, 0 uses the default stream, default 0
 Returns:
     0 if successful)")
         .def("get_group_ranks", &RallocPool::GetGroupRanks, py::call_guard<py::gil_scoped_release>(), R"(

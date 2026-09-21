@@ -50,6 +50,7 @@ constexpr uint64_t SMEM_RALLOC_DEVICE_USER_CONTEXT_PRE_SIZE = 64UL * 1024UL;    
 constexpr uint64_t SMEM_RALLOC_DEVICE_INFO_SIZE =
     SMEM_RALLOC_DEVICE_USER_CONTEXT_PRE_SIZE * SMEM_RALLOC_ENTITY_NUM_MAX + SMEM_RALLOC_DEVICE_META_SIZE; /* 32M */
 constexpr uint64_t SMEM_RALLOC_DEVICE_META_ADDR = SMEM_RALLOC_DEVICE_END_ADDR - SMEM_RALLOC_DEVICE_INFO_SIZE;
+constexpr uint64_t SMEM_RALLOC_DEVICE_USER_CONTEXT_ADDR = SMEM_RALLOC_DEVICE_META_ADDR + SMEM_RALLOC_DEVICE_META_SIZE;
 
 /* ---- meta record field offsets, in sync with hybm_define.h HybmDeviceMeta ---- */
 constexpr uint64_t SMEM_RALLOC_META_ENTITY_ID_OFFSET = 0;
@@ -123,6 +124,35 @@ struct SmemRallocMemInfo { /* in sync with RdmaMemRegionInfo */
     uint32_t rkey;
 };
 
+/* ---- user MR table (P1), in sync with ralloc publish side (smem_ralloc_entry.cpp PublishUserMrTable) ----
+ * published by the host into this entity's 64K user context region via hybm_set_extra_context;
+ * lets device-scheduled RDMA use locally registered user HBM as the local endpoint */
+constexpr uint32_t SMEM_RALLOC_USER_MR_TABLE_MAGIC = 0x31524D53; /* "SMR1" */
+constexpr uint32_t SMEM_RALLOC_USER_MR_TABLE_VERSION = 1;
+constexpr uint64_t SMEM_RALLOC_USER_MR_TABLE_HEADER_SIZE = 64;
+constexpr uint64_t SMEM_RALLOC_USER_MR_TABLE_ERRCODE_OFFSET = 12; /* device writes: 0 = ok, 1 = lkey lookup miss */
+constexpr uint64_t SMEM_RALLOC_USER_MR_TABLE_ENTRY_SIZE = 32;
+constexpr uint64_t SMEM_RALLOC_USER_MR_TABLE_CAPACITY =
+    (SMEM_RALLOC_DEVICE_USER_CONTEXT_PRE_SIZE - SMEM_RALLOC_USER_MR_TABLE_HEADER_SIZE) /
+    SMEM_RALLOC_USER_MR_TABLE_ENTRY_SIZE; /* 2046 slots, host publishes at most 2040 */
+
+struct SmemRallocUserMrEntry { /* 32B, in sync with the ralloc publish side */
+    uint64_t addr; /* device-dma-visible address returned by hybm_query_memory_key */
+    uint64_t size;
+    uint32_t lkey;
+    uint32_t rkey;
+    uint64_t reserved;
+};
+
+struct SmemRallocUserMrTable { /* 64B header + entries, serialized into the 64K user context region */
+    uint32_t magic;
+    uint32_t version;
+    uint32_t count;
+    uint32_t errCode;
+    uint64_t reserved[6];
+    SmemRallocUserMrEntry entries[SMEM_RALLOC_USER_MR_TABLE_CAPACITY];
+};
+
 /* in sync with AiQpRMAQueueInfo as published by FixedRanksQpManager::FillQpInfo */
 struct SmemRallocRdmaInfo {
     uint32_t qpNum;  /* QP count per connection, always 1 today */
@@ -165,6 +195,11 @@ SMEM_RALLOC_INLINE_AICORE __gm__ void *smem_ralloc_get_qp_info_address(uint32_t 
     return *(__gm__ void **)(metaAddr + SMEM_RALLOC_META_QP_INFO_OFFSET);
 }
 
+SMEM_RALLOC_INLINE_AICORE uint64_t smem_ralloc_user_context_address(uint32_t entityId)
+{
+    return SMEM_RALLOC_DEVICE_USER_CONTEXT_ADDR + entityId * SMEM_RALLOC_DEVICE_USER_CONTEXT_PRE_SIZE;
+}
+
 SMEM_RALLOC_INLINE_AICORE void smem_ralloc_cache_write_through(__gm__ uint8_t *sourceAddr, uint64_t length)
 {
     __gm__ uint8_t *start = (__gm__ uint8_t *)((uint64_t)sourceAddr / SMEM_RALLOC_DATA_CACHE_LINE_SIZE *
@@ -177,6 +212,50 @@ SMEM_RALLOC_INLINE_AICORE void smem_ralloc_cache_write_through(__gm__ uint8_t *s
         AscendC::DataCacheCleanAndInvalid<uint8_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
                                           AscendC::DcciDst::CACHELINE_OUT>(global[i]);
     }
+}
+
+/**
+ * @brief Look up the lkey of a locally registered user memory region (P1).
+ *        Two-level scheme: the caller first tries the pool MR of this rank; on miss this helper
+ *        scans the user MR table published (host side) into this entity's user context region.
+ * @return the lkey covering localAddr, or 0 when the table is absent/invalid or no entry matches.
+ */
+SMEM_RALLOC_INLINE_AICORE uint32_t smem_ralloc_lookup_local_mr(uint32_t entityId, uint64_t localAddr)
+{
+    if (entityId >= SMEM_RALLOC_ENTITY_NUM_MAX) {
+        return 0;
+    }
+    __gm__ SmemRallocUserMrTable *table = (__gm__ SmemRallocUserMrTable *)smem_ralloc_user_context_address(entityId);
+    if (table->magic != SMEM_RALLOC_USER_MR_TABLE_MAGIC || table->version != SMEM_RALLOC_USER_MR_TABLE_VERSION) {
+        return 0;
+    }
+    uint32_t count = table->count;
+    if (count > SMEM_RALLOC_USER_MR_TABLE_CAPACITY) {
+        return 0;
+    }
+    for (uint32_t i = 0; i < count; i++) {
+        __gm__ SmemRallocUserMrEntry *entry = table->entries + i;
+        if (localAddr >= entry->addr && localAddr < entry->addr + entry->size) {
+            return entry->lkey;
+        }
+    }
+    return 0;
+}
+
+/**
+ * @brief Record an lkey lookup miss into the user MR table header (errCode = 1) so the host can
+ *        read it back for diagnostics; the WQE is then not posted.
+ */
+SMEM_RALLOC_INLINE_AICORE void smem_ralloc_report_user_mr_lookup_miss(uint32_t entityId)
+{
+    if (entityId >= SMEM_RALLOC_ENTITY_NUM_MAX) {
+        return;
+    }
+    __gm__ uint32_t *errCode = (__gm__ uint32_t *)(smem_ralloc_user_context_address(entityId) +
+                                                   SMEM_RALLOC_USER_MR_TABLE_ERRCODE_OFFSET);
+    *errCode = 1;
+    smem_ralloc_cache_write_through((__gm__ uint8_t *)errCode, sizeof(uint32_t));
+    AscendC::PipeBarrier<PIPE_ALL>();
 }
 
 /* ---- RDMA data plane ---- */
@@ -356,7 +435,17 @@ SMEM_RALLOC_INLINE_AICORE void smem_ralloc_rdma_post_send(uint32_t entityId, __g
     *(__gm__ uint32_t *)(sgeAddr) = messageLen;
     __gm__ SmemRallocMemInfo *localMemInfo = (__gm__ SmemRallocMemInfo *)(
         memInfoTable + sizeof(SmemRallocMemInfo) * smem_ralloc_get_global_rank(entityId));
-    *(__gm__ uint32_t *)(sgeAddr + 4) = localMemInfo->lkey; /* local key */
+    uint32_t localLkey = localMemInfo->lkey;
+    if ((uint64_t)localAddr < localMemInfo->addr ||
+        (uint64_t)localAddr >= localMemInfo->addr + localMemInfo->size) {
+        /* local endpoint outside this rank's pool MR: fall back to the registered user MR table */
+        localLkey = smem_ralloc_lookup_local_mr(entityId, (uint64_t)localAddr);
+        if (localLkey == 0) {
+            smem_ralloc_report_user_mr_lookup_miss(entityId);
+            return;
+        }
+    }
+    *(__gm__ uint32_t *)(sgeAddr + 4) = localLkey; /* local key */
     *(__gm__ uint64_t *)(sgeAddr + 8) = (uint64_t)localAddr;
 
     /* WQE & SGE cache flush */

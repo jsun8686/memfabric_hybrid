@@ -22,14 +22,18 @@
 #include <cstdint>
 #include <mutex>
 
+#include "smem_ralloc_device_launch_def.h"
+
 namespace ock {
 namespace smem {
 
 using SmemRallocDeviceWriteRunFunc = void (*)(uint32_t entityId, uint32_t dstRank, void *dst, void *src,
-                                              uint64_t len, uint32_t iters, uint32_t dim, void *stream);
+                                              uint64_t len, void *stream);
 
 using SmemRallocDeviceReadRunFunc = void (*)(uint32_t entityId, uint32_t srcRank, void *dst, void *src,
-                                             uint64_t len, uint32_t iters, uint32_t dim, void *stream);
+                                             uint64_t len, void *stream);
+
+using SmemRallocDeviceBatchRunFunc = void (*)(const struct smem_ralloc_device_batch_args *args, void *stream);
 
 class DlSmemRallocDeviceApi {
 public:
@@ -53,12 +57,18 @@ public:
         return pReadRunSubmit;
     }
 
+    static SmemRallocDeviceBatchRunFunc GetBatchRunSubmit()
+    {
+        return pBatchRunSubmit;
+    }
+
 private:
     static bool gLoaded;
     static std::mutex gMutex;
     static void *libHandle;
     static SmemRallocDeviceWriteRunFunc pWriteRunSubmit;
     static SmemRallocDeviceReadRunFunc pReadRunSubmit;
+    static SmemRallocDeviceBatchRunFunc pBatchRunSubmit;
 };
 
 } // namespace smem

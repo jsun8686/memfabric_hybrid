@@ -192,6 +192,21 @@ int32_t hybm_remove_imported(hybm_entity_t e, uint32_t rank, uint32_t flags);
 int32_t hybm_set_extra_context(hybm_entity_t e, const void *context, uint32_t size);
 
 /**
+ * @brief Query the device-rdma memory key of one registered local memory region
+ *
+ * @param e                [in] entity created by hybm_create_entity
+ * @param addr             [in] registered local memory address
+ * @param mrAddr           [out] device-dma-visible address (gva for pool memory, original
+ *                               address for registered user HBM); usable to match the region
+ * @param size             [out] registered memory region size
+ * @param lkey             [out] local memory key of the region
+ * @param rkey             [out] remote memory key of the region
+ * @return 0 if successful, error code otherwise
+ */
+int32_t hybm_query_memory_key(hybm_entity_t e, uint64_t addr, uint64_t *mrAddr, uint64_t *size, uint32_t *lkey,
+                              uint32_t *rkey);
+
+/**
  * @brief Convert GVA (Global Virtual Address) to VA (Virtual Address) with specified memory type
  *
  * @param gva              [in] Global Virtual Address to convert

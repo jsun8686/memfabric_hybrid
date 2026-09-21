@@ -16,6 +16,7 @@
 #include "dl_api.h"
 #include "dl_acl_api.h"
 #include "dl_hal_api.h"
+#include "device_rdma_common.h"
 #include "host_hcom_common.h"
 #include "hybm_data_op_host_shm.h"
 #include "hybm_data_op_host_rdma.h"
@@ -682,6 +683,38 @@ int32_t MemEntityDefault::SetExtraContext(const void *context, uint32_t size) no
     }
 
     return UpdateHybmDeviceInfo(size);
+}
+
+int32_t MemEntityDefault::QueryMemoryKey(uint64_t addr, uint64_t &mrAddr, uint64_t &size, uint32_t &lkey,
+                                         uint32_t &rkey) noexcept
+{
+    if (!initialized_) {
+        BM_LOG_ERROR("the object is not initialized, please check whether Initialize is called.");
+        return BM_NOT_INITIALIZED;
+    }
+    if (transportManager_ == nullptr) {
+        BM_LOG_ERROR("query memory key failed, no transport manager on this entity");
+        return BM_NOT_SUPPORTED;
+    }
+
+    transport::TransportMemoryKey key{};
+    auto ret = transportManager_->QueryMemoryKey(addr, key);
+    if (ret != BM_OK) {
+        BM_LOG_ERROR("query memory key failed, addr: " << std::hex << addr << " ret: " << ret);
+        return ret;
+    }
+
+    /* TransportMemoryKey is a raw key blob whose first sizeof(RegMemResult) bytes carry the
+     * device-rdma key fields (device segment occupies the low keys, see ComposeTransportManager) */
+    transport::RegMemKeyUnion keyUnion{};
+    keyUnion.commonKey = key;
+    mrAddr = keyUnion.deviceKey.address;
+    size = keyUnion.deviceKey.size;
+    lkey = keyUnion.deviceKey.lkey;
+    rkey = keyUnion.deviceKey.rkey;
+    BM_LOG_INFO("query memory key ok, addr: " << std::hex << addr << " mrAddr: " << mrAddr << " size: " << std::dec
+                                              << size);
+    return BM_OK;
 }
 
 void MemEntityDefault::Unmap() noexcept

@@ -24,6 +24,7 @@ std::mutex DlSmemRallocDeviceApi::gMutex;
 void *DlSmemRallocDeviceApi::libHandle = nullptr;
 SmemRallocDeviceWriteRunFunc DlSmemRallocDeviceApi::pWriteRunSubmit = nullptr;
 SmemRallocDeviceReadRunFunc DlSmemRallocDeviceApi::pReadRunSubmit = nullptr;
+SmemRallocDeviceBatchRunFunc DlSmemRallocDeviceApi::pBatchRunSubmit = nullptr;
 
 static const char *SMEM_RALLOC_DEVICE_LIB_NAME = "libmf_smem_ralloc_device_rdma.so";
 
@@ -63,7 +64,9 @@ bool DlSmemRallocDeviceApi::TryLoadLibrary()
         dlsym(libHandle, "smem_ralloc_device_write_run_submit"));
     pReadRunSubmit = reinterpret_cast<SmemRallocDeviceReadRunFunc>(
         dlsym(libHandle, "smem_ralloc_device_read_run_submit"));
-    if (pWriteRunSubmit == nullptr || pReadRunSubmit == nullptr) {
+    pBatchRunSubmit = reinterpret_cast<SmemRallocDeviceBatchRunFunc>(
+        dlsym(libHandle, "smem_ralloc_device_batch_run_submit"));
+    if (pWriteRunSubmit == nullptr || pReadRunSubmit == nullptr || pBatchRunSubmit == nullptr) {
         SM_LOG_WARN("Failed to load symbol smem_ralloc_device_run_submit, error: " << dlerror());
         dlclose(libHandle);
         libHandle = nullptr;
@@ -83,6 +86,7 @@ void DlSmemRallocDeviceApi::CleanupLibrary()
 
     pWriteRunSubmit = nullptr;
     pReadRunSubmit = nullptr;
+    pBatchRunSubmit = nullptr;
     if (libHandle != nullptr) {
         dlclose(libHandle);
         libHandle = nullptr;

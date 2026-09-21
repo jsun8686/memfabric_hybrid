@@ -669,6 +669,29 @@ Result SmemRallocEntry::RegisterMem(uint64_t addr, uint64_t size)
     }
     auto slice = hybm_register_local_memory(entity_, reinterpret_cast<void *>(addr), size, 0);
     if (slice != nullptr) {
+        constexpr uint64_t publishCapacity = 2040;
+        if (userMrs_.size() >= publishCapacity) {
+            SM_LOG_ERROR("RegisterMem user_mr_table_full: count=" << userMrs_.size());
+            (void)hybm_free_local_memory(entity_, slice, 1, 0);
+            return SM_NOT_SUPPORTED;
+        }
+        uint64_t devAddr = 0;
+        uint64_t mrSize = 0;
+        uint32_t lkey = 0;
+        uint32_t rkey = 0;
+        auto keyRet = hybm_query_memory_key(entity_, addr, &devAddr, &mrSize, &lkey, &rkey);
+        if (keyRet != 0) {
+            SM_LOG_WARN("RegisterMem query_key_fail: addr=0x" << std::hex << addr << std::dec
+                                                               << " ret=" << keyRet
+                                                               << " (device-scheduled use disabled)");
+        } else {
+            userMrs_.emplace(addr, UserMrInfo{devAddr, size, lkey, rkey});
+            auto pubRet = PublishUserMrTable();
+            if (pubRet != SM_OK) {
+                SM_LOG_WARN("RegisterMem publish_user_mr_table_fail: ret=" << pubRet
+                                                                           << " (device-scheduled use degraded)");
+            }
+        }
         registedSlice_.emplace(addr, std::make_pair(size, slice));
         SM_LOG_INFO("RegisterMem ok: addr=0x" << std::hex << addr << std::dec << " size=" << size);
         return SM_OK;
@@ -694,7 +717,57 @@ Result SmemRallocEntry::UnRegisterMem(uint64_t addr)
         return SM_ERROR;
     }
     registedSlice_.erase(iter);
+    userMrs_.erase(addr);
+    auto pubRet = PublishUserMrTable();
+    if (pubRet != SM_OK) {
+        SM_LOG_WARN("UnRegisterMem publish_user_mr_table_fail: ret=" << pubRet);
+    }
     SM_LOG_INFO("UnRegisterMem ok: addr=0x" << std::hex << addr << std::dec << " size=" << sz);
+    return SM_OK;
+}
+
+bool SmemRallocEntry::IsUserRegistered(uint64_t addr, uint64_t size)
+{
+    SM_ASSERT_RETURN(inited_, false);
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (const auto &item : userMrs_) {
+        if (addr >= item.first && addr + size <= item.first + item.second.size) {
+            return true;
+        }
+    }
+    return false;
+}
+
+Result SmemRallocEntry::PublishUserMrTable()
+{
+    constexpr uint32_t tableMagic = 0x31524D53;
+    constexpr uint32_t tableVersion = 1;
+    constexpr uint64_t tableHeaderSize = 64;
+    constexpr uint64_t tableEntrySize = 32;
+
+    std::vector<uint8_t> buf(tableHeaderSize + tableEntrySize * userMrs_.size(), 0);
+    auto *header = reinterpret_cast<uint32_t *>(buf.data());
+    header[0] = tableMagic;
+    header[1] = tableVersion;
+    header[2] = static_cast<uint32_t>(userMrs_.size());
+    header[3] = 0;
+
+    uint64_t offset = tableHeaderSize;
+    for (auto iter = userMrs_.rbegin(); iter != userMrs_.rend(); ++iter) {
+        auto *entry = reinterpret_cast<uint64_t *>(buf.data() + offset);
+        entry[0] = iter->second.devAddr;
+        entry[1] = iter->second.size;
+        *(reinterpret_cast<uint32_t *>(buf.data() + offset + 16)) = iter->second.lkey;
+        *(reinterpret_cast<uint32_t *>(buf.data() + offset + 20)) = iter->second.rkey;
+        offset += tableEntrySize;
+    }
+
+    auto ret = hybm_set_extra_context(entity_, buf.data(), static_cast<uint32_t>(buf.size()));
+    if (ret != 0) {
+        SM_LOG_ERROR("PublishUserMrTable set_extra_context_fail: count=" << userMrs_.size() << " ret=" << ret);
+        return SM_ERROR;
+    }
+    SM_LOG_INFO("PublishUserMrTable ok: count=" << userMrs_.size());
     return SM_OK;
 }
 

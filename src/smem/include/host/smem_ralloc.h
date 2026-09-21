@@ -240,44 +240,44 @@ int32_t smem_ralloc_set_group_event_handler(smem_ralloc_t handle, smem_ralloc_gr
 uint32_t smem_ralloc_get_entity_id(smem_ralloc_t handle);
 
 /**
- * @brief Submit a device-scheduled RDMA WRITE job: the kernel posts `iters` one-sided writes of
- * `size` bytes from the local device slot (srcOffset) to the dstRank device slot (dstOffset)
- * and quiets the connection, all on the AICore. The launcher only enqueues the kernel on the
- * given stream and contains no host synchronization, so the whole job is NPU graph capturable.
- * The kernel library (libmf_smem_ralloc_device_rdma.so) is built at install time, the call
- * fails if it is missing.
+ * @brief Submit a device-scheduled one-sided copy between device window slots, the ralloc
+ * counterpart of <i>smem_ralloc_copy</i> for pools created with SMEMRA_DATA_OP_DEVICE_SCHEDULE |
+ * SMEMRA_DATA_OP_DEVICE_RDMA. The direction is derived from the addresses: src in the local
+ * slot and dest in a peer slot issues an AICore RDMA WRITE, src in a peer slot and dest in
+ * the local slot issues an AICore RDMA READ; any other combination is rejected (the host
+ * engine is not available on such pools, see the pool type selection). The launcher only
+ * enqueues the kernel on the given stream and contains no host synchronization, so the whole
+ * job (one-sided copy + connection quiet) is NPU graph capturable. The kernel library
+ * (libmf_smem_ralloc_device_rdma.so) is built at install time, the call fails if it is
+ * missing. Completion is observed by synchronizing the stream (or replaying the graph).
  *
  * @param handle           [in] ralloc object handle created by <i>smem_ralloc_create</i> with
  *                            SMEMRA_DATA_OP_DEVICE_SCHEDULE | SMEMRA_DATA_OP_DEVICE_RDMA
- * @param dstRank          [in] destination rank of the pool
- * @param srcOffset        [in] offset inside the local device slot
- * @param dstOffset        [in] offset inside the dstRank device slot
- * @param size             [in] bytes to write per iteration
- * @param iters            [in] write iterations per submission
+ * @param src              [in] source address, must fall into a committed device window slot
+ * @param dest             [in] destination address, must fall into a committed device window slot
+ * @param size             [in] bytes to copy
  * @param stream           [in] aclrt stream, null uses the default stream
  * @return 0 if successful
  */
-int32_t smem_ralloc_device_write_run_submit(smem_ralloc_t handle, uint32_t dstRank, uint64_t srcOffset,
-                                            uint64_t dstOffset, uint64_t size, uint32_t iters, void *stream);
+int32_t smem_ralloc_device_copy(smem_ralloc_t handle, const void *src, void *dest, uint64_t size, void *stream);
 
 /**
- * @brief Submit a device-scheduled RDMA READ job: the kernel issues one one-sided READ of
- * `size` bytes from the srcRank device slot (srcOffset) into the local device slot (dstOffset)
- * and quiets the connection, all on the AICore. Same graph-capture properties as
- * <i>smem_ralloc_device_write_run_submit</i>. Typically used to verify data written by the
- * WRITE job without any host-side copy engine.
+ * @brief Submit a device-scheduled batch of one-sided copies, the ralloc counterpart of
+ * <i>smem_ralloc_copy_batch</i> for device-scheduled pools. Same address semantics and
+ * graph-capture properties as <i>smem_ralloc_device_copy</i>, applied per segment: the
+ * direction of every segment is derived from its own addresses and mixed WRITE/READ
+ * segments are allowed within one batch. All segments are prechecked before anything is
+ * enqueued; they are then driven by at most SMEM_RALLOC_DEVICE_COPY_BATCH_SEG_MAX segments
+ * per kernel launch (see smem_ralloc_device_launch_def.h), each launch quiets every peer it
+ * touched exactly once.
  *
  * @param handle           [in] ralloc object handle created by <i>smem_ralloc_create</i> with
  *                            SMEMRA_DATA_OP_DEVICE_SCHEDULE | SMEMRA_DATA_OP_DEVICE_RDMA
- * @param srcRank          [in] source rank of the pool
- * @param srcOffset        [in] offset inside the srcRank device slot
- * @param dstOffset        [in] offset inside the local device slot
- * @param size             [in] bytes to read
+ * @param params           [in] batch description, same layout as <i>smem_ralloc_copy_batch</i>
  * @param stream           [in] aclrt stream, null uses the default stream
  * @return 0 if successful
  */
-int32_t smem_ralloc_device_read_run_submit(smem_ralloc_t handle, uint32_t srcRank, uint64_t srcOffset,
-                                           uint64_t dstOffset, uint64_t size, void *stream);
+int32_t smem_ralloc_device_copy_batch(smem_ralloc_t handle, smem_ralloc_batch_copy_params_t *params, void *stream);
 
 #ifdef __cplusplus
 }
