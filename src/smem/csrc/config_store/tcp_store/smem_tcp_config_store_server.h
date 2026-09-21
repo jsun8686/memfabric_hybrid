@@ -154,7 +154,7 @@ private:
     std::atomic<bool> shouldStop_{false};
     std::thread cleanupThread_;
     std::unordered_set<uint32_t> aliveRankFromBackend_;
-    std::unordered_map<uint32_t, StoreWaitContext> rankStateWaiters_;
+    std::unordered_map<uint32_t, std::vector<StoreWaitContext>> rankStateWaiters_;
     std::unordered_map<std::string, std::unordered_map<uint32_t, StoreWaitContext>> watchWaiters_;
     std::unordered_map<uint32_t, std::vector<std::string>> linkWatchList_;
     std::queue<uint32_t> rankStateTaskQueue_;

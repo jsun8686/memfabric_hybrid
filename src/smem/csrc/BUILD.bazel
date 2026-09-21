@@ -32,8 +32,8 @@ COMMON_COPTS = GLOBAL_COPTS + [] # DIGEST:cb4e3d52a21c46096b487afa0d3bd01f
 
 cc_library(
     name = "smem_src_headers",
-    hdrs = glob(["common/*.h", "net/*.h","smem_bm/*.h", "smem_shm/*.h", "smem_trans/*.h"]),
-    includes = [".", "common", "net", "smem_bm", "smem_shm", "smem_trans"],
+    hdrs = glob(["common/*.h", "net/*.h","smem_bm/*.h", "smem_shm/*.h", "smem_trans/*.h", "smem_ralloc/*.h"]),
+    includes = [".", "common", "net", "smem_bm", "smem_shm", "smem_trans", "smem_ralloc"],
     visibility = ["//visibility:public"],
 )
 
@@ -44,6 +44,7 @@ SMEM_SRCS = glob([
     "smem_bm/*.cpp",
     "smem_shm/*.cpp",
     "smem_trans/*.cpp",
+    "smem_ralloc/*.cpp",
 ])
 
 cc_library (

@@ -204,7 +204,11 @@ StorePtr StoreFactory::CreateStoreByUrl(const std::string &storeUrl, bool isServ
         return nullptr;
     }
     if (backend->IsDistributed()) {
-        return CreateHaStore(backend, storeKey, parsedStoreUrl.backendUrl, worldSize, parsedStoreUrl.instanceId);
+        /* fixed-rank deployments (autoRanking off) forward rankId so the delegate registers
+         * its rank on connect (server-side liveness / WATCH_RANK_LINK_DOWN); the isServer
+         * intent is dropped by definition -- the HA election decides the server host */
+        return CreateHaStore(backend, storeKey, parsedStoreUrl.backendUrl, worldSize, parsedStoreUrl.instanceId,
+                             rankId);
     }
     auto store = SmMakeRef<TcpConfigStore>(backend, ip, port, isServer, skipRecover, worldSize, rankId);
     STORE_ASSERT_RETURN(store != nullptr, nullptr);
@@ -230,11 +234,11 @@ StorePtr StoreFactory::CreateStoreByUrl(const std::string &storeUrl, bool isServ
 }
 
 StorePtr StoreFactory::CreateHaStore(const StoreBackendPtr &backend, const std::string &storeKey,
-                                     const std::string &storeUrl, uint32_t worldSize,
-                                     const std::string &instanceId) noexcept
+                                     const std::string &storeUrl, uint32_t worldSize, const std::string &instanceId,
+                                     int32_t rankId) noexcept
 {
     STORE_ASSERT_RETURN(backend != nullptr, nullptr);
-    auto clientDelegate = SmMakeRef<TcpConfigStore>(backend, "", 0, false, true, worldSize);
+    auto clientDelegate = SmMakeRef<TcpConfigStore>(backend, "", 0, false, true, worldSize, rankId);
     STORE_ASSERT_RETURN(clientDelegate != nullptr, nullptr);
     const auto store = SmMakeRef<HaConfigStore>(backend, clientDelegate, storeUrl, worldSize, instanceId);
     STORE_ASSERT_RETURN(store != nullptr, nullptr);

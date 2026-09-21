@@ -149,6 +149,19 @@ public:
         baseStore_->RegisterServerBrokenHandler(handler);
     }
 
+    void RegisterLeaderPromotionHandler(const ConfigStoreLeaderPromotionHandler &handler) noexcept override
+    {
+        if (baseStore_ == nullptr) {
+            return;
+        }
+        baseStore_->RegisterLeaderPromotionHandler(handler);
+    }
+
+    bool IsLeaderStore() const noexcept override
+    {
+        return baseStore_ != nullptr && baseStore_->IsLeaderStore();
+    }
+
     void SetRankId(const int32_t &rankId) noexcept override;
 
 protected:

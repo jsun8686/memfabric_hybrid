@@ -434,6 +434,20 @@ void HybmVaManager::DumpAllocatedGvaInfo() const
     }
 }
 
+std::vector<AllocatedGvaInfo> HybmVaManager::QueryAllocRanges(uint64_t gvaBegin, uint64_t gvaEnd) const
+{
+    std::vector<AllocatedGvaInfo> ranges;
+    if (gvaBegin >= gvaEnd) {
+        return ranges;
+    }
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    for (auto it = allocatedMap_[HVM_GVA].lower_bound(gvaBegin);
+         it != allocatedMap_[HVM_GVA].end() && it->first < gvaEnd; ++it) {
+        ranges.push_back(it->second);
+    }
+    return ranges;
+}
+
 std::pair<bool, AllocatedGvaInfo> HybmVaManager::CheckOverlap(const uint64_t va, const uint64_t size, uint32_t type)
 {
     const uint64_t end = va + size;

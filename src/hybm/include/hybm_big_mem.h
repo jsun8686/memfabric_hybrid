@@ -96,6 +96,21 @@ int32_t hybm_free_local_memory(hybm_entity_t e, hybm_mem_slice_t slice, uint32_t
 void* hybm_get_slice_va(hybm_entity_t e, hybm_mem_slice_t slice);
 
 /**
+ * @brief Query allocated va ranges within [gvaBegin, gvaEnd), ranges of all entities of this
+ * process are visible, sorted by gva ascending. Ranges contributed by remote ranks are visible
+ * after the local side has imported them.
+ *
+ * @param e                [in] entity created by hybm_create_entity
+ * @param gvaBegin         [in] begin address of the query window, inclusive
+ * @param gvaEnd           [in] end address of the query window, exclusive
+ * @param ranges           [out] output array of allocated ranges, can be null if only count needed
+ * @param inOutCount       [in/out] array capacity as input, needed count as output
+ * @return 0 if successful, BM_BUFFER_TOO_SMALL if capacity is insufficient (needed count is written back)
+ */
+int32_t hybm_query_alloc_ranges(hybm_entity_t e, uint64_t gvaBegin, uint64_t gvaEnd,
+                                hybm_va_range ranges[], uint32_t *inOutCount);
+
+/**
  * @brief Register memory at local side, registered memory can be accessed by remote.
  * @param e                [in] entity created by hybm_create_entity
  * @param ptr              [in] local memory start address

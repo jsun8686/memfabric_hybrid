@@ -570,6 +570,9 @@ void JoinableRanksQpManager::RemoveRanksProcess(const std::set<uint32_t> &ranks)
     }
 
     for (auto it = removedConnections.begin(); it != removedConnections.end(); ++it) {
+        if (it->second.socketHandle == nullptr && it->second.socketFd == nullptr) {
+            continue;
+        }
         BM_LOG_INFO("close connection from " << rankId_ << " to " << it->first);
         if (it->second.qpHandle != nullptr) {
             WriteGuard guard(qpLock_);

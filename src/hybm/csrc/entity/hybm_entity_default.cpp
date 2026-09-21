@@ -105,6 +105,9 @@ int32_t MemEntityDefault::Initialize(const hybm_options *options) noexcept
         options_.dramShmFd = -1;
     }
 
+    // init thread acl device: RPC worker threads may never have set the device (e.g. re-arm
+    // after reap lands on a fresh worker thread); all subsequent ACL calls need it.
+    BM_ASSERT_LOG_AND_RETURN(SetThreadAclDevice() == BM_OK, "Failed to set thread acl device.", BM_ERROR);
     // init tag info
     BM_ASSERT_LOG_AND_RETURN(InitTagManager() == BM_OK, "Failed to init tag manager.", BM_ERROR);
     // load dlopen lib

@@ -14,11 +14,13 @@ XPU_TYPE=${2:-NPU}
 BUILD_PYTHON=${3:-ON}
 BUILD_HCOM=${4:-OFF}
 BUILD_ETCD_BACKEND=${5:-OFF}
+HCOM_LOCAL_PATH=${6:-}
 echo "BUILD_TEST is ${BUILD_TEST}"
 echo "XPU_TYPE is ${XPU_TYPE}"
 echo "BUILD_PYTHON is ${BUILD_PYTHON}"
 echo "BUILD_HCOM is ${BUILD_HCOM}"
 echo "BUILD_ETCD_BACKEND is ${BUILD_ETCD_BACKEND}"
+echo "HCOM_LOCAL_PATH is ${HCOM_LOCAL_PATH}"
 set -e
 readonly BASH_PATH=$(dirname $(readlink -f "$0"))
 CURRENT_DIR=$(pwd)
@@ -60,9 +62,13 @@ mkdir -p ${PKG_DIR}/include/hcom
 
 # hcom
 if [ "${BUILD_HCOM}" == "ON" ]; then
-cp "${PROJECT_DIR}"/output/3rdparty/hcom/lib/libhcom.so ${PKG_DIR}/"${ARCH_OS}"/lib64
-cp -v "${PROJECT_DIR}"/build/_deps/hcom-src/dist/hcom_3rdparty/libboundscheck/lib/libboundscheck.so \
-       ${PKG_DIR}/"${ARCH_OS}"/lib64
+    LIBBOUNDSCHECK_SRC_DIR="${PROJECT_DIR}/build/_deps/hcom-src/dist/hcom_3rdparty/libboundscheck/lib"
+    if [ -n "${HCOM_LOCAL_PATH}" ]; then
+        LIBBOUNDSCHECK_SRC_DIR="${HCOM_LOCAL_PATH}/dist/hcom_3rdparty/libboundscheck/lib"
+    fi
+    cp "${PROJECT_DIR}"/output/3rdparty/hcom/lib/libhcom.so ${PKG_DIR}/"${ARCH_OS}"/lib64
+    cp -v "${LIBBOUNDSCHECK_SRC_DIR}"/libboundscheck.so \
+           ${PKG_DIR}/"${ARCH_OS}"/lib64
 fi
 # etcd
 if [ "${BUILD_ETCD_BACKEND}" == "ON" ]; then

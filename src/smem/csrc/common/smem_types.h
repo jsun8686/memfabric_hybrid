@@ -37,6 +37,7 @@ enum SMErrorCode : int32_t {
     SM_PARTIAL_FAILED = -2012,
     SM_INNER_BUSY = -2013,
     SM_NOT_CONNECTED = -2014,
+    SM_NOT_SUPPORTED = -2015,
 };
 
 constexpr int32_t N16 = 16;

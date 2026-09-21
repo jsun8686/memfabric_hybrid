@@ -219,6 +219,17 @@ Result HaConfigStore::TryBecomeLeader() noexcept
     }
     SM_LOG_INFO("Self-connection established");
 
+    // Notify leader promotion (callback contract: return quickly, offload heavy work)
+    ConfigStoreLeaderPromotionHandler promotionHandler = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(stateMutex_);
+        promotionHandler = leaderPromotionHandler_;
+    }
+    if (promotionHandler != nullptr) {
+        SM_LOG_INFO("Firing leader promotion handler after successful promotion");
+        promotionHandler();
+    }
+
     return SM_OK;
 }
 
@@ -688,6 +699,13 @@ void HaConfigStore::RegisterServerBrokenHandler(const ConfigStoreServerBrokenHan
         return;
     }
     serverDelegate_->RegisterBrokenLinkCHandler(handler);
+}
+
+void HaConfigStore::RegisterLeaderPromotionHandler(const ConfigStoreLeaderPromotionHandler &handler) noexcept
+{
+    std::lock_guard<std::mutex> lock(stateMutex_);
+    leaderPromotionHandler_ = handler;
+    SM_LOG_DEBUG("Leader promotion handler registered");
 }
 
 Result HaConfigStore::GetReal(const std::string &key, std::vector<uint8_t> &value, int64_t timeoutMs) noexcept

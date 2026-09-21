@@ -987,6 +987,7 @@ int32_t RdmaTransportManager::InitStreamNotifyBuf()
 
 int32_t RdmaTransportManager::Synchronize(void *qpHandle, uint32_t rankId)
 {
+    TP_TRACE_BEGIN(TP_HYBM_RDMA_SYNC_TOTAL);
     auto hStream = HybmStreamManager::GetThreadHybmStream(HybmGetInitedLogicDeviceId());
     BM_ASSERT_RETURN(hStream != nullptr, BM_ERROR);
     auto &remoteMr = notifyRemoteInfo_[rankId];
@@ -1027,7 +1028,10 @@ int32_t RdmaTransportManager::Synchronize(void *qpHandle, uint32_t rankId)
         return ret;
     }
 
+    TP_TRACE_BEGIN(TP_HYBM_RDMA_SYNC_NOTIFY_WAIT);
     ret = notify_->Wait();
+    TP_TRACE_END(TP_HYBM_RDMA_SYNC_NOTIFY_WAIT, ret);
+    TP_TRACE_END(TP_HYBM_RDMA_SYNC_TOTAL, ret);
     return ret;
 }
 
