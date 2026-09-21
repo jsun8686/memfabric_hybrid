@@ -15,6 +15,7 @@ CURRENT_DIR=$(pwd)
 
 BUILD_MODE="RELEASE"
 BUILD_PYTHON="ON"
+ENABLE_PTRACER="ON"
 XPU_TYPE="NPU"
 BUILD_TEST="OFF"
 BUILD_HCOM="OFF"
@@ -29,6 +30,7 @@ show_help() {
     echo "Options:"
     echo "  --build_mode <mode>         Set build mode (RELEASE/DEBUG/ASAN), default: RELEASE"
     echo "  --build_python <ON/OFF>     Enable/disable Python build, default: ON"
+    echo "  --enable_ptracer <ON/OFF>   Enable/disable ptracer (tp tracepoints), default: ON"
     echo "  --xpu_type <GPU/NPU/NONE>   Set xpu dependency(GPU:CUDA, NPU:CANN), set none without xpu, default: NPU"
     echo "  --build_test <ON/OFF>       Enable/disable build and package test utilities and examples, default: OFF"
     echo "  --build_hcom <ON/OFF>       Enable/disable build and package hcom, default: OFF"
@@ -52,6 +54,10 @@ while [[ "$#" -gt 0 ]]; do
             ;;
         --build_python)
             BUILD_PYTHON="$2"
+            shift 2
+            ;;
+        --enable_ptracer)
+            ENABLE_PTRACER="$2"
             shift 2
             ;;
         --xpu_type)
@@ -101,6 +107,7 @@ done
 
 echo "BUILD_MODE: $BUILD_MODE"
 echo "BUILD_PYTHON: $BUILD_PYTHON"
+echo "ENABLE_PTRACER: $ENABLE_PTRACER"
 echo "XPU_TYPE: $XPU_TYPE"
 echo "BUILD_TEST: $BUILD_TEST"
 echo "BUILD_HCOM: $BUILD_HCOM"
@@ -124,7 +131,7 @@ if [ "${BUILD_HCOM}" == "ON" ] && [ -n "${HCOM_LOCAL_PATH}" ]; then
     fi
 fi
 
-bash build.sh "${BUILD_MODE}" OFF OFF "${BUILD_PYTHON}" ON "${XPU_TYPE}" "${BUILD_TEST}" "${BUILD_HCOM}" "${BUILD_HCOM_WITH_RDMA}" "${BUILD_HCOM_WITH_UB}" "${BUILD_ETCD_BACKEND}" "${BUILD_TOOL}" "${HCOM_LOCAL_PATH}"
+bash build.sh "${BUILD_MODE}" OFF OFF "${BUILD_PYTHON}" "${ENABLE_PTRACER}" "${XPU_TYPE}" "${BUILD_TEST}" "${BUILD_HCOM}" "${BUILD_HCOM_WITH_RDMA}" "${BUILD_HCOM_WITH_UB}" "${BUILD_ETCD_BACKEND}" "${BUILD_TOOL}" "${HCOM_LOCAL_PATH}"
 
 bash run_pkg_maker/make_run.sh "${BUILD_TEST}" "${XPU_TYPE}" "${BUILD_PYTHON}" "${BUILD_HCOM}" "${BUILD_ETCD_BACKEND}" "${HCOM_LOCAL_PATH}"
 
