@@ -252,10 +252,10 @@ void RdmaTransportManager::SynthesizeSelfRankInfo(std::unordered_map<uint32_t, C
             keyUnion.deviceKey = it->second;
             uint64_t gva = HybmVaManager::GetInstance().TransformVa(keyUnion.deviceKey.address, HVM_HVA, HVM_GVA);
             keyUnion.deviceKey.address = (gva != 0) ? gva : keyUnion.deviceKey.address;
-            uint64_t dva = HybmVaManager::GetInstance().TransformVa(keyUnion.deviceKey.address, HVM_GVA, HVM_DVA);
-            if (dva != 0) {
-                keyUnion.deviceKey.address = dva;
-            }
+            /* keep the self entry in GVA semantics, same as the remote memKeys path: the device
+             * WQE/SGE addresses are derived as regAddress + (gva - addr), so mr.addr must be the
+             * GVA base -- overwriting it with the DVA here breaks the kernel-side range check on
+             * DRAM pools where DVA != GVA */
             keyUnion.deviceKey.notifyAddr = notifyInfo_.srcAddr;
             keyUnion.deviceKey.notifyRkey = notifyInfo_.srcRkey;
             selfInfo.memoryMap.emplace(keyUnion.deviceKey.address, keyUnion.deviceKey);
