@@ -685,24 +685,29 @@ static int32_t SmemRallocDeviceSegCheck(smem_ralloc_t handle, const void *src, c
     }
 
     auto checkRange = [entry](uint32_t rank, const void *addr, uint64_t len) -> int32_t {
-        auto memType = SMEM_RALLOC_MEM_TYPE_DEVICE;
-        auto base = entry->GetMemPtrByRank(rank, memType);
-        if (base == nullptr) {
-            memType = SMEM_RALLOC_MEM_TYPE_HOST;
-            base = entry->GetMemPtrByRank(rank, memType);
+        /* pick the window the address actually falls into: a rank may own both a DEVICE slot
+         * (e.g. a small hbm window carried for meta) and a HOST slot, and checking against the
+         * wrong one would misjudge a valid host-pool range as out of bounds */
+        auto p = static_cast<const uint8_t *>(addr);
+        bool hasSlot = false;
+        for (auto memType : {SMEM_RALLOC_MEM_TYPE_DEVICE, SMEM_RALLOC_MEM_TYPE_HOST}) {
+            auto base = entry->GetMemPtrByRank(rank, memType);
+            if (base == nullptr) {
+                continue;
+            }
+            hasSlot = true;
+            auto b = static_cast<const uint8_t *>(base);
+            if (p >= b && p + len <= b + entry->GetMemSizeByRank(rank, memType)) {
+                return SM_OK;
+            }
         }
-        if (base == nullptr) {
+        if (!hasSlot) {
             SM_LOG_AND_SET_LAST_ERROR_CODE(SM_ERROR, "pool slot of rank " << rank << " not ready");
             return SM_ERROR;
         }
-        auto offset = static_cast<uint64_t>(reinterpret_cast<const uint8_t *>(addr) -
-                                            static_cast<const uint8_t *>(base));
-        if (offset + len > entry->GetMemSizeByRank(rank, memType)) {
-            SM_LOG_AND_SET_LAST_ERROR_CODE(SM_INVALID_PARAM,
-                "copy range exceeds the committed slot of rank " << rank);
-            return SM_INVALID_PARAM;
-        }
-        return SM_OK;
+        SM_LOG_AND_SET_LAST_ERROR_CODE(SM_INVALID_PARAM,
+            "copy range falls outside the committed slot of rank " << rank);
+        return SM_INVALID_PARAM;
     };
     if (srcType != DevEndType::USER) {
         ret = checkRange(srcRank, src, size);
