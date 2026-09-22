@@ -345,6 +345,28 @@ SMEM_API int32_t smem_ralloc_wait(smem_ralloc_t handle)
     return entry->Wait();
 }
 
+/* defined below: submit the read-only dump kernel against the QP-table scratch and print
+ * whatever landed; bring-up diagnostics, safe to call at any point after extend */
+static void SmemRallocDumpQpInfo(const SmemRallocEntryPtr &entry, smem_ralloc_mem_type_t memType,
+                                 uint32_t peerRank);
+
+SMEM_API int32_t smem_ralloc_dump_qp_info(smem_ralloc_t handle, smem_ralloc_mem_type_t memType,
+                                          uint32_t peerRank)
+{
+    SM_VALIDATE_RETURN(handle != nullptr, "invalid param, handle is NULL", SM_INVALID_PARAM);
+    SM_VALIDATE_RETURN(g_smemRallocInited, "smem ralloc not initialized yet", SM_NOT_INITIALIZED);
+
+    SmemRallocEntryPtr entry = nullptr;
+    auto ret = SmemRallocEntryManager::Instance().GetEntryByPtr(reinterpret_cast<uintptr_t>(handle), entry);
+    if (ret != SM_OK || entry == nullptr) {
+        SM_LOG_AND_SET_LAST_ERROR("input handle is invalid, result: " << ret);
+        return SM_INVALID_PARAM;
+    }
+
+    SmemRallocDumpQpInfo(entry, memType, peerRank);
+    return SM_OK;
+}
+
 SMEM_API int32_t smem_ralloc_register_user_mem(smem_ralloc_t handle, uint64_t addr, uint64_t size)
 {
     SM_VALIDATE_RETURN(handle != nullptr, "invalid param, handle is NULL", SM_INVALID_PARAM);
@@ -417,7 +439,7 @@ static void SmemRallocDumpQpInfo(const SmemRallocEntryPtr &entry, smem_ralloc_me
         return; /* kernel library without the dump entry: skip silently */
     }
 
-    constexpr uint32_t dumpSlotCount = 42;               /* slots 0..41, see the device-header contract */
+    constexpr uint32_t dumpSlotCount = 50;               /* slots 0..49, see the device-header contract */
     constexpr uint32_t dumpBytes = dumpSlotCount * 8;
     constexpr uint64_t finalMagic = 0x46494E414C3132ULL; /* slot 41, written last by the kernel */
 

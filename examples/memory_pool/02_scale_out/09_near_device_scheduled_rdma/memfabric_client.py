@@ -92,6 +92,38 @@ def _check_u32_pattern(gva, words, seed):
     return bad
 
 
+def _dump_roundtrip_mismatch(pattern_gva, verify_gva, words, seed):
+    """bring-up diagnostics for a failed warmup round trip: shape of the verify region tells
+    which leg is broken -- all zeros: data never arrived; shifted: address translation off by
+    a constant; garbage: content corrupted; partial: short transfer"""
+    pv = (ctypes.c_uint32 * words).from_address(pattern_gva)
+    vv = (ctypes.c_uint32 * words).from_address(verify_gva)
+    nonzero = sum(1 for i in range(words) if vv[i] != 0)
+    bad = sum(1 for i in range(words) if vv[i] != pv[i])
+    _log(f"[diag] verify region: {nonzero}/{words} nonzero words, {bad}/{words} mismatched")
+    for i in list(range(4)) + [words // 2, words - 1]:
+        _log(f"[diag] word[{i:#x}] pattern=0x{pv[i]:08x} verify=0x{vv[i]:08x} "
+             f"expected=0x{_pattern(i, seed):08x}")
+    # constant-shift detector: does verify[i] equal pattern[i - k] for some small k?
+    for k in range(-8, 9):
+        if k == 0:
+            continue
+        hits = 0
+        samples = 0
+        for i in range(max(0, -k) if k < 0 else 0, min(words, words - k) if k < 0 else words):
+            if i + k < 0 or i + k >= words:
+                continue
+            samples += 1
+            if vv[i] == pv[i + k]:
+                hits += 1
+            if samples >= 256:
+                break
+        if samples and hits == samples:
+            _log(f"[diag] EXACT SHIFT DETECTED: verify[i] == pattern[i - ({k})] for all samples")
+            return
+    _log("[diag] no constant word-shift detected")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--store", required=True,
@@ -199,7 +231,11 @@ def main():
             assert handle.device_copy(far_gva, local_gva + size, size, stream_ptr) == 0, \
                 "warmup read failed"
         torch.npu.synchronize()
-        assert _check_u32_pattern(local_gva + size, words, seed) == 0, "warmup round-trip mismatch"
+        bad = _check_u32_pattern(local_gva + size, words, seed)
+        if bad != 0:
+            _dump_roundtrip_mismatch(local_gva, local_gva + size, words, seed)
+            handle.dump_qp_info(far_rank)  # raw CQEs carry the authoritative roce status
+        assert bad == 0, f"warmup round-trip mismatch: {bad}/{words} words"
         _log("[client] warmup round-trip OK (kernel library loaded, meta window reachable)")
 
         # capture the whole copy job into an NPU graph: one-sided WRITE + quiet

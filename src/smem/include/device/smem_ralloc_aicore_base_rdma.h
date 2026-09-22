@@ -557,6 +557,8 @@ SMEM_RALLOC_INLINE_AICORE uint32_t smem_ralloc_roce_quiet(uint32_t entityId, uin
  *        [30..34] mr[dest]: size/addr/lkey/rkey/regAddress
  *        [35..39] mr[local]: size/addr/lkey/rkey/regAddress
  *        [40] 0x52414E444D5031 DVA-store probe magic (written first, NOT a completion marker)
+ *        [42..45] raw CQE[0] of scq[dest]: word0..word3 ([8:15] of word0 = completion status)
+ *        [46..49] raw CQE[1] of scq[dest]: word0..word3
  *        [41] 0x46494E414C3132 final completion magic (written last, polled by the host)
  */
 SMEM_RALLOC_INLINE_AICORE void smem_ralloc_roce_qpinfo_dump(uint32_t entityId, uint32_t destRankId, uint32_t qpIdx,
@@ -640,6 +642,18 @@ SMEM_RALLOC_INLINE_AICORE void smem_ralloc_roce_qpinfo_dump(uint32_t entityId, u
     *(__gm__ uint64_t *)(out + 38 * 8) = localMemInfo->rkey;
     *(__gm__ uint64_t *)(out + 39 * 8) = localMemInfo->regAddress;
     smem_ralloc_cache_write_through(out + 30 * 8, 10 * 8);
+
+    /* stage 8: raw copy of the first two send-CQ entries (4 u32 words each) -- after a data
+     * mismatch the CQE carries the authoritative roce completion status ([8:15] of word0) */
+    *(__gm__ uint64_t *)(out + 42 * 8) = *(__gm__ uint32_t *)(cq->bufAddr);
+    *(__gm__ uint64_t *)(out + 43 * 8) = *(__gm__ uint32_t *)(cq->bufAddr + 4);
+    *(__gm__ uint64_t *)(out + 44 * 8) = *(__gm__ uint32_t *)(cq->bufAddr + 8);
+    *(__gm__ uint64_t *)(out + 45 * 8) = *(__gm__ uint32_t *)(cq->bufAddr + 12);
+    *(__gm__ uint64_t *)(out + 46 * 8) = *(__gm__ uint32_t *)(cq->bufAddr + cq->cqeSize);
+    *(__gm__ uint64_t *)(out + 47 * 8) = *(__gm__ uint32_t *)(cq->bufAddr + cq->cqeSize + 4);
+    *(__gm__ uint64_t *)(out + 48 * 8) = *(__gm__ uint32_t *)(cq->bufAddr + cq->cqeSize + 8);
+    *(__gm__ uint64_t *)(out + 49 * 8) = *(__gm__ uint32_t *)(cq->bufAddr + cq->cqeSize + 12);
+    smem_ralloc_cache_write_through(out + 42 * 8, 8 * 8);
 
     /* final completion marker -- distinct from the stage-1 DVA probe magic in slot 40 */
     *(__gm__ uint64_t *)(out + 41 * 8) = 0x46494E414C3132ULL; /* "FINAL12" */
