@@ -539,82 +539,109 @@ SMEM_RALLOC_INLINE_AICORE uint32_t smem_ralloc_roce_quiet(uint32_t entityId, uin
 }
 
 /**
- * @brief Debug helper: dump the full kernel-side QP context into a 320B device buffer (40 x u64)
- *        for bring-up. The host submits this before the first data copy and reads the buffer back
- *        through the host alias of the same slot; slot 39 carries a magic so the host can poll for
- *        completion. Layout contract (must stay in sync with SmemRallocDumpQpInfo in smem_ralloc.cpp):
- *        [0]qpInfoVa [1]globalRank [2]rankSize [3]qpNum [4]sqPtr [5]rqPtr [6]scqPtr [7]rcqPtr [8]memPtr
- *        [9..17] sq[dest] WQCtx: wqn/bufAddr/wqeSize/depth/headAddr/tailAddr/dbMode/dbAddr/sl
- *        [18] head value (after dcci) [19] tail value (after dcci)
- *        [20..27] scq[dest] CQCtx: cqn/bufAddr/cqeSize/depth/headAddr/tailAddr/dbMode/dbAddr
- *        [28] cq tail value (after dcci)
- *        [29..33] mr[dest]: size/addr/lkey/rkey/regAddress
- *        [34..38] mr[local]: size/addr/lkey/rkey/regAddress
- *        [39] magic 0x52414E444D5031
+ * @brief Debug helper: dump the kernel-side QP context into a 328B device buffer (41 x u64) as a
+ *        staged reachability probe. Each stage writes its slots and flushes them IMMEDIATELY, so
+ *        when the kernel faults midway the host still reads back every stage that completed --
+ *        the highest numbered non-zero slot marks exactly how far execution got. The host polls
+ *        slot 41 (final magic) for completion. Layout contract (must stay in sync with
+ *        SmemRallocDumpQpInfo in smem_ralloc.cpp):
+ *        [0] 0xBEEF00000001  DVA-store probe: the very first store of the kernel, no meta access
+ *        [1] qpInfoVa        meta-window read probe   [2] globalRank  [3] rankSize
+ *        [4] qpNum           [5] sqPtr [6] rqPtr [7] scqPtr [8] rcqPtr [9] memPtr (QP-table read)
+ *        [10..18] sq[dest] WQCtx: wqn/bufAddr/wqeSize/depth/headAddr/tailAddr/dbMode/dbAddr/sl
+ *        [19] head value (dcci + read of the hardware headAddr)  [20] tail value (same for tailAddr)
+ *        [21..28] scq[dest] CQCtx: cqn/bufAddr/cqeSize/depth/headAddr/tailAddr/dbMode/dbAddr
+ *        [29] cq tail value (dcci + read of the hardware cq tailAddr)
+ *        [30..34] mr[dest]: size/addr/lkey/rkey/regAddress
+ *        [35..39] mr[local]: size/addr/lkey/rkey/regAddress
+ *        [40] 0x52414E444D5031 DVA-store probe magic (written first, NOT a completion marker)
+ *        [41] 0x46494E414C3132 final completion magic (written last, polled by the host)
  */
 SMEM_RALLOC_INLINE_AICORE void smem_ralloc_roce_qpinfo_dump(uint32_t entityId, uint32_t destRankId, uint32_t qpIdx,
                                                             __gm__ uint8_t *out)
 {
-    __gm__ void *qpInfoVa = smem_ralloc_get_qp_info_address(entityId);
-    *(__gm__ uint64_t *)(out + 0) = (uint64_t)qpInfoVa;
-    *(__gm__ uint64_t *)(out + 8) = smem_ralloc_get_global_rank(entityId);
-    *(__gm__ uint64_t *)(out + 16) = smem_ralloc_get_global_rank_size(entityId);
-    __gm__ SmemRallocRdmaInfo *rdmaInfo = (__gm__ SmemRallocRdmaInfo *)qpInfoVa;
-    *(__gm__ uint64_t *)(out + 24) = rdmaInfo->qpNum;
-    *(__gm__ uint64_t *)(out + 32) = rdmaInfo->sqPtr;
-    *(__gm__ uint64_t *)(out + 40) = rdmaInfo->rqPtr;
-    *(__gm__ uint64_t *)(out + 48) = rdmaInfo->scqPtr;
-    *(__gm__ uint64_t *)(out + 56) = rdmaInfo->rcqPtr;
-    *(__gm__ uint64_t *)(out + 64) = rdmaInfo->memPtr;
+    /* stage 1: pure DVA-store probe -- proves the out buffer itself is writable by the AI core
+     * before touching the meta window or the QP table */
+    *(__gm__ uint64_t *)(out + 40 * 8) = 0x52414E444D5031ULL; /* "RANDMP1" DVA-store probe magic */
+    *(__gm__ uint64_t *)(out + 0) = 0xBEEF00000001ULL;
+    smem_ralloc_cache_write_through(out, 8);
+    smem_ralloc_cache_write_through(out + 40 * 8, 8);
 
+    /* stage 2: meta window read (0x17ffbe... region) -- the suspected unreachable mapping */
+    __gm__ void *qpInfoVa = smem_ralloc_get_qp_info_address(entityId);
+    *(__gm__ uint64_t *)(out + 1 * 8) = (uint64_t)qpInfoVa;
+    *(__gm__ uint64_t *)(out + 2 * 8) = smem_ralloc_get_global_rank(entityId);
+    *(__gm__ uint64_t *)(out + 3 * 8) = smem_ralloc_get_global_rank_size(entityId);
+    smem_ralloc_cache_write_through(out + 8, 3 * 8);
+
+    /* stage 3: QP table header (AclrtMalloc device heap) */
+    __gm__ SmemRallocRdmaInfo *rdmaInfo = (__gm__ SmemRallocRdmaInfo *)qpInfoVa;
+    *(__gm__ uint64_t *)(out + 4 * 8) = rdmaInfo->qpNum;
+    *(__gm__ uint64_t *)(out + 5 * 8) = rdmaInfo->sqPtr;
+    *(__gm__ uint64_t *)(out + 6 * 8) = rdmaInfo->rqPtr;
+    *(__gm__ uint64_t *)(out + 7 * 8) = rdmaInfo->scqPtr;
+    *(__gm__ uint64_t *)(out + 8 * 8) = rdmaInfo->rcqPtr;
+    *(__gm__ uint64_t *)(out + 9 * 8) = rdmaInfo->memPtr;
+    smem_ralloc_cache_write_through(out + 4 * 8, 6 * 8);
+
+    /* stage 4: WQ context */
     __gm__ SmemRallocWQCtx *wq = (__gm__ SmemRallocWQCtx *)(rdmaInfo->sqPtr +
                                                             (destRankId * rdmaInfo->qpNum + qpIdx) *
                                                                 sizeof(SmemRallocWQCtx));
-    *(__gm__ uint64_t *)(out + 9 * 8) = wq->wqn;
-    *(__gm__ uint64_t *)(out + 10 * 8) = wq->bufAddr;
-    *(__gm__ uint64_t *)(out + 11 * 8) = wq->wqeSize;
-    *(__gm__ uint64_t *)(out + 12 * 8) = wq->depth;
-    *(__gm__ uint64_t *)(out + 13 * 8) = wq->headAddr;
-    *(__gm__ uint64_t *)(out + 14 * 8) = wq->tailAddr;
-    *(__gm__ uint64_t *)(out + 15 * 8) = (uint64_t)wq->dbMode;
-    *(__gm__ uint64_t *)(out + 16 * 8) = wq->dbAddr;
-    *(__gm__ uint64_t *)(out + 17 * 8) = wq->sl;
-    smem_ralloc_cache_write_through((__gm__ uint8_t *)wq->headAddr, 8);
-    *(__gm__ uint64_t *)(out + 18 * 8) = *(__gm__ uint32_t *)(wq->headAddr);
-    smem_ralloc_cache_write_through((__gm__ uint8_t *)wq->tailAddr, 8);
-    *(__gm__ uint64_t *)(out + 19 * 8) = *(__gm__ uint32_t *)(wq->tailAddr);
+    *(__gm__ uint64_t *)(out + 10 * 8) = wq->wqn;
+    *(__gm__ uint64_t *)(out + 11 * 8) = wq->bufAddr;
+    *(__gm__ uint64_t *)(out + 12 * 8) = wq->wqeSize;
+    *(__gm__ uint64_t *)(out + 13 * 8) = wq->depth;
+    *(__gm__ uint64_t *)(out + 14 * 8) = wq->headAddr;
+    *(__gm__ uint64_t *)(out + 15 * 8) = wq->tailAddr;
+    *(__gm__ uint64_t *)(out + 16 * 8) = (uint64_t)wq->dbMode;
+    *(__gm__ uint64_t *)(out + 17 * 8) = wq->dbAddr;
+    *(__gm__ uint64_t *)(out + 18 * 8) = wq->sl;
+    smem_ralloc_cache_write_through(out + 10 * 8, 9 * 8);
 
+    /* stage 5: dereference the hardware head/tail shadow addresses (dcci + load) */
+    smem_ralloc_cache_write_through((__gm__ uint8_t *)wq->headAddr, 8);
+    *(__gm__ uint64_t *)(out + 19 * 8) = *(__gm__ uint32_t *)(wq->headAddr);
+    smem_ralloc_cache_write_through((__gm__ uint8_t *)wq->tailAddr, 8);
+    *(__gm__ uint64_t *)(out + 20 * 8) = *(__gm__ uint32_t *)(wq->tailAddr);
+    smem_ralloc_cache_write_through(out + 19 * 8, 2 * 8);
+
+    /* stage 6: CQ context + hardware cq tail */
     __gm__ SmemRallocCQCtx *cq = (__gm__ SmemRallocCQCtx *)(rdmaInfo->scqPtr +
                                                             (destRankId * rdmaInfo->qpNum + qpIdx) *
                                                                 sizeof(SmemRallocCQCtx));
-    *(__gm__ uint64_t *)(out + 20 * 8) = cq->cqn;
-    *(__gm__ uint64_t *)(out + 21 * 8) = cq->bufAddr;
-    *(__gm__ uint64_t *)(out + 22 * 8) = cq->cqeSize;
-    *(__gm__ uint64_t *)(out + 23 * 8) = cq->depth;
-    *(__gm__ uint64_t *)(out + 24 * 8) = cq->headAddr;
-    *(__gm__ uint64_t *)(out + 25 * 8) = cq->tailAddr;
-    *(__gm__ uint64_t *)(out + 26 * 8) = (uint64_t)cq->dbMode;
-    *(__gm__ uint64_t *)(out + 27 * 8) = cq->dbAddr;
+    *(__gm__ uint64_t *)(out + 21 * 8) = cq->cqn;
+    *(__gm__ uint64_t *)(out + 22 * 8) = cq->bufAddr;
+    *(__gm__ uint64_t *)(out + 23 * 8) = cq->cqeSize;
+    *(__gm__ uint64_t *)(out + 24 * 8) = cq->depth;
+    *(__gm__ uint64_t *)(out + 25 * 8) = cq->headAddr;
+    *(__gm__ uint64_t *)(out + 26 * 8) = cq->tailAddr;
+    *(__gm__ uint64_t *)(out + 27 * 8) = (uint64_t)cq->dbMode;
+    *(__gm__ uint64_t *)(out + 28 * 8) = cq->dbAddr;
     smem_ralloc_cache_write_through((__gm__ uint8_t *)cq->tailAddr, 8);
-    *(__gm__ uint64_t *)(out + 28 * 8) = *(__gm__ uint32_t *)(cq->tailAddr);
+    *(__gm__ uint64_t *)(out + 29 * 8) = *(__gm__ uint32_t *)(cq->tailAddr);
+    smem_ralloc_cache_write_through(out + 21 * 8, 9 * 8);
 
+    /* stage 7: MR table entries */
     __gm__ SmemRallocMemInfo *remoteMemInfo = (__gm__ SmemRallocMemInfo *)(rdmaInfo->memPtr +
                                                                            sizeof(SmemRallocMemInfo) * destRankId);
-    *(__gm__ uint64_t *)(out + 29 * 8) = remoteMemInfo->size;
-    *(__gm__ uint64_t *)(out + 30 * 8) = remoteMemInfo->addr;
-    *(__gm__ uint64_t *)(out + 31 * 8) = remoteMemInfo->lkey;
-    *(__gm__ uint64_t *)(out + 32 * 8) = remoteMemInfo->rkey;
-    *(__gm__ uint64_t *)(out + 33 * 8) = remoteMemInfo->regAddress;
+    *(__gm__ uint64_t *)(out + 30 * 8) = remoteMemInfo->size;
+    *(__gm__ uint64_t *)(out + 31 * 8) = remoteMemInfo->addr;
+    *(__gm__ uint64_t *)(out + 32 * 8) = remoteMemInfo->lkey;
+    *(__gm__ uint64_t *)(out + 33 * 8) = remoteMemInfo->rkey;
+    *(__gm__ uint64_t *)(out + 34 * 8) = remoteMemInfo->regAddress;
     __gm__ SmemRallocMemInfo *localMemInfo = (__gm__ SmemRallocMemInfo *)(
         rdmaInfo->memPtr + sizeof(SmemRallocMemInfo) * smem_ralloc_get_global_rank(entityId));
-    *(__gm__ uint64_t *)(out + 34 * 8) = localMemInfo->size;
-    *(__gm__ uint64_t *)(out + 35 * 8) = localMemInfo->addr;
-    *(__gm__ uint64_t *)(out + 36 * 8) = localMemInfo->lkey;
-    *(__gm__ uint64_t *)(out + 37 * 8) = localMemInfo->rkey;
-    *(__gm__ uint64_t *)(out + 38 * 8) = localMemInfo->regAddress;
+    *(__gm__ uint64_t *)(out + 35 * 8) = localMemInfo->size;
+    *(__gm__ uint64_t *)(out + 36 * 8) = localMemInfo->addr;
+    *(__gm__ uint64_t *)(out + 37 * 8) = localMemInfo->lkey;
+    *(__gm__ uint64_t *)(out + 38 * 8) = localMemInfo->rkey;
+    *(__gm__ uint64_t *)(out + 39 * 8) = localMemInfo->regAddress;
+    smem_ralloc_cache_write_through(out + 30 * 8, 10 * 8);
 
-    *(__gm__ uint64_t *)(out + 39 * 8) = 0x52414E444D5031ULL; /* "RANDMP1" completion magic */
-    smem_ralloc_cache_write_through(out, 40 * 8);
+    /* final completion marker -- distinct from the stage-1 DVA probe magic in slot 40 */
+    *(__gm__ uint64_t *)(out + 41 * 8) = 0x46494E414C3132ULL; /* "FINAL12" */
+    smem_ralloc_cache_write_through(out + 41 * 8, 8);
 }
 
 #endif /* __MEMFABRIC_SMEM_RALLOC_AI_CORE_BASE_RDMA_H__ */

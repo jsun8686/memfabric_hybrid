@@ -397,11 +397,11 @@ SMEM_API int32_t smem_ralloc_extend_local_mem(smem_ralloc_t handle, smem_ralloc_
 }
 
 /* bring-up helper: run the device-side QP context dump kernel into the tail 4K of the local slot
- * and read it back through the host alias. The kernel writes through the device alias (dva) of the
- * slot while the host polls the completion magic (slot 39) through the host alias (hva) of the same
- * bytes -- DRAM slots are linearly mapped in both spaces so the offsets coincide. Best-effort:
- * failures are logged and never propagate to the caller. Slot layout: see the contract comment on
- * smem_ralloc_roce_qpinfo_dump in smem_ralloc_aicore_base_rdma.h. */
+ * and read it back through the host alias. The kernel is a staged reachability probe (see the slot
+ * contract on smem_ralloc_roce_qpinfo_dump): slot 40 is a DVA-store probe magic written first,
+ * slot 41 is the final completion magic. On timeout every landed slot is still printed -- the
+ * highest non-zero stage marks exactly where the kernel died. Best-effort: failures are logged
+ * and never propagate to the caller. */
 static void SmemRallocDumpQpInfo(const SmemRallocEntryPtr &entry, smem_ralloc_mem_type_t memType, uint32_t peerRank)
 {
     /* the lazy library load normally first happens inside device_copy's seg check, which runs
@@ -423,7 +423,8 @@ static void SmemRallocDumpQpInfo(const SmemRallocEntryPtr &entry, smem_ralloc_me
     }
 
     constexpr uint64_t dumpRegion = 4096;
-    constexpr uint64_t dumpMagic = 0x52414E444D5031ULL;
+    constexpr uint64_t dumpSlotCount = 42;                /* slots 0..41, see the device-header contract */
+    constexpr uint64_t finalMagic = 0x46494E414C3132ULL;  /* slot 41, written last by the kernel */
     uint8_t *out = slot + slotSize - dumpRegion;
     memset(out, 0, dumpRegion);
 
@@ -436,24 +437,23 @@ static void SmemRallocDumpQpInfo(const SmemRallocEntryPtr &entry, smem_ralloc_me
 
     submit(entry->GetEntityId(), peerRank, reinterpret_cast<void *>(outDva), nullptr);
 
-    volatile uint64_t *magic = reinterpret_cast<volatile uint64_t *>(out + 39 * 8);
+    volatile uint64_t *slots = reinterpret_cast<volatile uint64_t *>(out);
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-    while (*magic != dumpMagic) {
+    while (slots[41] != finalMagic) {
         if (std::chrono::steady_clock::now() > deadline) {
-            SM_LOG_ERROR("qpinfo dump timeout: dump kernel did not complete in 5s"
-                         " (kernel fault? check plog / near log for the fault kernel name)");
-            return;
+            break;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
 
-    auto *slots = reinterpret_cast<volatile uint64_t *>(out);
+    bool complete = slots[41] == finalMagic;
     std::ostringstream oss;
     oss << std::hex;
-    for (uint32_t i = 0; i < 40; i++) {
+    for (uint32_t i = 0; i < dumpSlotCount; i++) {
         oss << " [" << i << "]0x" << slots[i];
     }
-    SM_LOG_ERROR("qpinfo dump (entity: " << entry->GetEntityId() << " peer: " << peerRank << "):" << oss.str());
+    SM_LOG_ERROR("qpinfo dump " << (complete ? "OK" : "TIMEOUT (partial slots, stage reached see [0]/[40] probes)")
+                 << " (entity: " << entry->GetEntityId() << " peer: " << peerRank << "):" << oss.str());
 }
 
 SMEM_API int32_t smem_ralloc_extend_remote_mem(smem_ralloc_t handle, smem_ralloc_mem_type_t memType, uint64_t size,
