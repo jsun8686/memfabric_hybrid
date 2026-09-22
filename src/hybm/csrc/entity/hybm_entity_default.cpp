@@ -706,7 +706,7 @@ int32_t MemEntityDefault::QueryMemoryKey(uint64_t addr, uint64_t &mrAddr, uint64
 
     /* TransportMemoryKey is a raw key blob whose first sizeof(RegMemResult) bytes carry the
      * device-rdma key fields (device segment occupies the low keys, see ComposeTransportManager) */
-    transport::RegMemKeyUnion keyUnion{};
+    transport::device::RegMemKeyUnion keyUnion{};
     keyUnion.commonKey = key;
     mrAddr = keyUnion.deviceKey.address;
     size = keyUnion.deviceKey.size;
