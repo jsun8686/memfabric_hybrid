@@ -63,6 +63,11 @@ int FixedRanksQpManager::Startup(void *rdma) noexcept
     }
 
     rdmaHandle_ = rdma;
+    /* Startup may run on a group-callback thread that has never bound a device context
+     * (ralloc dynamic join -> ImportEntityExchangeInfo -> Prepare). ReserveQpInfoSpace
+     * calls AclrtMalloc, which is thread-context bound; bind this thread first, same
+     * as the connect worker threads in StartServerSide/StartClientSide. */
+    DlAclApi::AclrtSetDevice(deviceId_);
     if (!ReserveQpInfoSpace()) {
         BM_LOG_ERROR("reserve qp info space failed.");
         return BM_ERROR;
