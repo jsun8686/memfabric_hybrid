@@ -90,7 +90,12 @@ SMEM_API int32_t smem_ralloc_init(const char *storeURL, uint32_t worldSize, uint
         return SM_ERROR;
     }
 
-    ret = hybm_init(deviceId, config->flags);
+    /* same as smem_shm: the fixed meta window (per-entity rank/qp/context records) is a
+     * process-level infrastructure built inside hybm_init; ralloc needs it too because
+     * device-scheduled pools (AI_CORE_INITIATE) publish their context there, and without
+     * the flag hybm_init skips the window and any meta write would fault */
+    uint64_t hybmInitFlags = static_cast<uint64_t>(config->flags) | HYBM_FLAG_INIT_SHMEM_META;
+    ret = hybm_init(deviceId, hybmInitFlags);
     if (ret != 0) {
         SM_LOG_AND_SET_LAST_ERROR("init hybm failed, result: " << ret << ", flags: 0x" << std::hex << config->flags);
         SmemRallocEntryManager::Instance().Destroy();
