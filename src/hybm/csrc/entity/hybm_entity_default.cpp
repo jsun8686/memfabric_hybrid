@@ -606,6 +606,16 @@ int32_t MemEntityDefault::ImportForTransportManager()
             BM_LOG_ERROR("Failed to prepare transport connect, ret: " << ret);
             return ret;
         }
+        /* the device meta record (qpInfoAddress etc.) may have been written before the QP table
+         * existed (e.g. AllocLocalMemory during extend_local); refresh it now that QPs are ready
+         * so kernels can locate the QP/MR table. Bind this thread first: this can run on a
+         * group callback thread that has never set a device context. */
+        DlAclApi::AclrtSetDevice(HybmGetInitDeviceId());
+        ret = UpdateHybmDeviceInfo(extraCtxSize_);
+        if (ret != BM_OK) {
+            BM_LOG_ERROR("Failed to refresh device meta after transport connect, ret: " << ret);
+            return ret;
+        }
     }
 
     BM_ASSERT_LOG_AND_RETURN(ret == BM_OK, "Failed to Connect transport: " << ret, ret);
@@ -993,6 +1003,7 @@ int MemEntityDefault::UpdateHybmDeviceInfo(uint32_t extCtxSize) noexcept
 
     SetHybmDeviceInfo(info);
     info.extraContextSize = extCtxSize;
+    extraCtxSize_ = extCtxSize;
     auto ret = DlAclApi::AclrtMemcpy((void *)addr, HYBM_LARGE_PAGE_SIZE, &info, sizeof(HybmDeviceMeta),
                                      ACL_MEMCPY_HOST_TO_DEVICE);
     if (ret != BM_OK) {

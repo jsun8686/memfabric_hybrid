@@ -73,7 +73,9 @@ int FixedRanksQpManager::Startup(void *rdma) noexcept
         return BM_ERROR;
     }
 
-    if (currentRanksInfo_.size() != rankCount_) {
+    /* dynamic groups (ralloc) may have fewer members than the world size: the qp table is sized
+     * by rankCount_ but only filled for the ranks present, so only reject an overflow here */
+    if (currentRanksInfo_.size() > rankCount_) {
         BM_LOG_ERROR("set rank count = " << currentRanksInfo_.size() << ", but rank_size = " << rankCount_);
         return BM_INVALID_PARAM;
     }

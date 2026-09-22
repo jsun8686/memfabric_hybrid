@@ -99,6 +99,7 @@ private:
     int CorrectHostRegWr(uint32_t rankId, uint64_t lAddr, uint64_t rAddr, uint64_t size, send_wr_v2 &wr);
     int ConvertHccpMrInfo(const TransportMemoryRegion &mr, HccpMrInfo &info);
     void OptionsToRankMRs(const HybmTransPrepareOptions &options);
+    void SynthesizeSelfRankInfo(std::unordered_map<uint32_t, ConnectRankInfo> &rankInfo);
     Result WaitQpReady();
     int GetRegAddress(const MemoryRegionMap &map, uint64_t inputAddr, uint64_t size, bool isLocal, uint64_t &outputAddr,
                       uint32_t &mrKey) const;

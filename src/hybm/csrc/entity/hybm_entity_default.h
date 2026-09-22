@@ -123,6 +123,7 @@ private:
     std::shared_ptr<MemSegment> dramSegment_{nullptr};
     std::shared_ptr<DataOperator> dataOperator_;
     bool transportPrepared_{false};
+    uint32_t extraCtxSize_{0}; /* last extra-context size, to re-publish device meta after QP setup */
     std::mutex importMutex_;
     transport::TransManagerPtr transportManager_;
     std::unordered_map<uint32_t, EntityExportInfo> importedRanks_;

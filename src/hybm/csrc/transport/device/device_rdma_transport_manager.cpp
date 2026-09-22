@@ -227,6 +227,43 @@ void RdmaTransportManager::UpdateMemoryKey(TransportMemoryKey &key, void *addr)
     }
 }
 
+/* ralloc dynamic groups import remote ranks incrementally and never import the local rank
+ * itself, but FixedRanksQpManager fills the device-side QP/MR table (qpInfo->mr[rankId]) from
+ * currentRanksInfo_, so the local entry must exist. Synthesize it from the locally registered
+ * MRs and our own nic when the caller did not provide it. */
+void RdmaTransportManager::SynthesizeSelfRankInfo(std::unordered_map<uint32_t, ConnectRankInfo> &rankInfo)
+{
+    if (rankInfo.find(rankId_) != rankInfo.end()) {
+        return;
+    }
+
+    sockaddr_in deviceNetwork{};
+    auto ret = ParseDeviceNic(nicInfo_, deviceNetwork);
+    if (ret != BM_OK) {
+        BM_LOG_ERROR("parse self nic(" << nicInfo_ << ") failed: " << ret);
+        return;
+    }
+
+    ConnectRankInfo selfInfo{role_, deviceNetwork, std::vector<TransportMemoryKey>{}};
+    {
+        ReadGuard lockGuard(lock_);
+        for (auto it = registerMRS_.begin(); it != registerMRS_.end(); ++it) {
+            RegMemKeyUnion keyUnion{};
+            keyUnion.deviceKey = it->second;
+            uint64_t gva = HybmVaManager::GetInstance().TransformVa(keyUnion.deviceKey.address, HVM_HVA, HVM_GVA);
+            keyUnion.deviceKey.address = (gva != 0) ? gva : keyUnion.deviceKey.address;
+            uint64_t dva = HybmVaManager::GetInstance().TransformVa(keyUnion.deviceKey.address, HVM_GVA, HVM_DVA);
+            if (dva != 0) {
+                keyUnion.deviceKey.address = dva;
+            }
+            keyUnion.deviceKey.notifyAddr = notifyInfo_.srcAddr;
+            keyUnion.deviceKey.notifyRkey = notifyInfo_.srcRkey;
+            selfInfo.memoryMap.emplace(keyUnion.deviceKey.address, keyUnion.deviceKey);
+        }
+    }
+    rankInfo.emplace(rankId_, std::move(selfInfo));
+}
+
 Result RdmaTransportManager::Prepare(const HybmTransPrepareOptions &options)
 {
     int ret;
@@ -246,6 +283,7 @@ Result RdmaTransportManager::Prepare(const HybmTransPrepareOptions &options)
         rankInfo.emplace(it->first, ConnectRankInfo{it->second.role, deviceNetwork, it->second.memKeys});
     }
 
+    SynthesizeSelfRankInfo(rankInfo);
     ret = qpManager_->SetRemoteRankInfo(rankInfo);
     if (ret != BM_OK) {
         BM_LOG_ERROR("qp manager set remote rank info failed: " << ret);
@@ -382,6 +420,7 @@ Result RdmaTransportManager::UpdateRankOptions(const HybmTransPrepareOptions &op
         ranksInfo.emplace(it->first, ConnectRankInfo{it->second.role, deviceNetwork, it->second.memKeys});
     }
 
+    SynthesizeSelfRankInfo(ranksInfo);
     auto ret = qpManager_->SetRemoteRankInfo(ranksInfo);
     if (ret != BM_OK) {
         BM_LOG_ERROR("update rank options failed: " << ret);
