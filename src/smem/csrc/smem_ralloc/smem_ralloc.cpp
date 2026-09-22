@@ -11,6 +11,7 @@
  */
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <limits>
 #include <thread>
 #include "smem_common_includes.h"
@@ -423,8 +424,9 @@ SMEM_API int32_t smem_ralloc_extend_local_mem(smem_ralloc_t handle, smem_ralloc_
  * mappings where the dcci is bus-NAKed). The kernel is a staged reachability probe: slot 40 is a
  * DVA-store probe magic written first, slot 41 is the final completion magic. The host cannot
  * alias device heap, so it polls by re-reading the region via AclrtMemcpy (hybm_read_qp_dump)
- * until the final magic lands or the deadline expires, then prints every landed slot in short
- * chunks (the logger truncates long single messages). Best-effort: never propagates failures. */
+ * until the final magic lands or the deadline expires, then prints every landed slot straight to
+ * stderr -- the externally registered log callback truncates long messages and garbles the
+ * remainder, so slot values must bypass the logger. Best-effort: never propagates failures. */
 static void SmemRallocDumpQpInfo(const SmemRallocEntryPtr &entry, smem_ralloc_mem_type_t memType, uint32_t peerRank)
 {
     (void)memType; /* the dump target lives in the QP table scratch, not in the pool slot */
@@ -466,16 +468,15 @@ static void SmemRallocDumpQpInfo(const SmemRallocEntryPtr &entry, smem_ralloc_me
     }
 
     bool complete = slots[41] == finalMagic;
-    for (uint32_t base = 0; base < dumpSlotCount; base += 7) {
-        std::ostringstream oss;
-        oss << std::hex;
-        for (uint32_t i = base; i < base + 7 && i < dumpSlotCount; i++) {
-            oss << " [" << i << "]0x" << slots[i];
-        }
-        SM_LOG_ERROR("qpinfo dump " << (complete ? "OK" : "TIMEOUT(partial)") << " entity: "
-                     << entry->GetEntityId() << " peer: " << peerRank << " slots " << base << ":"
-                     << oss.str());
+    for (uint32_t i = 0; i < dumpSlotCount; i++) {
+        fprintf(stderr, "qpinfo[%s] entity %u peer %u slot[%u] = 0x%016llx\n",
+                complete ? "OK" : "TIMEOUT", entry->GetEntityId(), peerRank, i,
+                static_cast<unsigned long long>(slots[i]));
     }
+    fflush(stderr);
+    SM_LOG_INFO("qpinfo dump " << (complete ? "OK" : "TIMEOUT(partial)") << " entity: "
+                 << entry->GetEntityId() << " peer: " << peerRank << ", " << dumpSlotCount
+                 << " slots printed on stderr");
 }
 
 SMEM_API int32_t smem_ralloc_extend_remote_mem(smem_ralloc_t handle, smem_ralloc_mem_type_t memType, uint64_t size,
