@@ -1025,6 +1025,32 @@ void MemEntityDefault::SetHybmDeviceInfo(HybmDeviceMeta &info)
     }
 }
 
+const void *MemEntityDefault::GetQpDumpAddress() const noexcept
+{
+    if (transportManager_ == nullptr) {
+        return nullptr;
+    }
+    return transportManager_->GetQpDumpAddress();
+}
+
+int32_t MemEntityDefault::ReadQpDumpRegion(void *hostBuf, uint32_t size) noexcept
+{
+    auto devAddr = GetQpDumpAddress();
+    if (devAddr == nullptr || hostBuf == nullptr || size == 0) {
+        return BM_ERROR;
+    }
+    /* may run on a group-callback thread without a bound device context, same as the meta
+     * refresh in ImportForTransportManager */
+    DlAclApi::AclrtSetDevice(HybmGetInitDeviceId());
+    auto ret = DlAclApi::AclrtMemcpy(hostBuf, size, const_cast<void *>(devAddr), size,
+                                     ACL_MEMCPY_DEVICE_TO_HOST);
+    if (ret != BM_OK) {
+        BM_LOG_ERROR("read qp dump region failed, ret: " << ret);
+        return BM_ERROR;
+    }
+    return BM_OK;
+}
+
 int32_t MemEntityDefault::ImportForTransportPrecheck(const ExchangeInfoReader desc[], uint32_t &count,
                                                      void *addresses[])
 {

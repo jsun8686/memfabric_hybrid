@@ -396,14 +396,16 @@ SMEM_API int32_t smem_ralloc_extend_local_mem(smem_ralloc_t handle, smem_ralloc_
     return entry->ExtendLocalMem(memType, size, info);
 }
 
-/* bring-up helper: run the device-side QP context dump kernel into the tail 4K of the local slot
- * and read it back through the host alias. The kernel is a staged reachability probe (see the slot
- * contract on smem_ralloc_roce_qpinfo_dump): slot 40 is a DVA-store probe magic written first,
- * slot 41 is the final completion magic. On timeout every landed slot is still printed -- the
- * highest non-zero stage marks exactly where the kernel died. Best-effort: failures are logged
- * and never propagate to the caller. */
+/* bring-up helper: run the device-side QP context dump kernel into the debug scratch appended
+ * after the QP table (device heap: AI-core store AND dcci are both legal there, unlike host-DRAM
+ * mappings where the dcci is bus-NAKed). The kernel is a staged reachability probe: slot 40 is a
+ * DVA-store probe magic written first, slot 41 is the final completion magic. The host cannot
+ * alias device heap, so it polls by re-reading the region via AclrtMemcpy (hybm_read_qp_dump)
+ * until the final magic lands or the deadline expires, then prints every landed slot in short
+ * chunks (the logger truncates long single messages). Best-effort: never propagates failures. */
 static void SmemRallocDumpQpInfo(const SmemRallocEntryPtr &entry, smem_ralloc_mem_type_t memType, uint32_t peerRank)
 {
+    (void)memType; /* the dump target lives in the QP table scratch, not in the pool slot */
     /* the lazy library load normally first happens inside device_copy's seg check, which runs
      * AFTER extend -- load explicitly here or the dump entry reads as nullptr and silently skips */
     if (!DlSmemRallocDeviceApi::TryLoadLibrary()) {
@@ -415,45 +417,43 @@ static void SmemRallocDumpQpInfo(const SmemRallocEntryPtr &entry, smem_ralloc_me
         return; /* kernel library without the dump entry: skip silently */
     }
 
-    uint32_t localRank = SmemRallocEntryManager::Instance().GetRankId();
-    uint8_t *slot = static_cast<uint8_t *>(entry->GetMemPtrByRank(localRank, memType));
-    uint64_t slotSize = entry->GetMemSizeByRank(localRank, memType);
-    if (slot == nullptr || slotSize < 8192) {
+    constexpr uint32_t dumpSlotCount = 42;               /* slots 0..41, see the device-header contract */
+    constexpr uint32_t dumpBytes = dumpSlotCount * 8;
+    constexpr uint64_t finalMagic = 0x46494E414C3132ULL; /* slot 41, written last by the kernel */
+
+    auto entity = entry->GetHybmEntity();
+    auto dumpDevAddr = hybm_get_qp_dump_address(entity);
+    if (dumpDevAddr == 0) {
+        SM_LOG_WARN("qpinfo dump skipped: transport has no qp dump region");
         return;
     }
 
-    constexpr uint64_t dumpRegion = 4096;
-    constexpr uint64_t dumpSlotCount = 42;                /* slots 0..41, see the device-header contract */
-    constexpr uint64_t finalMagic = 0x46494E414C3132ULL;  /* slot 41, written last by the kernel */
-    uint8_t *out = slot + slotSize - dumpRegion;
-    memset(out, 0, dumpRegion);
+    uint64_t slots[dumpSlotCount] = {0};
+    auto readBack = [&]() {
+        return hybm_read_qp_dump(entity, slots, dumpBytes) == 0 && slots[41] == finalMagic;
+    };
 
-    uint64_t outDva = 0;
-    if (hybm_gva_to_va(reinterpret_cast<uint64_t>(out), HYBM_MEM_TYPE_DEVICE, &outDva) != 0 || outDva == 0) {
-        SM_LOG_WARN("qpinfo dump skipped: gva to dva failed, gva: 0x" << std::hex
-                      << reinterpret_cast<uint64_t>(out));
-        return;
-    }
+    submit(entry->GetEntityId(), peerRank, reinterpret_cast<void *>(dumpDevAddr), nullptr);
 
-    submit(entry->GetEntityId(), peerRank, reinterpret_cast<void *>(outDva), nullptr);
-
-    volatile uint64_t *slots = reinterpret_cast<volatile uint64_t *>(out);
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-    while (slots[41] != finalMagic) {
+    while (!readBack()) {
         if (std::chrono::steady_clock::now() > deadline) {
             break;
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
 
     bool complete = slots[41] == finalMagic;
-    std::ostringstream oss;
-    oss << std::hex;
-    for (uint32_t i = 0; i < dumpSlotCount; i++) {
-        oss << " [" << i << "]0x" << slots[i];
+    for (uint32_t base = 0; base < dumpSlotCount; base += 7) {
+        std::ostringstream oss;
+        oss << std::hex;
+        for (uint32_t i = base; i < base + 7 && i < dumpSlotCount; i++) {
+            oss << " [" << i << "]0x" << slots[i];
+        }
+        SM_LOG_ERROR("qpinfo dump " << (complete ? "OK" : "TIMEOUT(partial)") << " entity: "
+                     << entry->GetEntityId() << " peer: " << peerRank << " slots " << base << ":"
+                     << oss.str());
     }
-    SM_LOG_ERROR("qpinfo dump " << (complete ? "OK" : "TIMEOUT (partial slots, stage reached see [0]/[40] probes)")
-                 << " (entity: " << entry->GetEntityId() << " peer: " << peerRank << "):" << oss.str());
 }
 
 SMEM_API int32_t smem_ralloc_extend_remote_mem(smem_ralloc_t handle, smem_ralloc_mem_type_t memType, uint64_t size,

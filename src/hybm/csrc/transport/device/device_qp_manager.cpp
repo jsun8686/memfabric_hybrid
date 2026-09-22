@@ -42,6 +42,11 @@ const void *DeviceQpManager::GetQpInfoAddress() const noexcept
     return nullptr;
 }
 
+const void *DeviceQpManager::GetQpDumpAddress() const noexcept
+{
+    return nullptr;
+}
+
 void *DeviceQpManager::CreateLocalSocket() noexcept
 {
     void *socketHandle = nullptr;

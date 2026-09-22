@@ -99,6 +99,10 @@ public:
 
     virtual const void *GetQpInfo() const;
 
+    /* device address of the QP dump scratch (null unless the transport owns a fixed-ranks QP
+     * table with the appended debug region); see FixedRanksQpManager::GetQpDumpAddress */
+    virtual const void *GetQpDumpAddress() const;
+
     /**
       * rdma单边传输
       */

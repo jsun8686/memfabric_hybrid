@@ -70,6 +70,7 @@ public:
     uint32_t GetRankId() const;
 
     uint32_t GetEntityId() const;
+    hybm_entity_t GetHybmEntity() const;
 
     uint32_t GetRankIdByGva(void *gva);
 
@@ -174,6 +175,11 @@ inline uint32_t SmemRallocEntry::GetRankId() const
 inline uint32_t SmemRallocEntry::GetEntityId() const
 {
     return (Id() << 1U) + 1U;
+}
+
+inline hybm_entity_t SmemRallocEntry::GetHybmEntity() const
+{
+    return entity_;
 }
 
 inline const hybm_options &SmemRallocEntry::GetCoreOptions() const

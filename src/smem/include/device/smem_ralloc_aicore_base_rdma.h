@@ -540,11 +540,13 @@ SMEM_RALLOC_INLINE_AICORE uint32_t smem_ralloc_roce_quiet(uint32_t entityId, uin
 
 /**
  * @brief Debug helper: dump the kernel-side QP context into a 328B device buffer (41 x u64) as a
- *        staged reachability probe. Each stage writes its slots and flushes them IMMEDIATELY, so
- *        when the kernel faults midway the host still reads back every stage that completed --
- *        the highest numbered non-zero slot marks exactly how far execution got. The host polls
- *        slot 41 (final magic) for completion. Layout contract (must stay in sync with
- *        SmemRallocDumpQpInfo in smem_ralloc.cpp):
+ *        staged reachability probe. The host passes the debug scratch appended after the QP
+ *        table (AclrtMalloc device heap -- stores AND dcci are both legal there) as `out`; each
+ *        stage writes its slots and flushes them IMMEDIATELY, so when the kernel faults midway
+ *        the host still reads back every stage that completed -- the highest numbered non-zero
+ *        slot marks exactly how far execution got. The host polls slot 41 (final magic) for
+ *        completion. Layout contract (must stay in sync with SmemRallocDumpQpInfo in
+ *        smem_ralloc.cpp):
  *        [0] 0xBEEF00000001  DVA-store probe: the very first store of the kernel, no meta access
  *        [1] qpInfoVa        meta-window read probe   [2] globalRank  [3] rankSize
  *        [4] qpNum           [5] sqPtr [6] rqPtr [7] scqPtr [8] rcqPtr [9] memPtr (QP-table read)
