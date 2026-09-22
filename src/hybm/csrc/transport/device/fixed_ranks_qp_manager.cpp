@@ -468,6 +468,9 @@ int FixedRanksQpManager::FillQpInfo() noexcept
         copyInfo->mr[it->first].addr = map.begin()->second.address;
         copyInfo->mr[it->first].lkey = map.begin()->second.lkey;
         copyInfo->mr[it->first].rkey = map.begin()->second.rkey;
+        /* device-dma base the MR was registered under (host-dram iova; equals address for hbm):
+         * the device-side WQE/SGE addresses must be translated into this range */
+        copyInfo->mr[it->first].regAddress = map.begin()->second.regAddress;
         if (it->first == rankId_) {
             continue;
         }

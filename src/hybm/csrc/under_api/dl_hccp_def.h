@@ -359,9 +359,10 @@ struct AiQpRMACQ {
 
 struct RdmaMemRegionInfo {
     uint64_t size{0}; // size of the memory region
-    uint64_t addr{0}; // start address of the memory region
+    uint64_t addr{0}; // start address of the memory region (GVA base)
     uint32_t lkey{0};
     uint32_t rkey{0}; // key of the memory region
+    uint64_t regAddress{0}; // device-dma base the MR was registered under (equals addr for hbm)
 };
 
 struct AiQpRMAQueueInfo {

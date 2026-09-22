@@ -119,9 +119,11 @@ struct SmemRallocCqeCtx {
 
 struct SmemRallocMemInfo { /* in sync with RdmaMemRegionInfo */
     uint64_t size;
-    uint64_t addr;
+    uint64_t addr;         /* GVA base of the pool block MR */
     uint32_t lkey;
     uint32_t rkey;
+    uint64_t regAddress;   /* device-dma base the MR was registered under; for host-dram pools
+                            * this differs from addr (HalHostRegister iova), for hbm it equals addr */
 };
 
 /* ---- user MR table (P1), in sync with ralloc publish side (smem_ralloc_entry.cpp PublishUserMrTable) ----
@@ -426,9 +428,14 @@ SMEM_RALLOC_INLINE_AICORE void smem_ralloc_rdma_post_send(uint32_t entityId, __g
     *(__gm__ uint32_t *)(wqeAddr + 12) = 1 << 24;  /* [120:127] num_sge = 1 */
     *(__gm__ uint32_t *)(wqeAddr + 16) = 0;        /* [128:151] start_sge_index = 0 */
     __gm__ SmemRallocMemInfo *remoteMemInfo = (__gm__ SmemRallocMemInfo *)(memInfoTable + sizeof(SmemRallocMemInfo) *
-                                                                                     destRankId);
+                                                                                      destRankId);
     *(__gm__ uint32_t *)(wqeAddr + 20) = remoteMemInfo->rkey;  /* remote key */
-    *(__gm__ uint64_t *)(wqeAddr + 24) = (uint64_t)remoteAddr; /* remote VA */
+    /* the rkey covers the device-dma range the remote MR was registered under: translate the
+     * pool GVA into that range (identity for hbm pools where regAddress == addr) */
+    uint64_t remoteRegAddr = (remoteMemInfo->regAddress != 0)
+                                 ? remoteMemInfo->regAddress + ((uint64_t)remoteAddr - remoteMemInfo->addr)
+                                 : (uint64_t)remoteAddr;
+    *(__gm__ uint64_t *)(wqeAddr + 24) = remoteRegAddr; /* remote VA */
 
     /* write SGE to HBM */
     __gm__ uint8_t *sgeAddr = wqeAddr + sizeof(SmemRallocWqeCtx);
@@ -446,7 +453,12 @@ SMEM_RALLOC_INLINE_AICORE void smem_ralloc_rdma_post_send(uint32_t entityId, __g
         }
     }
     *(__gm__ uint32_t *)(sgeAddr + 4) = localLkey; /* local key */
-    *(__gm__ uint64_t *)(sgeAddr + 8) = (uint64_t)localAddr;
+    /* same translation for the local sge address: the lkey covers the device-dma range this
+     * block was registered under, not the GVA range */
+    uint64_t localRegAddr = (localMemInfo->regAddress != 0)
+                                ? localMemInfo->regAddress + ((uint64_t)localAddr - localMemInfo->addr)
+                                : (uint64_t)localAddr;
+    *(__gm__ uint64_t *)(sgeAddr + 8) = localRegAddr;
 
     /* WQE & SGE cache flush */
     smem_ralloc_cache_write_through(wqeAddr, sizeof(SmemRallocWqeCtx) + sizeof(SmemRallocSegCtx));
