@@ -747,8 +747,10 @@ SMEM_API int32_t smem_ralloc_device_copy_batch(smem_ralloc_t handle, smem_ralloc
     std::vector<uint32_t> peers(params->batchSize);
     std::vector<bool> writes(params->batchSize);
     for (uint32_t i = 0; i < params->batchSize; i++) {
+        bool write = false; /* vector<bool> proxies cannot bind to the bool& out-param */
         auto ret = SmemRallocDeviceSegCheck(handle, params->sources[i], params->destinations[i],
-                                            params->dataSizes[i], entries[i], peers[i], writes[i]);
+                                            params->dataSizes[i], entries[i], peers[i], write);
+        writes[i] = write;
         if (ret != SM_OK) {
             return ret;
         }
