@@ -396,6 +396,60 @@ SMEM_API int32_t smem_ralloc_extend_local_mem(smem_ralloc_t handle, smem_ralloc_
     return entry->ExtendLocalMem(memType, size, info);
 }
 
+/* bring-up helper: run the device-side QP context dump kernel into the tail 4K of the local slot
+ * and read it back through the host alias. The kernel writes through the device alias (dva) of the
+ * slot while the host polls the completion magic (slot 39) through the host alias (hva) of the same
+ * bytes -- DRAM slots are linearly mapped in both spaces so the offsets coincide. Best-effort:
+ * failures are logged and never propagate to the caller. Slot layout: see the contract comment on
+ * smem_ralloc_roce_qpinfo_dump in smem_ralloc_aicore_base_rdma.h. */
+static void SmemRallocDumpQpInfo(const SmemRallocEntryPtr &entry, smem_ralloc_mem_type_t memType, uint32_t peerRank)
+{
+    auto submit = DlSmemRallocDeviceApi::GetDumpRunSubmit();
+    if (submit == nullptr) {
+        return; /* kernel library without the dump entry: skip silently */
+    }
+
+    uint32_t localRank = SmemRallocEntryManager::Instance().GetRankId();
+    uint8_t *slot = static_cast<uint8_t *>(entry->GetMemPtrByRank(localRank, memType));
+    uint64_t slotSize = entry->GetMemSizeByRank(localRank, memType);
+    if (slot == nullptr || slotSize < 8192) {
+        return;
+    }
+
+    constexpr uint64_t dumpRegion = 4096;
+    constexpr uint64_t dumpMagic = 0x52414E444D5031ULL;
+    uint8_t *out = slot + slotSize - dumpRegion;
+    memset(out, 0, dumpRegion);
+
+    uint64_t outDva = 0;
+    if (hybm_gva_to_va(reinterpret_cast<uint64_t>(out), HYBM_MEM_TYPE_DEVICE, &outDva) != 0 || outDva == 0) {
+        SM_LOG_WARN("qpinfo dump skipped: gva to dva failed, gva: 0x" << std::hex
+                      << reinterpret_cast<uint64_t>(out));
+        return;
+    }
+
+    submit(entry->GetEntityId(), peerRank, reinterpret_cast<void *>(outDva), nullptr);
+
+    volatile uint64_t *magic = reinterpret_cast<volatile uint64_t *>(out + 39 * 8);
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (*magic != dumpMagic) {
+        if (std::chrono::steady_clock::now() > deadline) {
+            SM_LOG_ERROR("qpinfo dump timeout: dump kernel did not complete in 5s"
+                         " (kernel fault? check plog / near log for the fault kernel name)");
+            return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+
+    auto *slots = reinterpret_cast<volatile uint64_t *>(out);
+    std::ostringstream oss;
+    oss << std::hex;
+    for (uint32_t i = 0; i < 40; i++) {
+        oss << " [" << i << "]0x" << slots[i];
+    }
+    SM_LOG_ERROR("qpinfo dump (entity: " << entry->GetEntityId() << " peer: " << peerRank << "):" << oss.str());
+}
+
 SMEM_API int32_t smem_ralloc_extend_remote_mem(smem_ralloc_t handle, smem_ralloc_mem_type_t memType, uint64_t size,
                                                smem_ralloc_mem_info_t *info)
 {
@@ -499,6 +553,7 @@ SMEM_API int32_t smem_ralloc_extend_remote_mem(smem_ralloc_t handle, smem_ralloc
             SM_LOG_INFO("remote block created, pool: " << entry->Id() << " ownerRank: " << allocMsg.ownerRank
                                                        << " gva: " << reinterpret_cast<void *>(allocMsg.gva)
                                                        << " size: " << size << " round: " << round);
+            SmemRallocDumpQpInfo(entry, memType, static_cast<uint32_t>(allocMsg.ownerRank));
             return SM_OK;
         }
 

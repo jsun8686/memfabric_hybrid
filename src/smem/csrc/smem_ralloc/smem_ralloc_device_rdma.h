@@ -35,6 +35,8 @@ using SmemRallocDeviceReadRunFunc = void (*)(uint32_t entityId, uint32_t srcRank
 
 using SmemRallocDeviceBatchRunFunc = void (*)(const struct smem_ralloc_device_batch_args *args, void *stream);
 
+using SmemRallocDeviceDumpRunFunc = void (*)(uint32_t entityId, uint32_t peerRank, void *out, void *stream);
+
 class DlSmemRallocDeviceApi {
 public:
     /* dlopen the kernel library lazily, thread safe, returns true when the submit entries are ready */
@@ -62,6 +64,11 @@ public:
         return pBatchRunSubmit;
     }
 
+    static SmemRallocDeviceDumpRunFunc GetDumpRunSubmit()
+    {
+        return pDumpRunSubmit;
+    }
+
 private:
     static bool gLoaded;
     static std::mutex gMutex;
@@ -69,6 +76,7 @@ private:
     static SmemRallocDeviceWriteRunFunc pWriteRunSubmit;
     static SmemRallocDeviceReadRunFunc pReadRunSubmit;
     static SmemRallocDeviceBatchRunFunc pBatchRunSubmit;
+    static SmemRallocDeviceDumpRunFunc pDumpRunSubmit;
 };
 
 } // namespace smem
