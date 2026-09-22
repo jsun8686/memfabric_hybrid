@@ -194,7 +194,7 @@ def main():
         side = torch.npu.Stream()
         side.wait_stream(torch.npu.current_stream())
         with torch.npu.stream(side):
-            stream_ptr = torch.npu.current_stream().cuda_stream
+            stream_ptr = torch.npu.current_stream().npu_stream
             assert handle.device_copy(local_gva, far_gva, size, stream_ptr) == 0, "warmup write failed"
             assert handle.device_copy(far_gva, local_gva + size, size, stream_ptr) == 0, \
                 "warmup read failed"
@@ -208,7 +208,7 @@ def main():
         with torch.npu.stream(side):
             graph.capture_begin()
             assert handle.device_copy(local_gva, far_gva, size,
-                                      torch.npu.current_stream().cuda_stream) == 0, \
+                                      torch.npu.current_stream().npu_stream) == 0, \
                 "captured copy submit failed"
             graph.capture_end()
         _log(f"[client] graph captured: 1 x {size} byte device-scheduled WRITE + quiet, "
