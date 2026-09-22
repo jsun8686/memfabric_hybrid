@@ -558,7 +558,7 @@ SMEM_RALLOC_INLINE_AICORE void smem_ralloc_roce_qpinfo_dump(uint32_t entityId, u
     __gm__ void *qpInfoVa = smem_ralloc_get_qp_info_address(entityId);
     *(__gm__ uint64_t *)(out + 0) = (uint64_t)qpInfoVa;
     *(__gm__ uint64_t *)(out + 8) = smem_ralloc_get_global_rank(entityId);
-    *(__gm__ uint64_t *)(out + 16) = smem_ralloc_get_rank_size(entityId);
+    *(__gm__ uint64_t *)(out + 16) = smem_ralloc_get_global_rank_size(entityId);
     __gm__ SmemRallocRdmaInfo *rdmaInfo = (__gm__ SmemRallocRdmaInfo *)qpInfoVa;
     *(__gm__ uint64_t *)(out + 24) = rdmaInfo->qpNum;
     *(__gm__ uint64_t *)(out + 32) = rdmaInfo->sqPtr;
