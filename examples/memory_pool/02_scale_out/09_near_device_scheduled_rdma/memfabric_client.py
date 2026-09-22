@@ -23,8 +23,8 @@ import memfabric_hybrid as mf
 from memfabric_hybrid import ralloc
 
 DEFAULT_WORLD = 512          # declared world capacity, actual members join dynamically
-NIC_PORT_BASE = 10005        # data-plane nic port base (set_nic); NOT the control rpc port
-RPC_PORT_BASE = 11100        # control rpc port = base + rankId (smem_ralloc_def.h default)
+NIC_PORT_BASE = 10010        # data-plane nic port base (set_nic); NOT the control rpc port
+RPC_PORT_BASE = 11105        # control rpc port = base + rankId (smem_ralloc_def.h default)
 DEFAULT_SIZE = "1M"          # bytes per one-sided copy
 DEFAULT_REPLAYS = 8          # graph replays after capture
 DEFAULT_BLOCK_SIZE = "64M"   # DRAM slot bytes committed on each side
@@ -94,7 +94,7 @@ def _check_u32_pattern(gva, words, seed):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--store", required=True,
-                        help="store url of the FAR daemon, e.g. tcp://10.0.0.1:8587")
+                        help="store url of the FAR daemon, e.g. tcp://10.0.0.1:8588")
     parser.add_argument("--dev", type=int, required=True,
                         help="NPU id this client runs on")
     parser.add_argument("--size", default=DEFAULT_SIZE,

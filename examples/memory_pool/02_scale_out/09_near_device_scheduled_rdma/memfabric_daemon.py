@@ -15,8 +15,8 @@ import memfabric_hybrid as mf
 from memfabric_hybrid import ralloc
 
 DEFAULT_WORLD = 512          # declared world capacity, actual members join dynamically
-NIC_PORT_BASE = 10005        # data-plane nic port base (set_nic); NOT the control rpc port
-RPC_PORT_BASE = 11100        # control rpc port = base + rankId (smem_ralloc_def.h default)
+NIC_PORT_BASE = 10010        # data-plane nic port base (set_nic); NOT the control rpc port
+RPC_PORT_BASE = 11105        # control rpc port = base + rankId (smem_ralloc_def.h default)
 READY_TIMEOUT_SEC = 180      # contributor init gate (ralloc init timeout defaults to 120s)
 JOIN_TIMEOUT_SEC = 90        # graceful stop gate before terminate()
 
@@ -82,7 +82,7 @@ def _collect_ready(ready_q, procs, devs, timeout_sec):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--store", required=True,
-                        help="store url, MUST point at THIS FAR node, e.g. tcp://10.0.0.1:8587")
+                        help="store url, MUST point at THIS FAR node, e.g. tcp://10.0.0.1:8588")
     parser.add_argument("--devs", required=True,
                         help="comma list of NPU ids to contribute, e.g. 0,1 (one child per card)")
     parser.add_argument("--world", type=int, default=DEFAULT_WORLD,
