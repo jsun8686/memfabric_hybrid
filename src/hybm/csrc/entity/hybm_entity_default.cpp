@@ -596,12 +596,10 @@ int32_t MemEntityDefault::ImportForTransportManager()
     if (transportPrepared_) {
         ret = transportManager_->UpdateRankOptions(prepareOptions);
     } else {
-        ret = transportManager_->Prepare(prepareOptions);
-        if (ret != BM_OK) {
-            BM_LOG_ERROR("Failed to prepare transport connect data, ret: " << ret);
-            return ret;
-        }
-        ret = transportManager_->Connect();
+        /* go through ConnectWithOptions so the base-class connected_ flag is set here; calling
+         * Prepare/Connect directly leaves it cleared and later slice imports (which also go
+         * through ConnectWithOptions) would re-Prepare an already started qp manager */
+        ret = transportManager_->ConnectWithOptions(prepareOptions);
         if (ret != BM_OK) {
             BM_LOG_ERROR("Failed to prepare transport connect, ret: " << ret);
             return ret;

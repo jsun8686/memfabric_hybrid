@@ -42,8 +42,18 @@ FixedRanksQpManager::~FixedRanksQpManager() noexcept
 int FixedRanksQpManager::SetRemoteRankInfo(const std::unordered_map<uint32_t, ConnectRankInfo> &ranks) noexcept
 {
     if (started_.load()) {
-        BM_LOG_ERROR("fixed ranks not support update ranks info after startup");
-        return BM_ERROR;
+        /* dynamic groups (ralloc) import slices/ranks incrementally after startup: merge the new
+         * entries (memKeys grow per slice) instead of rejecting, then refresh the device-side
+         * QP/MR table. Connections stay as-is; a rank not connected yet is filled by the connect
+         * worker's own FillQpInfo once its QP becomes ready, so a refresh failure is not fatal. */
+        for (auto it = ranks.begin(); it != ranks.end(); ++it) {
+            currentRanksInfo_[it->first] = it->second;
+        }
+        DlAclApi::AclrtSetDevice(deviceId_);
+        if (FillQpInfo() != BM_OK) {
+            BM_LOG_WARN("refresh qp info after rank update failed; deferred to connect worker");
+        }
+        return BM_OK;
     }
 
     currentRanksInfo_ = ranks;
