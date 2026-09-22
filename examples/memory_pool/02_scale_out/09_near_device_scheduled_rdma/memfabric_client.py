@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 # coding=utf-8
 # Copyright: (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
-"""Near-side device-scheduled RDMA under NPU graph capture.
+"""Near-side device-scheduled RDMA under NPU graph capture (08 + DEVICE_SCHEDULE).
 
-The pool is created with DEVICE_RDMA | DEVICE_SCHEDULE: the transport layer builds
-AI-core QPs and publishes the meta/QP/MR context into the fixed device meta window,
-so an AICore kernel (libmf_smem_ralloc_device_rdma.so, built at install time) drives
-the RDMA data plane by itself. The host-side launcher only enqueues the kernel,
-which makes the whole copy job (one-sided WRITE/READ + quiet) NPU-graph capturable:
-capture once, replay K times, zero host interaction per replay.
+Same topology and skeleton as 08_far_daemon_near_client, but the pool is created with
+DEVICE_RDMA | DEVICE_SCHEDULE on a DRAM window: the transport layer builds AI-core QPs
+and publishes the meta/QP/MR context into the fixed device meta window, so an AICore
+kernel (libmf_smem_ralloc_device_rdma.so, built at install time) drives the RDMA data
+plane by itself. The host-side device_copy only enqueues the kernel, which makes the
+copy job (one-sided WRITE/READ + quiet) NPU-graph capturable: capture once, replay K
+times, zero host interaction per replay.
 """
 
 import argparse
@@ -25,15 +26,15 @@ DEFAULT_WORLD = 512          # declared world capacity, actual members join dyna
 NIC_PORT_BASE = 10005        # data-plane nic port base (set_nic); NOT the control rpc port
 RPC_PORT_BASE = 11100        # control rpc port = base + rankId (smem_ralloc_def.h default)
 DEFAULT_SIZE = "1M"          # bytes per one-sided copy
-DEFAULT_REPLAYS = 8          # graph replays
-DEFAULT_BLOCK_SIZE = "32M"   # device slot bytes committed on each side
-DEFAULT_MAX_POOL_SIZE = "64M"
+DEFAULT_REPLAYS = 8          # graph replays after capture
+DEFAULT_BLOCK_SIZE = "64M"   # DRAM slot bytes committed on each side
+DEFAULT_MAX_POOL_SIZE = "4G" # pool DRAM window, must be GB aligned (VMM segment rule)
 EXTEND_RETRY_SEC = 5
 EXTEND_TIMEOUT_SEC = 300
 GIB = 1 << 30
 
 DATA_OP = ralloc.RallocDataOpType.DEVICE_RDMA | ralloc.RallocDataOpType.DEVICE_SCHEDULE
-MEM_TYPE = ralloc.RallocMemType.DEVICE
+MEM_TYPE = ralloc.RallocMemType.HOST
 
 
 _term_fd = None
@@ -101,11 +102,12 @@ def main():
     parser.add_argument("--replays", type=int, default=DEFAULT_REPLAYS,
                         help=f"graph replays after capture (default {DEFAULT_REPLAYS})")
     parser.add_argument("--block-size", default=DEFAULT_BLOCK_SIZE,
-                        help=f"device slot bytes committed on each side, must be >= 4 * size "
+                        help=f"DRAM slot bytes committed on each side, must be >= 2 * size: "
+                             f"slot layout is [pattern | verify] "
                              f"(K/M/G suffix, default {DEFAULT_BLOCK_SIZE})")
     parser.add_argument("--max-pool-size", default=DEFAULT_MAX_POOL_SIZE,
-                        help=f"pool HBM window declared to the FAR placement master "
-                             f"(K/M/G suffix, default {DEFAULT_MAX_POOL_SIZE})")
+                        help=f"pool DRAM window declared to the FAR placement master, must be GB "
+                             f"aligned (K/M/G suffix, default {DEFAULT_MAX_POOL_SIZE})")
     parser.add_argument("--world", type=int, default=DEFAULT_WORLD,
                         help=f"declared world capacity (default {DEFAULT_WORLD})")
     parser.add_argument("--rpc-port-base", type=int, default=RPC_PORT_BASE,
@@ -125,11 +127,13 @@ def main():
     size = _parse_size(args.size)
     block = _parse_size(args.block_size)
     max_pool = _parse_size(args.max_pool_size)
-    if 4 * size > block:
-        raise RuntimeError(f"--block-size ({block}) must be >= 4 * size ({4 * size}): "
-                           f"slot layout is [src | src2 | verify | verify2]")
+    if 2 * size > block:
+        raise RuntimeError(f"--block-size ({block}) must be >= 2 * size ({2 * size}): "
+                           f"slot layout is [pattern | verify]")
     if block > max_pool:
         raise RuntimeError(f"--block-size ({block}) exceeds --max-pool-size ({max_pool})")
+    if max_pool % GIB != 0:
+        raise RuntimeError(f"--max-pool-size ({max_pool}) must be GB aligned (VMM segment rule)")
 
     _wait_tcp(args.store, 30)
     dev = args.dev
@@ -152,14 +156,14 @@ def main():
         ralloc_inited = True
         rank = ralloc.get_rank_id()
 
-        # device-scheduled pool: HBM window only, both sides commit their slot below
-        handle = ralloc.create(id=0, max_dram_size=0, max_hbm_size=max_pool, data_op_type=DATA_OP)
+        # device-scheduled pool on a DRAM window: both sides commit their slot below
+        handle = ralloc.create(id=0, max_dram_size=max_pool, max_hbm_size=0, data_op_type=DATA_OP)
         _log(f"[client rank {rank}] device-scheduled pool created (DEVICE_RDMA | DEVICE_SCHEDULE)")
 
         ret, info = handle.extend_local_mem(MEM_TYPE, block)
         assert ret == 0 and info.get("gva"), f"extend_local_mem failed: {ret} {info}"
         local_gva = handle.get_mem_ptr_by_rank(rank, MEM_TYPE)
-        assert local_gva != 0, "local device slot not visible"
+        assert local_gva != 0, "local DRAM slot not visible"
 
         deadline = time.time() + EXTEND_TIMEOUT_SEC
         while True:
@@ -171,68 +175,29 @@ def main():
             time.sleep(EXTEND_RETRY_SEC)
         far_rank = info["rank_id"]
         far_gva = handle.get_mem_ptr_by_rank(far_rank, MEM_TYPE)
-        assert far_gva != 0, "far device slot not visible"
+        assert far_gva != 0, "far DRAM slot not visible"
         mf.get_and_clear_last_err_msg()
+        _log(f"[client rank {rank}] remote block from FAR rank {far_rank} (gva=0x{far_gva:x}, npu {dev}), "
+             f"local gva=0x{local_gva:x}")
 
-        entity_id = handle.get_entity_id()
-        assert entity_id != 0xFFFFFFFF, "get_entity_id failed"
-        _log(f"[client rank {rank}] local slot gva=0x{local_gva:x}, far rank {far_rank} slot gva=0x{far_gva:x}, "
-             f"entity_id={entity_id}")
-
-        # slot layout: [0, size) pattern A | [size, 2*size) pattern B | [2*size, 3*size)
-        #               verify A | [3*size, 4*size) verify B
+        # slot layout: [0, size) pattern | [size, 2*size) verify
         words = size // 4
-        seed_a = rank + 1
-        seed_b = rank + 100001
-        _write_u32_pattern(local_gva, words, seed_a)
-        _write_u32_pattern(local_gva + size, words, seed_b)
-        ctypes.memset(local_gva + 2 * size, 0, 2 * size)
+        seed = rank + 1
+        _write_u32_pattern(local_gva, words, seed)
+        ctypes.memset(local_gva + size, 0, size)
 
-        # warmup on a side stream, OUTSIDE any graph: the first device_copy dlopens and
-        # loads the kernel library, which is illegal inside capture
+        # warmup round-trip on a side stream, OUTSIDE any graph: the first device_copy
+        # dlopens and loads the kernel library, which is illegal inside capture
         side = torch.npu.Stream()
         side.wait_stream(torch.npu.current_stream())
         with torch.npu.stream(side):
             stream_ptr = torch.npu.current_stream().cuda_stream
             assert handle.device_copy(local_gva, far_gva, size, stream_ptr) == 0, "warmup write failed"
-            assert handle.device_copy(far_gva, local_gva + 2 * size, size, stream_ptr) == 0, \
+            assert handle.device_copy(far_gva, local_gva + size, size, stream_ptr) == 0, \
                 "warmup read failed"
         torch.npu.synchronize()
-        assert _check_u32_pattern(local_gva + 2 * size, words, seed_a) == 0, "warmup round-trip mismatch"
+        assert _check_u32_pattern(local_gva + size, words, seed) == 0, "warmup round-trip mismatch"
         _log("[client] warmup round-trip OK (kernel library loaded, meta window reachable)")
-
-        # batch smoke outside capture: both patterns go over in ONE submission, read back
-        # and verified separately — exercises the multi-segment kernel launch path
-        ctypes.memset(local_gva + 2 * size, 0, 2 * size)
-        assert handle.device_copy_batch([local_gva, local_gva + size], [far_gva, far_gva + size],
-                                        [size, size], side.cuda_stream) == 0, "batch smoke write failed"
-        assert handle.device_copy(far_gva, local_gva + 2 * size, size, side.cuda_stream) == 0, \
-            "batch smoke read A failed"
-        assert handle.device_copy(far_gva + size, local_gva + 3 * size, size, side.cuda_stream) == 0, \
-            "batch smoke read B failed"
-        torch.npu.synchronize()
-        assert _check_u32_pattern(local_gva + 2 * size, words, seed_a) == 0, "batch smoke A mismatch"
-        assert _check_u32_pattern(local_gva + 3 * size, words, seed_b) == 0, "batch smoke B mismatch"
-        _log("[client] batch smoke OK (2 segments, one submission, both verified)")
-
-        # user HBM smoke (P1): register one NPU tensor as a user memory region, then use its
-        # data_ptr directly as the DMA source — no card-internal staging copy into the slot;
-        # the device kernel resolves the lkey from the user MR table in the meta window.
-        # register/unregister must stay OUTSIDE graph capture (the table is a frozen snapshot)
-        user_val = seed_a + 7
-        user_buf = torch.full((words,), user_val, dtype=torch.int32, device="npu")
-        assert handle.register(user_buf.data_ptr(), size) == 0, "user buffer register failed"
-        ctypes.memset(local_gva + 2 * size, 0, size)
-        assert handle.device_copy(user_buf.data_ptr(), far_gva, size, side.cuda_stream) == 0, \
-            "user buffer write failed"
-        assert handle.device_copy(far_gva, local_gva + 2 * size, size, side.cuda_stream) == 0, \
-            "user buffer read back failed"
-        torch.npu.synchronize()
-        bad = _check_u32_pattern(local_gva + 2 * size, words, user_val)
-        assert bad == 0, f"user buffer smoke mismatch: {bad}/{words} words"
-        assert handle.unregister(user_buf.data_ptr()) == 0, "user buffer unregister failed"
-        del user_buf
-        _log("[client] user buffer smoke OK (registered HBM as DMA source, no staging copy)")
 
         # capture the whole copy job into an NPU graph: one-sided WRITE + quiet
         graph = torch.npu.NPUGraph()
@@ -256,17 +221,17 @@ def main():
              f"{moved / t_replay / GIB:.2f} GB/s device-scheduled")
 
         # verify on the default stream: READ the far slot back into the verify area
-        assert handle.device_copy(far_gva, local_gva + 2 * size, size, 0) == 0, "verify read failed"
+        assert handle.device_copy(far_gva, local_gva + size, size, 0) == 0, "verify read failed"
         torch.npu.synchronize()
-        bad = _check_u32_pattern(local_gva + 2 * size, words, seed_a)
+        bad = _check_u32_pattern(local_gva + size, words, seed)
         assert bad == 0, f"verify failed: {bad}/{words} words mismatch after {args.replays} replays"
         _log(f"[client] verify OK: far rank {far_rank} slot matches the pattern "
-             f"({words} words, seed {seed_a})")
+             f"({words} words, seed {seed})")
 
         handle.destroy()
         mf.get_and_clear_last_err_msg()
         assert mf.get_last_err_msg() == "", mf.get_last_err_msg()
-        _log(f"[client rank {rank}] pool destroyed, exiting")
+        _log(f"[client rank {rank}] remote block released, exiting")
     finally:
         if ralloc_inited:
             ralloc.uninitialize(0)

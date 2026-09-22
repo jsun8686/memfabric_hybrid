@@ -675,16 +675,21 @@ static int32_t SmemRallocDeviceSegCheck(smem_ralloc_t handle, const void *src, c
     }
 
     auto checkRange = [entry](uint32_t rank, const void *addr, uint64_t len) -> int32_t {
-        auto base = entry->GetMemPtrByRank(rank, SMEM_RALLOC_MEM_TYPE_DEVICE);
+        auto memType = SMEM_RALLOC_MEM_TYPE_DEVICE;
+        auto base = entry->GetMemPtrByRank(rank, memType);
         if (base == nullptr) {
-            SM_LOG_AND_SET_LAST_ERROR_CODE(SM_ERROR, "device slot of rank " << rank << " not ready");
+            memType = SMEM_RALLOC_MEM_TYPE_HOST;
+            base = entry->GetMemPtrByRank(rank, memType);
+        }
+        if (base == nullptr) {
+            SM_LOG_AND_SET_LAST_ERROR_CODE(SM_ERROR, "pool slot of rank " << rank << " not ready");
             return SM_ERROR;
         }
         auto offset = static_cast<uint64_t>(reinterpret_cast<const uint8_t *>(addr) -
                                             static_cast<const uint8_t *>(base));
-        if (offset + len > entry->GetMemSizeByRank(rank, SMEM_RALLOC_MEM_TYPE_DEVICE)) {
+        if (offset + len > entry->GetMemSizeByRank(rank, memType)) {
             SM_LOG_AND_SET_LAST_ERROR_CODE(SM_INVALID_PARAM,
-                "copy range exceeds the committed device slot of rank " << rank);
+                "copy range exceeds the committed slot of rank " << rank);
             return SM_INVALID_PARAM;
         }
         return SM_OK;
