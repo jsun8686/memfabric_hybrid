@@ -404,6 +404,12 @@ SMEM_API int32_t smem_ralloc_extend_local_mem(smem_ralloc_t handle, smem_ralloc_
  * smem_ralloc_roce_qpinfo_dump in smem_ralloc_aicore_base_rdma.h. */
 static void SmemRallocDumpQpInfo(const SmemRallocEntryPtr &entry, smem_ralloc_mem_type_t memType, uint32_t peerRank)
 {
+    /* the lazy library load normally first happens inside device_copy's seg check, which runs
+     * AFTER extend -- load explicitly here or the dump entry reads as nullptr and silently skips */
+    if (!DlSmemRallocDeviceApi::TryLoadLibrary()) {
+        SM_LOG_WARN("qpinfo dump skipped: device kernel library not available");
+        return;
+    }
     auto submit = DlSmemRallocDeviceApi::GetDumpRunSubmit();
     if (submit == nullptr) {
         return; /* kernel library without the dump entry: skip silently */
