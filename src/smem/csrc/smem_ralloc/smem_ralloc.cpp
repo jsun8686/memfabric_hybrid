@@ -174,6 +174,11 @@ static int32_t smem_ralloc_create_inner(uint32_t id, const smem_ralloc_create_op
             "DEVICE_SCHEDULE must be combined with DEVICE_RDMA, pool: " << id);
         return SM_INVALID_PARAM;
     }
+    if ((option->dataOpType & SMEMRA_DATA_OP_DEVICE_SCHEDULE) != 0U && option->maxHbmSize == 0UL) {
+        SM_LOG_AND_SET_LAST_ERROR_CODE(SM_NOT_SUPPORTED,
+            "DEVICE_SCHEDULE requires a nonzero max_hbm_size for the device meta window, pool: " << id);
+        return SM_NOT_SUPPORTED;
+    }
 
     SmemRallocEntryPtr entry;
     auto ret = manager.CreateEntryById(id, entry);

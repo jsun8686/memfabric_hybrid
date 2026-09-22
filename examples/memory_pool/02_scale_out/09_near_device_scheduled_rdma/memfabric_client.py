@@ -29,6 +29,7 @@ DEFAULT_SIZE = "1M"          # bytes per one-sided copy
 DEFAULT_REPLAYS = 8          # graph replays after capture
 DEFAULT_BLOCK_SIZE = "64M"   # DRAM slot bytes committed on each side
 DEFAULT_MAX_POOL_SIZE = "4G" # pool DRAM window, must be GB aligned (VMM segment rule)
+META_HBM_WINDOW = 1 << 30    # minimal GB-aligned hbm window: hosts the fixed device meta window only
 EXTEND_RETRY_SEC = 5
 EXTEND_TIMEOUT_SEC = 300
 GIB = 1 << 30
@@ -156,8 +157,10 @@ def main():
         ralloc_inited = True
         rank = ralloc.get_rank_id()
 
-        # device-scheduled pool on a DRAM window: both sides commit their slot below
-        handle = ralloc.create(id=0, max_dram_size=max_pool, max_hbm_size=0, data_op_type=DATA_OP)
+        # device-scheduled pool on a DRAM window: both sides commit their slot below.
+        # max_hbm_size is GB aligned and hosts ONLY the fixed device meta window
+        # (rank/QP/MR context); the copy slots live in the DRAM window
+        handle = ralloc.create(id=0, max_dram_size=max_pool, max_hbm_size=META_HBM_WINDOW, data_op_type=DATA_OP)
         _log(f"[client rank {rank}] device-scheduled pool created (DEVICE_RDMA | DEVICE_SCHEDULE)")
 
         ret, info = handle.extend_local_mem(MEM_TYPE, block)

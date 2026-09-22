@@ -79,6 +79,10 @@ kill -TERM <daemon_pid>
 
 ## 必要条件
 - CANN ≥ 8.3.RC1（NPUGraph 与 bisheng 设备侧编译）
+- **池必须带 HBM 窗口**：设备侧 meta 窗口（rank/QP/MR 上下文发布区）物理上在 HBM 段固定
+  区，create 时 `max_hbm_size` 须非 0 且 GB 对齐（本用例固定 1G，仅为承载 meta，拷贝 slot
+  仍在 DRAM）；缺 HBM 窗口会在 extend 时段错误，C 层已前置拦截并报
+  `DEVICE_SCHEDULE requires a nonzero max_hbm_size`
 - 安装期 `install ralloc device rdma lib success`（bisheng 在位；失败会 WARNING 跳过，
   客户端 `device_copy` 将报 library not available）
 - 指定 NPU 卡 device RDMA 链路 UP 且跨节点可达；客户端另需 torch/torch_npu
@@ -106,6 +110,7 @@ kill -TERM <daemon_pid>
 | 症状 | 处置 |
 |---|---|
 | create 报 `must align GB` | 池窗口（`--max-pool-size`）未 GB 对齐：VMM 段硬性要求，默认 4G 已满足，自定义时注意 |
+| create 报 `DEVICE_SCHEDULE requires a nonzero max_hbm_size` | 设备调度依赖 HBM 窗口承载 meta：`max_hbm_size` 传 0 被前置拦截（本用例固定 1G，自定义时须 GB 对齐） |
 | device_copy 返回非 0 且日志报 library not available | 安装期 bisheng 缺失或编译失败：确认 `bisheng` 在 PATH、重跑 install.sh，检查 `lib64/libmf_smem_ralloc_device_rdma.so` 是否存在 |
 | device_copy 报 `copy endpoint falls neither into the pool device window nor a registered user region` | 地址不是本池窗口 GVA（slot 地址用 `get_mem_ptr_by_rank(rank, HOST)` 取）或用户内存未 register |
 | device_copy 报 `needs one local endpoint ... and one peer pool slot` | 组合非法：两端同为本地/远端、或用户内存 × 用户内存（远端用户内存暂不支持） |
