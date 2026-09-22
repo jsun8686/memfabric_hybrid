@@ -47,7 +47,7 @@ int FixedRanksQpManager::SetRemoteRankInfo(const std::unordered_map<uint32_t, Co
          * QP/MR table. Connections stay as-is; a rank not connected yet is filled by the connect
          * worker's own FillQpInfo once its QP becomes ready, so a refresh failure is not fatal. */
         for (auto it = ranks.begin(); it != ranks.end(); ++it) {
-            currentRanksInfo_[it->first] = it->second;
+            currentRanksInfo_.insert_or_assign(it->first, it->second);
         }
         DlAclApi::AclrtSetDevice(deviceId_);
         if (FillQpInfo() != BM_OK) {
