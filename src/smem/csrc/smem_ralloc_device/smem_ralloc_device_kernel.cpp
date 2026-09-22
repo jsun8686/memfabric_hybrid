@@ -23,10 +23,13 @@
 #include "smem_ralloc_aicore_base_rdma.h"
 #include "smem_ralloc_device_launch_def.h"
 
-static void smem_ralloc_device_ub_alloc(AscendC::TPipe &pipe, AscendC::TQue<AscendC::TPosition::VECIN, 1> &que64,
-                                        AscendC::TQue<AscendC::TPosition::VECIN, 1> &que32,
-                                        AscendC::LocalTensor<uint64_t> &ubLocal64,
-                                        AscendC::LocalTensor<uint32_t> &ubLocal32)
+/* must carry __aicore__: helpers without it compile as host functions and cannot be called
+ * from __global__ __aicore__ kernels, nor use aicore-only TPipe/TQue APIs inside */
+__aicore__ static void smem_ralloc_device_ub_alloc(AscendC::TPipe &pipe,
+                                                   AscendC::TQue<AscendC::TPosition::VECIN, 1> &que64,
+                                                   AscendC::TQue<AscendC::TPosition::VECIN, 1> &que32,
+                                                   AscendC::LocalTensor<uint64_t> &ubLocal64,
+                                                   AscendC::LocalTensor<uint32_t> &ubLocal32)
 {
     pipe.InitBuffer(que64, 1, 32);
     pipe.InitBuffer(que32, 1, 32);
