@@ -393,14 +393,6 @@ const void *ComposeTransportManager::GetQpInfo() const
     return deviceTransportManager_->GetQpInfo();
 }
 
-const void *ComposeTransportManager::GetQpDumpAddress() const
-{
-    if (deviceTransportManager_ == nullptr) {
-        return nullptr;
-    }
-    return deviceTransportManager_->GetQpDumpAddress();
-}
-
 Result ComposeTransportManager::ReadRemote(uint32_t rankId, uint64_t lAddr, uint64_t rAddr, uint64_t size)
 {
     uint32_t opType = tagManager_->GetRank2RankOpType(rankId, options_.rankId);

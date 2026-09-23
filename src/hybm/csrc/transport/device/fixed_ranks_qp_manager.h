@@ -32,10 +32,6 @@ public:
     void Shutdown() noexcept override;
     int WaitingConnectionReady() noexcept override;
     const void *GetQpInfoAddress() const noexcept override;
-
-    /* device address of the debug scratch appended after the QP table inside the same
-     * AclrtMalloc block (see HYBM_QP_DUMP_REGION_SIZE); null before ReserveQpInfoSpace */
-    const void *GetQpDumpAddress() const noexcept override;
     UserQpInfo *GetQpHandleWithRankId(uint32_t rankId) noexcept override;
     void PutQpHandle(UserQpInfo *qp) const noexcept override;
 
@@ -76,7 +72,6 @@ private:
     std::atomic<int> serverConnectResult{-1};
     std::atomic<int> clientConnectResult{-1};
     uint32_t qpInfoSize_{0};
-    uint32_t qpTableDataSize_{0}; /* QP table body size, the dump scratch starts at this offset */
     void *rdmaHandle_{nullptr};
     std::unordered_map<uint32_t, ConnectRankInfo> currentRanksInfo_;
     MemoryRegionMap currentLocalMrs_;

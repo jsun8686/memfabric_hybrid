@@ -446,14 +446,6 @@ const void *RdmaTransportManager::GetQpInfo() const
     return qpManager_->GetQpInfoAddress();
 }
 
-const void *RdmaTransportManager::GetQpDumpAddress() const
-{
-    if (qpManager_ == nullptr) {
-        return nullptr;
-    }
-    return qpManager_->GetQpDumpAddress();
-}
-
 Result RdmaTransportManager::ReadRemote(uint32_t rankId, uint64_t lAddr, uint64_t rAddr, uint64_t size)
 {
     auto ret = RemoteIO(rankId, lAddr, rAddr, size, false, true);

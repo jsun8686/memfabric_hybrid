@@ -145,14 +145,6 @@ const void *FixedRanksQpManager::GetQpInfoAddress() const noexcept
     return qpInfo_;
 }
 
-const void *FixedRanksQpManager::GetQpDumpAddress() const noexcept
-{
-    if (qpInfo_ == nullptr) {
-        return nullptr;
-    }
-    return reinterpret_cast<const uint8_t *>(qpInfo_) + qpTableDataSize_;
-}
-
 UserQpInfo *FixedRanksQpManager::GetQpHandleWithRankId(uint32_t rankId) noexcept
 {
     BM_LOG_ERROR("FixedRanksQpManager can't get qp!");
@@ -173,10 +165,6 @@ bool FixedRanksQpManager::ReserveQpInfoSpace() noexcept
     void *ptr = nullptr;
     auto oneQpSize = 2U * (sizeof(AiQpRMAWQ) + sizeof(AiQpRMACQ)) + sizeof(RdmaMemRegionInfo);
     qpInfoSize_ = sizeof(AiQpRMAQueueInfo) + oneQpSize * rankCount_;
-    qpTableDataSize_ = qpInfoSize_;
-    /* append the device-side debug dump scratch: same AclrtMalloc block, beyond the table body,
-     * untouched by FillQpInfo (see HYBM_QP_DUMP_REGION_SIZE) */
-    qpInfoSize_ += static_cast<uint32_t>(HYBM_QP_DUMP_REGION_SIZE);
     auto ret = DlAclApi::AclrtMalloc(&ptr, qpInfoSize_, 0);
     if (ret != 0) {
         BM_LOG_ERROR("allocate device size: " << qpInfoSize_ << ", failed: " << ret);

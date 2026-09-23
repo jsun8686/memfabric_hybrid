@@ -62,11 +62,6 @@ const void *TransportManager::GetQpInfo() const
     return nullptr;
 }
 
-const void *TransportManager::GetQpDumpAddress() const
-{
-    return nullptr; /* only the fixed-ranks device transport carries the dump scratch */
-}
-
 Result TransportManager::ConnectWithOptions(const HybmTransPrepareOptions &options)
 {
     BM_LOG_DEBUG("ConnectWithOptions now connected=" << connected_);

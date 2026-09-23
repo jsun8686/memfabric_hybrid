@@ -27,11 +27,6 @@ namespace mf {
 namespace transport {
 namespace device {
 
-/* bring-up debug scratch appended to the QP-info table allocation: device-heap (HBM) memory is
- * dcci/cache-maintainable and AI-core writable, unlike host-DRAM mappings, so the staged QP
- * context dump kernel writes its probe slots here; the host reads them back via AclrtMemcpy */
-constexpr uint32_t HYBM_QP_DUMP_REGION_SIZE = 4096;
-
 sockaddr_in Ip2Net(in_addr ip);
 
 struct UserQpInfo {
@@ -71,7 +66,6 @@ public:
     virtual void Shutdown() noexcept = 0;
     virtual int WaitingConnectionReady() noexcept;
     virtual const void *GetQpInfoAddress() const noexcept;
-    virtual const void *GetQpDumpAddress() const noexcept;
     virtual UserQpInfo *GetQpHandleWithRankId(uint32_t rankId) noexcept = 0;
     virtual void PutQpHandle(UserQpInfo *qp) const noexcept = 0;
     virtual bool CheckQpReady(const std::vector<uint32_t> &rankIds) const noexcept;

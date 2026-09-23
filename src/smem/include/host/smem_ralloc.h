@@ -174,18 +174,6 @@ int32_t smem_ralloc_extend_remote_mem(smem_ralloc_t handle, smem_ralloc_mem_type
                                       smem_ralloc_mem_info_t *info);
 
 /**
- * @brief [bring-up debug] Re-run the read-only QP-context dump kernel against one peer and print
- * the landed slots, including the raw first two send-CQ entries (their completion status is the
- * authoritative roce verdict after a data mismatch). Best-effort, never fails.
- *
- * @param handle           [in] ralloc object handle created by <i>smem_ralloc_create</i>
- * @param memType          [in] memory type of the pool the dump targets
- * @param peerRank         [in] rank id whose WQ/CQ/MR context rows should be dumped
- * @return 0 if the dump was submitted, non-zero on an invalid handle
- */
-int32_t smem_ralloc_dump_qp_info(smem_ralloc_t handle, smem_ralloc_mem_type_t memType, uint32_t peerRank);
-
-/**
  * @brief Get the current committed size of one rank's slot of the pool, which is a snapshot of
  * the local imported state: blocks committed by other ranks are visible after the corresponding
  * JOIN/UPDATE event has been processed by the local side.

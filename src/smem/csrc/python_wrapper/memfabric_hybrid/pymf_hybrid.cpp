@@ -495,11 +495,6 @@ public:
                                        size, reinterpret_cast<void *>(stream));
     }
 
-    int32_t DumpQpInfo(uint32_t peerRank, smem_ralloc_mem_type memType) noexcept
-    {
-        return smem_ralloc_dump_qp_info(handle_, memType, peerRank);
-    }
-
     int32_t DeviceCopyBatch(std::vector<uintptr_t> srcs, std::vector<uintptr_t> dsts, std::vector<uint64_t> sizes,
                             uintptr_t stream)
     {
@@ -1291,17 +1286,6 @@ Arguments:
     stream(int):   aclrt stream pointer, 0 uses the default stream, default 0
 Returns:
     0 if successful)")
-        .def("dump_qp_info", &RallocPool::DumpQpInfo, py::arg("peer_rank"),
-             py::arg("mem_type") = SMEM_RALLOC_MEM_TYPE_DEVICE, R"(
-[bring-up debug] Re-run the read-only QP-context dump kernel against one peer and print the
-landed slots, including the raw first two send-CQ entries whose completion status is the
-authoritative roce verdict after a data mismatch. Output goes to the mf log, best-effort.
-
-Arguments:
-    peer_rank(int): rank id whose WQ/CQ/MR context rows should be dumped
-    mem_type(int):  memory type of the pool, default device
-Returns:
-    0 if the dump was submitted)")
         .def("device_copy_batch", &RallocPool::DeviceCopyBatch, py::call_guard<py::gil_scoped_release>(),
              py::arg("src_addrs"), py::arg("dst_addrs"), py::arg("sizes"), py::arg("stream") = 0, R"(
 Submit a batch of device-scheduled one-sided copies, the counterpart of copy_data_batch

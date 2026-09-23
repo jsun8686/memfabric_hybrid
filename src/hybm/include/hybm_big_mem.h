@@ -216,26 +216,6 @@ int32_t hybm_query_memory_key(hybm_entity_t e, uint64_t addr, uint64_t *mrAddr, 
  */
 int32_t hybm_gva_to_va(uint64_t gva, hybm_mem_type vaMemType, uint64_t *va);
 
-/**
- * @brief Bring-up debug: device address of the QP-info dump scratch region (device heap, beyond
- *        the QP table body). The device-scheduled dump kernel writes its staged probe slots
- *        there; pass this address to the kernel's out parameter.
- *
- * @param e                [in] entity created by hybm_create_entity
- * @return device address, 0 when the transport carries no dump region
- */
-uint64_t hybm_get_qp_dump_address(hybm_entity_t e);
-
-/**
- * @brief Bring-up debug: synchronously copy the QP dump scratch region out to host memory
- *
- * @param e                [in] entity created by hybm_create_entity
- * @param hostBuf          [out] host destination buffer
- * @param size             [in] bytes to copy
- * @return 0 if successful, error code otherwise
- */
-int32_t hybm_read_qp_dump(hybm_entity_t e, void *hostBuf, uint32_t size);
-
 #ifdef __cplusplus
 }
 #endif

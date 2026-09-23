@@ -53,7 +53,6 @@ public:
     const std::string &GetNic() const override;
     const TransportPrivateData GetPrivateData() const override;
     const void *GetQpInfo() const override;
-    const void *GetQpDumpAddress() const override;
     Result ReadRemote(uint32_t rankId, uint64_t lAddr, uint64_t rAddr, uint64_t size) override;
     Result WriteRemote(uint32_t rankId, uint64_t lAddr, uint64_t rAddr, uint64_t size) override;
     Result ReadRemoteAsync(uint32_t rankId, uint64_t lAddr, uint64_t rAddr, uint64_t size) override;

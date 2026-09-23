@@ -90,11 +90,6 @@ public:
     hybm_data_op_type CanReachDataOperators(uint32_t remoteRank) const noexcept override;
     void *GetSliceVa(hybm_mem_slice_t slice);
 
-    /* bring-up debug: device address of the QP dump scratch (null when the transport has none)
-     * and a synchronous D2H readback of its contents */
-    const void *GetQpDumpAddress() const noexcept;
-    int32_t ReadQpDumpRegion(void *hostBuf, uint32_t size) noexcept;
-
 private:
     static int CheckOptions(const hybm_options *options) noexcept;
     int32_t LoadExtendLibrary() noexcept;

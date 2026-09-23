@@ -258,24 +258,3 @@ HYBM_API void hybm_unmap(hybm_entity_t e, uint32_t flags)
     BM_ASSERT_RET_VOID(entity != nullptr);
     entity->Unmap();
 }
-
-HYBM_API uint64_t hybm_get_qp_dump_address(hybm_entity_t e)
-{
-    if (e == nullptr) {
-        return 0;
-    }
-    auto entity = MemEntityFactory::Instance().FindEngineByPtr(e);
-    if (entity == nullptr) {
-        return 0;
-    }
-    return reinterpret_cast<uint64_t>(entity->GetQpDumpAddress());
-}
-
-HYBM_API int32_t hybm_read_qp_dump(hybm_entity_t e, void *hostBuf, uint32_t size)
-{
-    BM_ASSERT_RETURN(e != nullptr, BM_INVALID_PARAM);
-    auto entity = MemEntityFactory::Instance().FindEngineByPtr(e);
-    BM_ASSERT_RETURN(entity != nullptr, BM_INVALID_PARAM);
-    BM_ASSERT_RETURN(hostBuf != nullptr && size > 0, BM_INVALID_PARAM);
-    return entity->ReadQpDumpRegion(hostBuf, size);
-}

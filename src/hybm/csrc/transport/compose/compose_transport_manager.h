@@ -66,12 +66,9 @@ public:
 
     const TransportPrivateData GetPrivateData() const override;
 
-    /* the QP table (and its dump scratch) lives in the device transport: without this
-     * forwarding the device meta would carry a null qpInfoAddress and the AI-core kernels
-     * would dereference a null table */
+    /* the QP table lives in the device transport: without this forwarding the device meta
+     * would carry a null qpInfoAddress and the AI-core kernels would dereference a null table */
     const void *GetQpInfo() const override;
-
-    const void *GetQpDumpAddress() const override;
 
     Result ReadRemote(uint32_t rankId, uint64_t lAddr, uint64_t rAddr, uint64_t size) override;
 

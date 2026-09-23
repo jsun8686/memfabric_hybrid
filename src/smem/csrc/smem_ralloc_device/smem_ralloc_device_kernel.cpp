@@ -99,25 +99,6 @@ extern "C" void smem_ralloc_device_read_run_submit(uint32_t entityId, uint32_t s
                                                                srcRank);
 }
 
-/* bring-up debug: writes the kernel-side QP context (40 x u64, see the dump layout contract in
- * smem_ralloc_aicore_base_rdma.h) into a caller-provided device-writable buffer; no UB needed,
- * plain GM stores plus a cache flush and a completion magic in slot 39 */
-extern "C" __global__ __aicore__ void smem_ralloc_device_dump_run_kernel(uint32_t entityId, uint32_t peerRank,
-                                                                         GM_ADDR out)
-{
-    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
-    if (AscendC::GetBlockIdx() != 0) {
-        return;
-    }
-
-    smem_ralloc_roce_qpinfo_dump(entityId, peerRank, 0, (__gm__ uint8_t *)out);
-}
-
-extern "C" void smem_ralloc_device_dump_run_submit(uint32_t entityId, uint32_t peerRank, void *out, void *stream)
-{
-    smem_ralloc_device_dump_run_kernel<<<1, nullptr, stream>>>(entityId, peerRank, (uint8_t *)out);
-}
-
 extern "C" __global__ __aicore__ void smem_ralloc_device_batch_run_kernel(struct smem_ralloc_device_batch_args args)
 {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
