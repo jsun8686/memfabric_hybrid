@@ -68,6 +68,19 @@ void smem_ralloc_uninit(uint32_t flags);
 uint32_t smem_ralloc_get_rank_id(void);
 
 /**
+ * @brief Run deferred pool maintenance work: FAR pool-empty entries are collected by the
+ *        internal reporter thread but their teardown (transport close) must run on a
+ *        caller-controlled thread — libra socket teardown driven from the reporter thread
+ *        is proven to crash. Long-lived FAR processes should call this periodically from
+ *        their main loop; without it pool reclamation is deferred (never crashes, entries
+ *        are also cleaned up by <i>smem_ralloc_uninit</i>).
+ *
+ * @param flags           [in] reserved, must be 0
+ * @return 0 if successful
+ */
+int32_t smem_ralloc_maintenance(uint32_t flags);
+
+/**
  * @brief Create ralloc object with specified id and join the dynamic group of the pool,
  * available to NEAR role nodes only (FAR nodes contribute via remote requests instead).
  * The first call of one id builds local entity with window reserved (rankCnt = worldSize),

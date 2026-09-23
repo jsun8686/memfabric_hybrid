@@ -51,6 +51,9 @@ def _contributor_main(dev, run_dir, store_url, world, rpc_base, ready_q, stop_ev
             if os.getppid() != parent_pid:
                 _log(f"[far npu {dev}] daemon gone, exiting")
                 break
+            # pool-empty teardowns are queued by the reporter thread and must run here on
+            # the main thread (libra socket teardown crashes off the main thread)
+            ralloc.maintenance()
     except KeyboardInterrupt:
         pass
     finally:

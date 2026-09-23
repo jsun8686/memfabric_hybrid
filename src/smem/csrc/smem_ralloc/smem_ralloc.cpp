@@ -130,6 +130,19 @@ SMEM_API uint32_t smem_ralloc_get_rank_id(void)
     return SmemRallocEntryManager::Instance().GetRankId();
 }
 
+SMEM_API int32_t smem_ralloc_maintenance(uint32_t flags)
+{
+    SM_VALIDATE_RETURN(flags == 0, "invalid param, flags must be 0", SM_INVALID_PARAM);
+    ReadGuard locker(g_smemRallocMutex_);
+    if (!g_smemRallocInited) {
+        return SM_OK;
+    }
+    /* runs the deferred pool teardowns on THIS thread (see header): the reporter only queues
+     * pool-empty victims because libra socket teardown crashes when driven from its thread */
+    SmemRallocEntryManager::Instance().RunPendingReap();
+    return SM_OK;
+}
+
 static inline int32_t SmemRallocDataOpCheck(smem_ralloc_data_op_type dataOpType)
 {
     constexpr uint32_t dataOpTypeMask = SMEMRA_DATA_OP_SDMA | SMEMRA_DATA_OP_HOST_RDMA | SMEMRA_DATA_OP_HOST_URMA |
