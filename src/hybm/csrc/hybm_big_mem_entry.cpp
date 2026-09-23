@@ -15,6 +15,7 @@
 #include "dl_hal_api.h"
 #include "hybm_ex_info_transfer.h"
 #include "hybm_va_manager.h"
+#include "hybm_define.h"
 
 using namespace ock::mf;
 
@@ -257,4 +258,12 @@ HYBM_API void hybm_unmap(hybm_entity_t e, uint32_t flags)
     auto entity = MemEntityFactory::Instance().FindEngineByPtr(e);
     BM_ASSERT_RET_VOID(entity != nullptr);
     entity->Unmap();
+}
+
+HYBM_API int32_t hybm_get_hbm_address_range(uint64_t *start, uint64_t *end)
+{
+    BM_ASSERT_RETURN(start != nullptr && end != nullptr, BM_INVALID_PARAM);
+    *start = HYBM_HBM_START_ADDR;
+    *end = HYBM_HBM_END_ADDR;
+    return BM_OK;
 }

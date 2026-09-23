@@ -130,7 +130,7 @@ struct SmemRallocMemInfo { /* in sync with RdmaMemRegionInfo */
  * published by the host into this entity's 64K user context region via hybm_set_extra_context;
  * lets device-scheduled RDMA use locally registered user HBM as the local endpoint */
 constexpr uint32_t SMEM_RALLOC_USER_MR_TABLE_MAGIC = 0x31524D53; /* "SMR1" */
-constexpr uint32_t SMEM_RALLOC_USER_MR_TABLE_VERSION = 1;
+constexpr uint32_t SMEM_RALLOC_USER_MR_TABLE_VERSION = 2;        /* v2: regAddress field filled */
 constexpr uint64_t SMEM_RALLOC_USER_MR_TABLE_HEADER_SIZE = 64;
 constexpr uint64_t SMEM_RALLOC_USER_MR_TABLE_ERRCODE_OFFSET = 12; /* device writes: 0 = ok, 1 = lkey lookup miss */
 constexpr uint64_t SMEM_RALLOC_USER_MR_TABLE_ENTRY_SIZE = 32;
@@ -139,11 +139,12 @@ constexpr uint64_t SMEM_RALLOC_USER_MR_TABLE_CAPACITY =
     SMEM_RALLOC_USER_MR_TABLE_ENTRY_SIZE; /* 2046 slots, host publishes at most 2040 */
 
 struct SmemRallocUserMrEntry { /* 32B, in sync with the ralloc publish side */
-    uint64_t addr; /* device-dma-visible address returned by hybm_query_memory_key */
+    uint64_t addr;        /* GVA base returned by hybm_query_memory_key: the kernel match key */
     uint64_t size;
     uint32_t lkey;
     uint32_t rkey;
-    uint64_t reserved;
+    uint64_t regAddress;  /* device-dma base of the MR: SGE address = regAddress + (localAddr -
+                           * addr). Equals addr for the only supported class (HBM, P1) */
 };
 
 struct SmemRallocUserMrTable { /* 64B header + entries, serialized into the 64K user context region */
@@ -217,31 +218,34 @@ SMEM_RALLOC_INLINE_AICORE void smem_ralloc_cache_write_through(__gm__ uint8_t *s
 }
 
 /**
- * @brief Look up the lkey of a locally registered user memory region (P1).
- *        Two-level scheme: the caller first tries the pool MR of this rank; on miss this helper
- *        scans the user MR table published (host side) into this entity's user context region.
- * @return the lkey covering localAddr, or 0 when the table is absent/invalid or no entry matches.
+ * @brief Look up the user memory region covering localAddr in the table published (host side)
+ *        into this entity's user context region (P1: NPU HBM only, enforced by the host).
+ *        Two-level scheme: the caller first tries the pool MR of this rank, on miss this helper
+ *        scans the user MR table.
+ * @return the covering entry (lkey for the SGE, addr/regAddress for the address translation),
+ *         or nullptr when the table is absent/invalid or no entry matches.
  */
-SMEM_RALLOC_INLINE_AICORE uint32_t smem_ralloc_lookup_local_mr(uint32_t entityId, uint64_t localAddr)
+SMEM_RALLOC_INLINE_AICORE __gm__ SmemRallocUserMrEntry *smem_ralloc_lookup_local_mr(uint32_t entityId,
+                                                                                    uint64_t localAddr)
 {
     if (entityId >= SMEM_RALLOC_ENTITY_NUM_MAX) {
-        return 0;
+        return nullptr;
     }
     __gm__ SmemRallocUserMrTable *table = (__gm__ SmemRallocUserMrTable *)smem_ralloc_user_context_address(entityId);
     if (table->magic != SMEM_RALLOC_USER_MR_TABLE_MAGIC || table->version != SMEM_RALLOC_USER_MR_TABLE_VERSION) {
-        return 0;
+        return nullptr;
     }
     uint32_t count = table->count;
     if (count > SMEM_RALLOC_USER_MR_TABLE_CAPACITY) {
-        return 0;
+        return nullptr;
     }
     for (uint32_t i = 0; i < count; i++) {
         __gm__ SmemRallocUserMrEntry *entry = table->entries + i;
         if (localAddr >= entry->addr && localAddr < entry->addr + entry->size) {
-            return entry->lkey;
+            return entry;
         }
     }
-    return 0;
+    return nullptr;
 }
 
 /**
@@ -442,22 +446,31 @@ SMEM_RALLOC_INLINE_AICORE void smem_ralloc_rdma_post_send(uint32_t entityId, __g
     *(__gm__ uint32_t *)(sgeAddr) = messageLen;
     __gm__ SmemRallocMemInfo *localMemInfo = (__gm__ SmemRallocMemInfo *)(
         memInfoTable + sizeof(SmemRallocMemInfo) * smem_ralloc_get_global_rank(entityId));
-    uint32_t localLkey = localMemInfo->lkey;
-    if ((uint64_t)localAddr < localMemInfo->addr ||
-        (uint64_t)localAddr >= localMemInfo->addr + localMemInfo->size) {
-        /* local endpoint outside this rank's pool MR: fall back to the registered user MR table */
-        localLkey = smem_ralloc_lookup_local_mr(entityId, (uint64_t)localAddr);
-        if (localLkey == 0) {
+    uint32_t localLkey;
+    uint64_t localRegAddr;
+    if ((uint64_t)localAddr >= localMemInfo->addr &&
+        (uint64_t)localAddr < localMemInfo->addr + localMemInfo->size) {
+        /* endpoint inside this rank's pool MR */
+        localLkey = localMemInfo->lkey;
+        /* the lkey covers the device-dma range this block was registered under, not the GVA
+         * range: translate the pool GVA into that range (identity for hbm pools) */
+        localRegAddr = (localMemInfo->regAddress != 0)
+                           ? localMemInfo->regAddress + ((uint64_t)localAddr - localMemInfo->addr)
+                           : (uint64_t)localAddr;
+    } else {
+        /* endpoint in a user-registered region (P1, NPU HBM only): same translation under the
+         * user MR's own lkey and dma base */
+        __gm__ SmemRallocUserMrEntry *userMr = smem_ralloc_lookup_local_mr(entityId, (uint64_t)localAddr);
+        if (userMr == nullptr) {
             smem_ralloc_report_user_mr_lookup_miss(entityId);
             return;
         }
+        localLkey = userMr->lkey;
+        localRegAddr = (userMr->regAddress != 0)
+                           ? userMr->regAddress + ((uint64_t)localAddr - userMr->addr)
+                           : (uint64_t)localAddr;
     }
     *(__gm__ uint32_t *)(sgeAddr + 4) = localLkey; /* local key */
-    /* same translation for the local sge address: the lkey covers the device-dma range this
-     * block was registered under, not the GVA range */
-    uint64_t localRegAddr = (localMemInfo->regAddress != 0)
-                                ? localMemInfo->regAddress + ((uint64_t)localAddr - localMemInfo->addr)
-                                : (uint64_t)localAddr;
     *(__gm__ uint64_t *)(sgeAddr + 8) = localRegAddr;
 
     /* WQE & SGE cache flush */

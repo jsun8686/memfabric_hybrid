@@ -656,6 +656,18 @@ Result SmemRallocEntry::Wait()
 Result SmemRallocEntry::RegisterMem(uint64_t addr, uint64_t size)
 {
     SM_ASSERT_RETURN(inited_, SM_NOT_INITIALIZED);
+    /* P1 supports NPU-managed HBM only: the device-side SGE translation relies on
+     * regAddress == addr, which holds for HBM registrations but NOT for host-DRAM ones (IOVA).
+     * Reject non-HBM addresses up front instead of letting device copies land on a wrong
+     * address silently. */
+    uint64_t hbmStart = 0;
+    uint64_t hbmEnd = 0;
+    if (hybm_get_hbm_address_range(&hbmStart, &hbmEnd) != 0 || addr < hbmStart || addr >= hbmEnd) {
+        SM_LOG_ERROR("RegisterMem reject_non_hbm: addr=0x" << std::hex << addr << std::dec
+            << " hbm_range=[0x" << std::hex << hbmStart << ", 0x" << hbmEnd << ")"
+            << " -- device-scheduled user endpoints support NPU HBM memory only");
+        return SM_NOT_SUPPORTED;
+    }
     std::lock_guard<std::mutex> lock(mutex_);
     auto iter = registedSlice_.find(addr);
     if (iter != registedSlice_.end()) {
@@ -741,7 +753,7 @@ bool SmemRallocEntry::IsUserRegistered(uint64_t addr, uint64_t size)
 Result SmemRallocEntry::PublishUserMrTable()
 {
     constexpr uint32_t tableMagic = 0x31524D53;
-    constexpr uint32_t tableVersion = 1;
+    constexpr uint32_t tableVersion = 2; /* v2: entry word 4 carries the device-dma base */
     constexpr uint64_t tableHeaderSize = 64;
     constexpr uint64_t tableEntrySize = 32;
 
@@ -759,6 +771,9 @@ Result SmemRallocEntry::PublishUserMrTable()
         entry[1] = iter->second.size;
         *(reinterpret_cast<uint32_t *>(buf.data() + offset + 16)) = iter->second.lkey;
         *(reinterpret_cast<uint32_t *>(buf.data() + offset + 20)) = iter->second.rkey;
+        /* device-dma base of the MR: equals devAddr for the only supported class (HBM, P1) --
+         * the kernel derives the SGE address as regAddress + (localAddr - devAddr) */
+        entry[4] = iter->second.devAddr;
         offset += tableEntrySize;
     }
 

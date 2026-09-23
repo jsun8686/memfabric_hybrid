@@ -141,7 +141,9 @@ private:
     std::map<uint64_t, std::pair<uint64_t, hybm_mem_slice_t>> registedSlice_;
 
     struct UserMrInfo {
-        uint64_t devAddr;
+        uint64_t devAddr; /* GVA base of the region, == the registration key and the kernel
+                           * match key; equals the device-dma base for HBM regions (P1: the only
+                           * supported user-memory class, regAddress == addr) */
         uint64_t size;
         uint32_t lkey;
         uint32_t rkey;

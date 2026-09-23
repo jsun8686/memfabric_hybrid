@@ -216,6 +216,18 @@ int32_t hybm_query_memory_key(hybm_entity_t e, uint64_t addr, uint64_t *mrAddr, 
  */
 int32_t hybm_gva_to_va(uint64_t gva, hybm_mem_type vaMemType, uint64_t *va);
 
+/**
+ * @brief Query the device HBM address range of this platform (SVA segment where NPU-managed
+ *        tensors live). Callers outside hybm use it to tell HBM endpoints from host-DRAM
+ *        endpoints: only the former are valid as device-scheduled RDMA user endpoints (P1),
+ *        because their MR registration keeps regAddress == addr.
+ *
+ * @param start            [out] HBM segment start address
+ * @param end              [out] HBM segment end address (exclusive)
+ * @return 0 if successful, error code otherwise
+ */
+int32_t hybm_get_hbm_address_range(uint64_t *start, uint64_t *end);
+
 #ifdef __cplusplus
 }
 #endif
