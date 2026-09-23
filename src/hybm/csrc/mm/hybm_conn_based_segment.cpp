@@ -930,7 +930,11 @@ Result HybmConnBasedSegment::ReleaseSliceMemory(const MemSlicePtr &slice) noexce
     slices_.erase(pos);
 
 #if defined(ASCEND_NPU)
-    const bool needUnregister = (options_.dataOpType & HYBM_DOP_TYPE_DEVICE_RDMA) != 0U;
+    /* symmetric with RegisterMemCommon: only host-dram slices register a hal mapping
+     * (HalHostRegister); hbm slices never do, so their release must not unregister either.
+     * Same guard as HybmVmmBasedSegment::ReleaseSliceMemory. */
+    const bool needUnregister = (options_.dataOpType & HYBM_DOP_TYPE_DEVICE_RDMA) != 0U &&
+                                slice->memType_ == HYBM_MEM_TYPE_HOST;
     if (needUnregister) {
         auto unregRet = DlHalApi::HalHostUnregisterEx(reinterpret_cast<void *>(slice->vAddress_),
                                                       logicDeviceId_, HOST_MEM_MAP_DEV);

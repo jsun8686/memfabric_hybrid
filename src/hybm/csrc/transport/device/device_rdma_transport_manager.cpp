@@ -19,7 +19,7 @@
 
 #include "hybm_common_include.h"
 #include "dl_acl_api.h"
-#include "dl_hal_api.h"
+#include "dl_hccp_def.h"
 #include "dl_hccp_api.h"
 #include "dl_hccl_api.h"
 #include "hybm_ptracer.h"
@@ -173,12 +173,9 @@ Result RdmaTransportManager::UnregisterMemoryRegion(uint64_t addr)
         return BM_DL_FUNCTION_FAILED;
     }
 
-    if (pos->second.address != pos->second.regAddress) {
-        ret = DlHalApi::HalHostUnregisterEx((void *)(ptrdiff_t)pos->second.address, deviceId_, HOST_MEM_MAP_DEV);
-        if (ret != 0) {
-            BM_LOG_ERROR("HalHostUnregister failed: " << ret);
-        }
-    }
+    /* the hal mapping (HalHostRegister, host-dram only) is NOT unregistered here: its
+     * lifecycle belongs to the segment layer (ReleaseSliceMemory) which registered it --
+     * unregistering on both sides double-freed the mapping (HalHostUnregisterEx ret:38) */
 
     registerMRS_.erase(pos);
     return BM_OK;
