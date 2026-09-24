@@ -5,7 +5,10 @@
 
 N workers each build its OWN pool (distinct pool id, so every extend_remote_mem drives
 its own JOIN_ALLOC create-branch on the contributor) and all of them call
-extend_remote_mem at the same instant behind a barrier. The placement master grants
+extend_remote_mem at the same instant behind a barrier. Every worker owns a DISTINCT
+NPU (--devs): concurrent first-time device-stack init from several processes on ONE
+card deadlocks inside the device layer (worker stalls right after "using default
+device rdma transport manager" with no further log). The placement master grants
 back-to-back blocks within milliseconds, so several create-branches hit one FAR node
 concurrently: the contributor-side device open (PrepareOpenDevice) must serialize them —
 the late opener waits and reuses the registered rdma handle instead of racing RaInit
@@ -36,6 +39,8 @@ DEFAULT_WORLD = 512          # declared world capacity, actual members join dyna
 NIC_PORT_BASE = 10015        # data-plane nic port base (set_nic); NOT the control rpc port
 RPC_PORT_BASE = 11110        # control rpc port base = base + rankId (smem_ralloc_def.h default)
 DEFAULT_WORKERS = 4          # concurrent pool creators (each its own pool id)
+DEFAULT_DEVS = "0,1,2,3"     # one NPU per worker; concurrent first-time device init on ONE
+                              # card from several processes deadlocks in the device layer
 DEFAULT_SIZE = "1M"          # bytes of the round-trip verify pattern
 DEFAULT_BLOCK_SIZE = "64M"   # remote block bytes taken per pool
 DEFAULT_MAX_POOL_SIZE = "4G" # pool DRAM window declared to the FAR placement master
@@ -177,8 +182,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--store", required=True,
                         help="store url of the FAR daemon, e.g. tcp://10.0.0.1:8587")
-    parser.add_argument("--dev", type=int, required=True,
-                        help="NPU id every worker runs on")
+    parser.add_argument("--devs", default=DEFAULT_DEVS,
+                        help=f"comma list of NPU ids, worker i exclusively owns devs[i] "
+                             f"(count must cover --workers, default {DEFAULT_DEVS})")
     parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS,
                         help=f"concurrent pool creators, each with its own pool id "
                              f"(default {DEFAULT_WORKERS})")
@@ -214,6 +220,13 @@ def main():
     max_pool = _parse_size(args.max_pool_size)
     if args.workers < 2:
         raise RuntimeError("--workers must be >= 2 (concurrency is the point of this example)")
+    devs = [int(t) for t in args.devs.split(",") if t.strip() != ""]
+    if not devs:
+        raise RuntimeError("empty --devs")
+    if len(devs) < args.workers:
+        raise RuntimeError(f"--devs has {len(devs)} card(s) but --workers is {args.workers}: several "
+                           f"processes first-initializing ONE card concurrently deadlock in the device "
+                           f"layer — add cards or lower --workers")
     if size % 4 != 0:
         raise RuntimeError(f"--size ({size}) must be 4-byte aligned (int32 verify pattern)")
     if size > block:
@@ -223,7 +236,7 @@ def main():
     if max_pool % GIB != 0:
         raise RuntimeError(f"--max-pool-size ({max_pool}) must be GB aligned (VMM segment rule)")
 
-    _log(f"[client] run dir: {run_dir}, store: {args.store}, world: {args.world}, dev: {args.dev}")
+    _log(f"[client] run dir: {run_dir}, store: {args.store}, world: {args.world}, devs: {devs}")
     _log(f"[client] {args.workers} independent pools, block {block} bytes each, verify pattern {size} bytes")
     _wait_tcp(args.store, 30)
 
@@ -231,12 +244,13 @@ def main():
     barrier = ctx.Barrier(args.workers)
     result_q = ctx.Queue()
     procs = [ctx.Process(target=_worker_main, name=f"pool-worker{i}",
-                         args=(i, args.pool_base + i, args.store, args.world, args.dev,
+                         args=(i, args.pool_base + i, args.store, args.world, devs[i],
                                args.rpc_port_base, block, size, max_pool, barrier, result_q, run_dir))
              for i in range(args.workers)]
     for p in procs:
         p.start()
-    _log(f"[client] {args.workers} workers spawned, pools {args.pool_base}.."
+    _log(f"[client] {args.workers} workers spawned (worker->npu: "
+         f"{', '.join(f'w{i}->npu{devs[i]}' for i in range(args.workers))}), pools {args.pool_base}.."
          f"{args.pool_base + args.workers - 1} building, extend fires simultaneously at the barrier")
 
     results = {}

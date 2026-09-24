@@ -43,7 +43,7 @@ FAR 节点（常驻守护，复用 09/10/11 形态）      NEAR 节点（客户�
 python3 memfabric_daemon.py --store tcp://<far_ip>:8588 --devs 0,1
 
 # 2) NEAR 节点跑客户端：N 池齐建 ─► 并发 extend ─► 各自往返验证 ─► 汇总
-python3 memfabric_client.py --store tcp://<far_ip>:8588 --dev 0
+python3 memfabric_client.py --store tcp://<far_ip>:8588 --devs 0,1,2,3
 
 # 3) 停止守护
 kill -TERM <daemon_pid>
@@ -65,7 +65,7 @@ kill -TERM <daemon_pid>
 | 参数 | 默认 | 说明 |
 |---|---|---|
 | `--store` | 必填 | 守护进程的 store url |
-| `--dev` | 必填 | 所有 worker 共用的 NPU id |
+| `--devs` | 0,1,2,3 | NPU id 列表，worker i **独占**第 i 张卡（数量须 ≥ `--workers`，见必要条件） |
 | `--workers` | 4 | 并发建池数（须 ≥2，即本例的并发度） |
 | `--size` | 1M | 往返验证 pattern 字节数（K/M/G 后缀，须 4 字节对齐且 ≤ block-size） |
 | `--block-size` | 64M | 每池远端 block 字节数（K/M/G 后缀） |
@@ -77,6 +77,11 @@ kill -TERM <daemon_pid>
 
 ## 必要条件
 - 在 09/10 的必要条件之上：
+- **每 worker 独占一张 NPU**（`--devs` 数量 ≥ `--workers`）：多进程在同一张卡上并发做
+  设备栈首次初始化会在底层库内**死锁**（worker 停在 `using default device rdma
+  transport manager` 之后无任何日志）；卡不够时降 `--workers`
+- **启动顺序**：先停旧守护再起新守护再跑客户端——旧守护占着 store 端口时客户端
+  `_wait_tcp` 仍会通过（只探端口不校验身份），中途 store 易主会重置 KV 并触发重排名
 - **两端版本一致**：并发 create 串行化为 host 库行为，不得与旧版守护混跑（旧行为依赖
   客户端重试兜底，FAR log 会出现 328002/19 报错）
 - 连续重跑前确认 FAR 侧旧池已 reap（pool-empty 后默认 grace + 一个上报周期，约 30s），
@@ -108,6 +113,8 @@ kill -TERM <daemon_pid>
 | 症状 | 处置 |
 |---|---|
 | worker 卡在 barrier 直到超时 | 某 worker 本地建池慢/失败，看对应 `near_worker{i}.log` |
+| worker 日志停在 `using default device rdma transport manager` 后无进展 | 同卡多进程并发首初始化死锁：`--devs` 数量须 ≥ `--workers`（每 worker 独占一卡），或降 `--workers` |
+| far log 出现 `address in use`（store 端口） | 旧守护未停仍占着 store：先 kill 旧守护再起新守护 |
 | `extend failed ... retrying` 反复 | 守护是否存活、FAR 窗口余量（`--max-pool-size` ≥ block）；连接类错误看 store 可达性 |
 | worker 日志出现 `328002` / `ret:19` 级联 | 守护为旧版本（无串行化）：两端同步到同 commit 重编重启后重跑 |
 | 重跑报 pool 已存在类错误 | 等 FAR reap（~30s）或换 `--pool-base` |

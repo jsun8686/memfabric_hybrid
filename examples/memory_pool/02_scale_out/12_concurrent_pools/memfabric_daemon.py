@@ -117,7 +117,7 @@ def main():
         got = _collect_ready(ready_q, procs, devs, READY_TIMEOUT_SEC)
         pairs = ", ".join(f"npu{dev}->rank{got[dev]['rank']}" for dev in devs)
         _log(f"[daemon] {len(devs)} memory contributors serving ({pairs})")
-        _log(f"[daemon] try the client:  python3 memfabric_client.py --store {args.store} --dev <npu_id>")
+        _log(f"[daemon] try the client:  python3 memfabric_client.py --store {args.store} --devs 0,1,2,3")
         _log(f"[daemon] per-contributor logs: {run_dir}/far_dev<N>.log")
         _log(f"[daemon] stop with Ctrl+C or:  kill -TERM {os.getpid()}")
         warned = set()
