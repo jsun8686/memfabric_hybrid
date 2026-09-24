@@ -567,6 +567,16 @@ bool RdmaTransportManager::GetRdmaHandleAfterInitHccl(uint32_t device, in_addr &
 bool RdmaTransportManager::PrepareOpenDevice(uint32_t userId, uint32_t device, uint32_t rankCount, in_addr &deviceIp,
                                              void *&rdmaHandle)
 {
+    /* entities of one process may open the same device concurrently (e.g. two pool
+     * entries created by back-to-back JOIN_ALLOCs): the loser's reuse check below runs
+     * before the winner's RaRdevInit registered the handle, its RaInit then hits the
+     * libra double-init rejection and the hccl-group fallback fails. Serialize the
+     * whole prepare per process (cold path, once per entity): the late opener waits,
+     * re-runs the reuse check and takes the "Had prepared device" path; the member
+     * mutex_ guards one manager only and cannot serialize cross-entity callers */
+    static std::mutex prepareMutex;
+    std::lock_guard<std::mutex> guard(prepareMutex);
+
     // If can get rdmaHandle, maybe the device has been opened, can try get rdmaHandle directly.
     if (DlHccpApi::RaRdevGetHandle(device, rdmaHandle) == 0) {
         if (rdmaHandle != nullptr) {
