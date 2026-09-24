@@ -815,6 +815,11 @@ int32_t MemEntityDefault::CopyData(hybm_copy_params &params, hybm_data_copy_dire
         BM_LOG_ERROR("the object is not initialized, please check whether Initialize is called.");
         return BM_NOT_INITIALIZED;
     }
+    if (dataOperator_ == nullptr) {
+        BM_LOG_ERROR("Data copy failed, dataOperator_ is null (entity without a host copy "
+                     "operator, e.g. ai core initiate).");
+        return BM_ERROR;
+    }
     BM_ASSERT_RETURN(SetThreadAclDevice() == BM_OK, BM_ERROR);
 
     int32_t ret = BM_OK;

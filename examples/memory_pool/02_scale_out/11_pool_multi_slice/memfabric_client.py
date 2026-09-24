@@ -3,14 +3,19 @@
 # Copyright: (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
 """Pool multi-slice expansion: two extend_remote_mem slots on one pool, device-scheduled.
 
-Same topology as 09/10, but the pool is grown twice: a second extend_local_mem and a second
-extend_remote_mem give the SAME pool two block MRs per rank. That pushes ConnectRankInfo's
-memoryMap to two entries per rank, and the device-visible QP/MR table must expose both
-(MR_SLOTS_PER_RANK slots per rank; a range lookup picks the covering slot). Flow: extend
-local slots 1/2 + remote slots 1/2 -> host-load two distinct patterns into the local slots
--> warmup WRITE both local->far pairs -> capture BOTH writes in one NPU graph -> replays ->
-zero the local slots -> READ both far slots back -> verify each pattern came back through
-its own slice (a slot mix-up would cross the patterns) -> clean destroy.
+Same topology as 09/10, but the pool is grown twice per side: a second extend_local_mem and
+a second extend_remote_mem give the SAME pool two block MRs per rank, so every rank's
+ConnectRankInfo.memoryMap holds two entries and the device-visible QP/MR table must expose
+both through its per-rank MR slots (MR_SLOTS_PER_RANK = 8; a range lookup picks the covering
+slot). Endpoints are registered torch tensors: device-scheduled pools keep NO host copy
+operator by design (host copy_data would be rejected), so every transfer is a device_copy.
+
+Flow: extend local slots 1/2 + FAR slices 1/2 -> register tensors with two distinct patterns
+-> warmup W1 tensor->FAR slice (remote slot lookup) and W2 FAR slice->local slot (local slot
+lookup) -> capture BOTH tensor writes in one NPU graph -> replays -> verify A: read both FAR
+slices back, each must carry its own pattern -> verify B: push local slots back through the
+FAR slices and read again, proving the W2 download really landed in the local slots -> a
+crossed pattern at any point means the kernel picked the wrong MR slot -> clean destroy.
 """
 
 import argparse
@@ -18,8 +23,6 @@ import os
 import socket
 import sys
 import time
-
-import numpy as np
 
 import memfabric_hybrid as mf
 from memfabric_hybrid import ralloc
@@ -183,34 +186,51 @@ def main():
              f"[0x{far_gvas[0]:x}, 0x{far_gvas[1]:x}), local slots [0x{lgva1:x}, 0x{lgva2:x}), "
              f"{block} bytes each")
 
-        # ---- two distinct host patterns -> local slots (host copy path) ----
+        # ---- registered tensors carry the patterns (host copy_data is unavailable on
+        # device-scheduled pools: every transfer below is a device_copy) ----
         words = size // 4
-        pat1 = (np.arange(words, dtype=np.int32) * 7 + rank + 1)
-        pat2 = (np.arange(words, dtype=np.int32) * 13 + rank + 101)
-        assert handle.copy_data(pat1.ctypes.data, lgva1, size, 0) == 0, "host load pattern1 failed"
-        assert handle.copy_data(pat2.ctypes.data, lgva2, size, 0) == 0, "host load pattern2 failed"
-        _log(f"[client] patterns loaded: {size} bytes each (seeds {rank + 1} / {rank + 101})")
+        src1 = torch.empty(size, dtype=torch.uint8, device="npu")
+        src2 = torch.empty(size, dtype=torch.uint8, device="npu")
+        dst = torch.empty(size, dtype=torch.uint8, device="npu")
+        src1_addr, src2_addr, dst_addr = src1.data_ptr(), src2.data_ptr(), dst.data_ptr()
+        assert src1_addr != 0 and src2_addr != 0 and dst_addr != 0, "tensor allocation failed"
+        seed1, seed2 = rank + 1, rank + 101
+        pat1 = (torch.arange(words, dtype=torch.int32, device="npu") * 7 + seed1)
+        pat2 = (torch.arange(words, dtype=torch.int32, device="npu") * 13 + seed2)
+        src1.view(torch.int32).copy_(pat1)
+        src2.view(torch.int32).copy_(pat2)
+        dst.zero_()
+        torch.npu.synchronize()
+        assert handle.register(src1_addr, size) == 0, "register(src1 tensor) failed"
+        assert handle.register(src2_addr, size) == 0, "register(src2 tensor) failed"
+        assert handle.register(dst_addr, size) == 0, "register(dst tensor) failed"
+        _log(f"[client] patterns registered: {size} bytes each (seeds {seed1} / {seed2})")
 
-        # warmup both writes on a side stream, OUTSIDE any graph: the first device_copy dlopens
-        # and loads the kernel library, which is illegal inside capture
+        # warmup on a side stream, OUTSIDE any graph: the first device_copy dlopens and loads
+        # the kernel library, which is illegal inside capture.
+        # W1: tensor -> FAR slice x2  (remote pool MR slot lookup)
+        # W2: FAR slice -> local slice x2  (local pool MR slot lookup)
         side = torch.npu.Stream()
         side.wait_stream(torch.npu.current_stream())
         with torch.npu.stream(side):
             stream_ptr = torch.npu.current_stream().npu_stream
-            assert handle.device_copy(lgva1, far_gvas[0], size, stream_ptr) == 0, "warmup write1 failed"
-            assert handle.device_copy(lgva2, far_gvas[1], size, stream_ptr) == 0, "warmup write2 failed"
+            assert handle.device_copy(src1_addr, far_gvas[0], size, stream_ptr) == 0, "W1 write1 failed"
+            assert handle.device_copy(src2_addr, far_gvas[1], size, stream_ptr) == 0, "W1 write2 failed"
+            assert handle.device_copy(far_gvas[0], lgva1, size, stream_ptr) == 0, "W2 download1 failed"
+            assert handle.device_copy(far_gvas[1], lgva2, size, stream_ptr) == 0, "W2 download2 failed"
         torch.npu.synchronize()
-        _log("[client] warmup writes OK (kernel library loaded, both slices reachable)")
+        _log("[client] warmup OK: W1 tensor->FAR slots, W2 FAR slots->local slots (kernel library loaded, "
+             "both remote and local MR slots reachable)")
 
-        # capture BOTH writes into one NPU graph: local slice -> matching FAR slice + quiet
+        # capture BOTH writes into one NPU graph: tensor -> matching FAR slice + quiet
         graph = torch.npu.NPUGraph()
         torch.npu.synchronize()
         with torch.npu.stream(side):
             graph.capture_begin()
-            assert handle.device_copy(lgva1, far_gvas[0], size,
+            assert handle.device_copy(src1_addr, far_gvas[0], size,
                                       torch.npu.current_stream().npu_stream) == 0, \
                 "captured copy1 submit failed"
-            assert handle.device_copy(lgva2, far_gvas[1], size,
+            assert handle.device_copy(src2_addr, far_gvas[1], size,
                                       torch.npu.current_stream().npu_stream) == 0, \
                 "captured copy2 submit failed"
             graph.capture_end()
@@ -226,26 +246,38 @@ def main():
         _log(f"[client] {args.replays} replays done: {moved / GIB:.2f} GiB in {t_replay * 1e3:.2f} ms, "
              f"{moved / t_replay / GIB:.2f} GB/s device-scheduled")
 
-        # ---- verify: zero the local slots, READ both FAR slices back, compare ----
-        zero = np.zeros(words, dtype=np.int32)
-        assert handle.copy_data(zero.ctypes.data, lgva1, size, 0) == 0, "zero local1 failed"
-        assert handle.copy_data(zero.ctypes.data, lgva2, size, 0) == 0, "zero local2 failed"
-        assert handle.device_copy(far_gvas[0], lgva1, size, 0) == 0, "verify read1 failed"
-        assert handle.device_copy(far_gvas[1], lgva2, size, 0) == 0, "verify read2 failed"
-        torch.npu.synchronize()
-        back1 = np.empty(words, dtype=np.int32)
-        back2 = np.empty(words, dtype=np.int32)
-        assert handle.copy_data(lgva1, back1.ctypes.data, size, 0) == 0, "host fetch1 failed"
-        assert handle.copy_data(lgva2, back2.ctypes.data, size, 0) == 0, "host fetch2 failed"
-        assert np.array_equal(back1, pat1), "verify failed: slice1 pattern mismatch (MR slot mix-up?)"
-        assert np.array_equal(back2, pat2), "verify failed: slice2 pattern mismatch (MR slot mix-up?)"
-        _log(f"[client] verify OK: both FAR slices carry their own pattern after {args.replays} replays "
-             f"(kernel MR-slot lookup picked the covering slot for each endpoint)")
+        # ---- verify A: read both FAR slices back, each must carry its own pattern ----
+        for gva, pat, tag in ((far_gvas[0], pat1, "slice1"), (far_gvas[1], pat2, "slice2")):
+            dst.zero_()
+            assert handle.device_copy(gva, dst_addr, size, 0) == 0, f"verifyA read {tag} failed"
+            torch.npu.synchronize()
+            assert torch.equal(dst.view(torch.int32), pat), \
+                f"verifyA failed: {tag} pattern mismatch (MR slot mix-up?)"
+        _log(f"[client] verify A OK: both FAR slices carry their own pattern after {args.replays} replays")
 
+        # ---- verify B: local slot round trip. Push the W2 downloads back through the FAR
+        # slices (local pool slot read + remote slot write) and read again: equality proves
+        # W2 really landed the patterns in the LOCAL slots through the second MR of each rank.
+        assert handle.device_copy(lgva1, far_gvas[0], size, 0) == 0, "verifyB upload1 failed"
+        assert handle.device_copy(lgva2, far_gvas[1], size, 0) == 0, "verifyB upload2 failed"
+        torch.npu.synchronize()
+        for gva, pat, tag in ((far_gvas[0], pat1, "local1"), (far_gvas[1], pat2, "local2")):
+            dst.zero_()
+            assert handle.device_copy(gva, dst_addr, size, 0) == 0, f"verifyB read {tag} failed"
+            torch.npu.synchronize()
+            assert torch.equal(dst.view(torch.int32), pat), \
+                f"verifyB failed: {tag} pattern mismatch (local MR slot mix-up?)"
+        _log("[client] verify B OK: local slots round-tripped their own patterns "
+             "(peer->local and local->peer both picked the covering MR slot)")
+
+        assert handle.unregister(dst_addr) == 0, "unregister(dst tensor) failed"
+        assert handle.unregister(src1_addr) == 0, "unregister(src1 tensor) failed"
+        assert handle.unregister(src2_addr) == 0, "unregister(src2 tensor) failed"
+        del src1, src2, dst, pat1, pat2
         handle.destroy()
         mf.get_and_clear_last_err_msg()
         assert mf.get_last_err_msg() == "", mf.get_last_err_msg()
-        _log(f"[client rank {rank}] pool destroyed, exiting")
+        _log(f"[client rank {rank}] tensors unregistered, pool destroyed, exiting")
     finally:
         if ralloc_inited:
             ralloc.uninitialize(0)
