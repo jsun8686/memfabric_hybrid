@@ -577,8 +577,11 @@ void FixedRanksQpManager::CloseClientConnections() noexcept
 
 void FixedRanksQpManager::CloseServerConnections() noexcept
 {
-    DestroyServerSocket();
+    /* close per-channel resources first, while the shared listen handle is still alive
+     * (BatchClose dereferences socketOps through it); DestroyServerSocket, the sole owner,
+     * then deinits the listen handle exactly once */
     CloseConnections(serverConnections_);
+    DestroyServerSocket();
 }
 
 void FixedRanksQpManager::CloseConnections(std::unordered_map<uint32_t, AiCoreConnChannel> &connections) noexcept
@@ -611,9 +614,15 @@ void FixedRanksQpManager::CloseConnections(std::unordered_map<uint32_t, AiCoreCo
     }
 
     for (auto it = connections.begin(); it != connections.end(); ++it) {
-        auto ret = DlHccpApi::RaSocketDeinit(it->second.socketHandle);
-        if (ret != 0) {
-            BM_LOG_INFO("deinit socket to server: " << it->first << " return: " << ret);
+        /* server channels borrow the shared listen handle (serverSocketHandle_, registered
+         * per entry in GenerateWhiteList); its lifetime is owned by DestroyServerSocket.
+         * Deinit-ing it here double-frees: RaSocketDeinit NULLs ops before free, so a second
+         * call dereferences the NULL ops and crashes inside libra. */
+        if (it->second.socketHandle != nullptr && it->second.socketHandle != serverSocketHandle_) {
+            auto ret = DlHccpApi::RaSocketDeinit(it->second.socketHandle);
+            if (ret != 0) {
+                BM_LOG_INFO("deinit socket to server: " << it->first << " return: " << ret);
+            }
         }
     }
 
