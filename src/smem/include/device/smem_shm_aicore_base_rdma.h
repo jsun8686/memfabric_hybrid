@@ -47,15 +47,19 @@ struct AIVRDMAInfo {
     uint64_t rqPtr;  // pointer to receive queue address array of size [PE_NUM][qpNum]
     uint64_t scqPtr; // pointer to send completion queue address array of size [PE_NUM][qpNum]
     uint64_t rcqPtr; // pointer to receive completion queue address array of size [PE_NUM][qpNum]
-    uint64_t memPtr; // pointer to memory region array of size [MAX_PE_NUM]
+    uint64_t memPtr; // pointer to memory region array of size [rankCount], entry layout must stay
+                     // binary-identical to RdmaMemRegionInfo in dl_hccp_def.h (filled host-side
+                     // by FixedRanksQpManager::FillQpInfo)
 };
 
 struct memInfo {
-    uint64_t size; // size of the memory region
-    uint64_t addr; // start address of the memory region
-    uint32_t lkey; // local key of the memory region
-    uint32_t rkey; // remote key of the memory region
-};
+    uint64_t size;        // size of the memory region
+    uint64_t addr;        // start address of the memory region
+    uint32_t lkey;        // local key of the memory region
+    uint32_t rkey;        // remote key of the memory region
+    uint64_t regAddress;  // device-dma base the MR was registered under (equals addr for hbm)
+}; /* must stay binary-identical to RdmaMemRegionInfo in dl_hccp_def.h: the host side fills the
+    * table via FixedRanksQpManager::FillQpInfo with RdmaMemRegionInfo entries */
 
 enum class DBMode : int32_t { INVALID_DB = -1, HW_DB = 0, SW_DB };
 
@@ -267,14 +271,23 @@ SMEM_SHM_INLINE_AICORE void smem_shm_rdma_post_send(__gm__ uint8_t *remoteAddr, 
     *(__gm__ uint32_t *)(wqeAddr + 16) = 0;         // [128:151] start_sge_index = 0
     __gm__ memInfo *remoteMemInfo = (__gm__ memInfo *)(memInfoTable + sizeof(memInfo) * destRankId);
     *(__gm__ uint32_t *)(wqeAddr + 20) = remoteMemInfo->rkey;  // rkey
-    *(__gm__ uint64_t *)(wqeAddr + 24) = (uint64_t)remoteAddr; // remote VA
+    // the rkey covers the device-dma range the remote MR was registered under: translate the
+    // pool GVA into that range (identity for hbm pools where regAddress == addr)
+    uint64_t remoteRegAddr = (remoteMemInfo->regAddress != 0)
+                                 ? remoteMemInfo->regAddress + ((uint64_t)remoteAddr - remoteMemInfo->addr)
+                                 : (uint64_t)remoteAddr;
+    *(__gm__ uint64_t *)(wqeAddr + 24) = remoteRegAddr;  // remote VA
 
     // Write SGE to HBM
     __gm__ uint8_t *sgeAddr = wqeAddr + sizeof(wqeCtx);
     *(__gm__ uint32_t *)(sgeAddr) = messageLen; // message size in bytes
     __gm__ memInfo *localMemInfo = (__gm__ memInfo *)(memInfoTable + sizeof(memInfo) * smem_shm_get_global_rank(0));
     *(__gm__ uint32_t *)(sgeAddr + 4) = localMemInfo->lkey;  // lkey
-    *(__gm__ uint64_t *)(sgeAddr + 8) = (uint64_t)localAddr; // local VA
+    // same translation for the local endpoint (identity for hbm pools where regAddress == addr)
+    uint64_t localRegAddr = (localMemInfo->regAddress != 0)
+                                ? localMemInfo->regAddress + ((uint64_t)localAddr - localMemInfo->addr)
+                                : (uint64_t)localAddr;
+    *(__gm__ uint64_t *)(sgeAddr + 8) = localRegAddr;  // local VA
 
     // WQE & SGE cache flush
     cacheWriteThrough(wqeAddr, sizeof(wqeCtx) + sizeof(segCtx));
