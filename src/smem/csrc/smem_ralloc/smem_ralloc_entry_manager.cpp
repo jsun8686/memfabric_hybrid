@@ -628,45 +628,15 @@ void SmemRallocEntryManager::ReapEmptyPools()
             }
         }
     }
-    /* defer the teardown instead of running it here: hccp/libra socket teardown driven from
-     * the reporter thread crashes (RaSocketDeinit SIGSEGV inside libra.so, gdb-proven), the
-     * teardown is executed by RunPendingReap() on the caller-controlled thread instead */
-    if (victims.empty()) {
-        return;
-    }
-    std::lock_guard<std::mutex> guard(reapMutex_);
-    for (auto &entry : victims) {
-        bool queued = false;
-        for (auto &pending : pendingReapEnts_) {
-            if (pending.Get() == entry.Get()) {
-                queued = true;
-                break;
-            }
-        }
-        if (!queued) {
-            SM_LOG_INFO("defer reap pool-empty entry, id: " << entry->Id());
-            pendingReapEnts_.push_back(entry);
-        }
-    }
-}
-
-void SmemRallocEntryManager::RunPendingReap()
-{
-    std::vector<SmemRallocEntryPtr> victims;
-    {
-        std::lock_guard<std::mutex> guard(reapMutex_);
-        if (pendingReapEnts_.empty()) {
-            return;
-        }
-        victims.swap(pendingReapEnts_);
-    }
-    /* teardown outside the reap lock: UnInitialize does a group leave which may take long */
+    /* teardown outside the entry lock: UnInitialize does a group leave which may take long */
     for (auto &entry : victims) {
         SM_LOG_INFO("reap pool-empty entry, id: " << entry->Id());
         entry->UnInitialize();
         (void)RemoveEntryByPtr(reinterpret_cast<uintptr_t>(entry.Get()));
     }
-    ReportCommittedBytes(0U); /* refresh master accounting right after the teardown */
+    if (!victims.empty()) {
+        ReportCommittedBytes(0U); /* refresh master accounting right after the teardown */
+    }
 }
 
 void SmemRallocEntryManager::Destroy()
@@ -683,12 +653,6 @@ void SmemRallocEntryManager::Destroy()
         }
         ptr2EntryMap_.clear();
         entryIdMap_.clear();
-    }
-    /* pending victims are still inside ptr2EntryMap_ above and got uninitialized there
-     * (UnInitialize is idempotent); just drop the stale references */
-    {
-        std::lock_guard<std::mutex> guard(reapMutex_);
-        pendingReapEnts_.clear();
     }
     /* stop the control plane (and the reporter thread) without holding the entry lock,
      * the reporter also takes the entry lock while reporting */

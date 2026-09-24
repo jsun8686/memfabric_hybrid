@@ -380,11 +380,6 @@ public:
         return smem_ralloc_get_rank_id();
     }
 
-    static int32_t Maintenance(uint32_t flags) noexcept
-    {
-        return smem_ralloc_maintenance(flags);
-    }
-
     static RallocPool *Create(uint32_t id, uint64_t maxDramSize, uint64_t maxHbmSize,
                               smem_ralloc_data_op_type dataOpType, bool enable56BitsGva, uint32_t flags)
     {
@@ -1155,17 +1150,6 @@ Arguments:
 Get the rank id, assigned during initialize.
 Returns:
     rank id if successful, UINT32_MAX is returned if failed.)");
-
-    m.def("maintenance", &RallocPool::Maintenance, py::call_guard<py::gil_scoped_release>(), py::arg("flags") = 0, R"(
-Run deferred pool maintenance: teardowns of pool-empty FAR entries are queued by the internal
-reporter thread and executed here on the calling thread (libra socket teardown crashes when
-driven from the reporter thread). Long-lived FAR processes should call this periodically from
-their main loop, e.g. once per second.
-
-Arguments:
-    flags(int): reserved, default 0
-Returns:
-    0 if successful)");
 
     m.def("create", &RallocPool::CreateFlexible, py::arg("id"),
           py::arg("max_dram_size"), py::arg("max_hbm_size") = 0,

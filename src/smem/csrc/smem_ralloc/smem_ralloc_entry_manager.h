@@ -16,7 +16,6 @@
 #include <condition_variable>
 #include <string>
 #include <thread>
-#include <vector>
 #include "smem_net_common.h"
 #include "smem_ralloc.h"
 #include "smem_ralloc_entry.h"
@@ -102,11 +101,6 @@ public:
     /* wake the reporter for an immediate committed-bytes report (master change / join alloc / reap) */
     void PokeReporter();
 
-    /* execute pool teardowns deferred by the reporter (see ReapEmptyPools): call from a
-     * caller-controlled thread — libra (CANN) socket teardown crashes when driven from the
-     * reporter thread (RaSocketDeinit SIGSEGV), while the main-thread teardown is proven safe */
-    void RunPendingReap();
-
 private:
     int32_t PrepareStore();
     int32_t RacingForStoreServer();
@@ -149,10 +143,6 @@ private:
     std::mutex reporterMutex_;
     std::condition_variable reporterCv_;
     bool reporterPoke_ = false;
-    /* pool-empty victims collected by the reporter, torn down by RunPendingReap on the caller's
-     * thread (reporter-thread teardown crashes inside libra RaSocketDeinit) */
-    std::mutex reapMutex_;
-    std::vector<SmemRallocEntryPtr> pendingReapEnts_;
     uint32_t masterWatchId_ = UINT32_MAX;
     uint32_t rankWatchId_ = UINT32_MAX;
     mutable std::mutex masterMutex_;
