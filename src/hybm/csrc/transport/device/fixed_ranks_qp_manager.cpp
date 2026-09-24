@@ -163,7 +163,7 @@ bool FixedRanksQpManager::ReserveQpInfoSpace() noexcept
     }
 
     void *ptr = nullptr;
-    auto oneQpSize = 2U * (sizeof(AiQpRMAWQ) + sizeof(AiQpRMACQ)) + sizeof(RdmaMemRegionInfo);
+    auto oneQpSize = 2U * (sizeof(AiQpRMAWQ) + sizeof(AiQpRMACQ)) + sizeof(RdmaMemRegionInfo) * MR_SLOTS_PER_RANK;
     qpInfoSize_ = sizeof(AiQpRMAQueueInfo) + oneQpSize * rankCount_;
     auto ret = DlAclApi::AclrtMalloc(&ptr, qpInfoSize_, 0);
     if (ret != 0) {
@@ -464,13 +464,25 @@ int FixedRanksQpManager::FillQpInfo() noexcept
         if (map.empty()) {
             continue;
         }
-        copyInfo->mr[it->first].size = map.begin()->second.size;
-        copyInfo->mr[it->first].addr = map.begin()->second.address;
-        copyInfo->mr[it->first].lkey = map.begin()->second.lkey;
-        copyInfo->mr[it->first].rkey = map.begin()->second.rkey;
-        /* device-dma base the MR was registered under (host-dram iova; equals address for hbm):
-         * the device-side WQE/SGE addresses must be translated into this range */
-        copyInfo->mr[it->first].regAddress = map.begin()->second.regAddress;
+        /* fill up to MR_SLOTS_PER_RANK slots per rank (map is ordered by address, descending):
+         * slot 0 holds the highest-address block; unused slots stay zero (addr == 0) */
+        auto *mrSlots = copyInfo->mr + it->first * MR_SLOTS_PER_RANK;
+        uint32_t filled = 0;
+        for (auto mrIt = map.begin(); mrIt != map.end() && filled < MR_SLOTS_PER_RANK; ++mrIt, ++filled) {
+            auto &slot = mrSlots[filled];
+            slot.size = mrIt->second.size;
+            slot.addr = mrIt->second.address;
+            slot.lkey = mrIt->second.lkey;
+            slot.rkey = mrIt->second.rkey;
+            /* device-dma base the MR was registered under (host-dram iova; equals address for hbm):
+             * the device-side WQE/SGE addresses must be translated into this range */
+            slot.regAddress = mrIt->second.regAddress;
+        }
+        if (map.size() > MR_SLOTS_PER_RANK) {
+            BM_LOG_WARN("rank " << it->first << " has " << map.size()
+                                << " memory regions, only the first " << MR_SLOTS_PER_RANK
+                                << " are visible to device-scheduled kernels");
+        }
         if (it->first == rankId_) {
             continue;
         }

@@ -65,6 +65,10 @@ constexpr uint32_t SMEM_RALLOC_NUM_CQE_PER_POLL_CQ = 100;
 constexpr uint32_t SMEM_RALLOC_CQE_OWNER_SHIFT = 7;
 
 /* ---- QP ring / MR table layouts, in sync with dl_hccp_def.h (AiQpRMAWQ etc.) ---- */
+constexpr uint32_t SMEM_RALLOC_MR_SLOTS_PER_RANK = 8; /* vendored copy of MR_SLOTS_PER_RANK
+                                                       * (dl_hccp_def.h): pool block MR slots
+                                                       * per rank in the table at memPtr */
+
 enum class SmemRallocDBMode : int32_t { INVALID_DB = -1, HW_DB = 0, SW_DB };
 
 struct SmemRallocWQCtx {
@@ -163,7 +167,8 @@ struct SmemRallocRdmaInfo {
     uint64_t rqPtr;  /* receive queue array of [rankCount][qpNum] WQCtx */
     uint64_t scqPtr; /* send completion queue array of [rankCount][qpNum] CQCtx */
     uint64_t rcqPtr; /* receive completion queue array of [rankCount][qpNum] CQCtx */
-    uint64_t memPtr; /* memory region array of [rankCount] MemInfo, pool block MR per rank */
+    uint64_t memPtr; /* memory region array of [rankCount][SMEM_RALLOC_MR_SLOTS_PER_RANK] MemInfo:
+                      * up to 8 pool block MRs per rank, zero slots (addr == 0) never match */
 };
 
 /* ---- meta accessors ---- */
@@ -215,6 +220,27 @@ SMEM_RALLOC_INLINE_AICORE void smem_ralloc_cache_write_through(__gm__ uint8_t *s
         AscendC::DataCacheCleanAndInvalid<uint8_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
                                           AscendC::DcciDst::CACHELINE_OUT>(global[i]);
     }
+}
+
+/**
+ * @brief Look up the pool memory region covering addr among the SMEM_RALLOC_MR_SLOTS_PER_RANK
+ *        slots of rankId (slots beyond the filled ones stay zero-filled by the host: their
+ *        addr == 0 never matches). Used for both endpoints of a WQE: the remote target under
+ *        its owning rank and the local source under this rank's own slots.
+ * @return the covering slot, or nullptr when no slot of that rank matches.
+ */
+SMEM_RALLOC_INLINE_AICORE __gm__ SmemRallocMemInfo *smem_ralloc_lookup_pool_mr(uint64_t memInfoTable,
+                                                                               uint32_t rankId, uint64_t addr)
+{
+    __gm__ SmemRallocMemInfo *slots = (__gm__ SmemRallocMemInfo *)(
+        memInfoTable + sizeof(SmemRallocMemInfo) * rankId * SMEM_RALLOC_MR_SLOTS_PER_RANK);
+    for (uint32_t i = 0; i < SMEM_RALLOC_MR_SLOTS_PER_RANK; i++) {
+        __gm__ SmemRallocMemInfo *slot = slots + i;
+        if (slot->addr != 0 && addr >= slot->addr && addr < slot->addr + slot->size) {
+            return slot;
+        }
+    }
+    return nullptr;
 }
 
 /**
@@ -431,8 +457,14 @@ SMEM_RALLOC_INLINE_AICORE void smem_ralloc_rdma_post_send(uint32_t entityId, __g
     *(__gm__ uint32_t *)(wqeAddr + 8) = 0;         /* immediate data, 0 */
     *(__gm__ uint32_t *)(wqeAddr + 12) = 1 << 24;  /* [120:127] num_sge = 1 */
     *(__gm__ uint32_t *)(wqeAddr + 16) = 0;        /* [128:151] start_sge_index = 0 */
-    __gm__ SmemRallocMemInfo *remoteMemInfo = (__gm__ SmemRallocMemInfo *)(memInfoTable + sizeof(SmemRallocMemInfo) *
-                                                                                      destRankId);
+    __gm__ SmemRallocMemInfo *remoteMemInfo =
+        smem_ralloc_lookup_pool_mr(memInfoTable, destRankId, (uint64_t)remoteAddr);
+    if (remoteMemInfo == nullptr) {
+        /* remote endpoint outside every pool MR slot of that rank: report the miss for host-side
+         * diagnostics and skip the WQE */
+        smem_ralloc_report_user_mr_lookup_miss(entityId);
+        return;
+    }
     *(__gm__ uint32_t *)(wqeAddr + 20) = remoteMemInfo->rkey;  /* remote key */
     /* the rkey covers the device-dma range the remote MR was registered under: translate the
      * pool GVA into that range (identity for hbm pools where regAddress == addr) */
@@ -444,13 +476,12 @@ SMEM_RALLOC_INLINE_AICORE void smem_ralloc_rdma_post_send(uint32_t entityId, __g
     /* write SGE to HBM */
     __gm__ uint8_t *sgeAddr = wqeAddr + sizeof(SmemRallocWqeCtx);
     *(__gm__ uint32_t *)(sgeAddr) = messageLen;
-    __gm__ SmemRallocMemInfo *localMemInfo = (__gm__ SmemRallocMemInfo *)(
-        memInfoTable + sizeof(SmemRallocMemInfo) * smem_ralloc_get_global_rank(entityId));
+    __gm__ SmemRallocMemInfo *localMemInfo = smem_ralloc_lookup_pool_mr(
+        memInfoTable, smem_ralloc_get_global_rank(entityId), (uint64_t)localAddr);
     uint32_t localLkey;
     uint64_t localRegAddr;
-    if ((uint64_t)localAddr >= localMemInfo->addr &&
-        (uint64_t)localAddr < localMemInfo->addr + localMemInfo->size) {
-        /* endpoint inside this rank's pool MR */
+    if (localMemInfo != nullptr) {
+        /* endpoint inside one of this rank's pool MR slots */
         localLkey = localMemInfo->lkey;
         /* the lkey covers the device-dma range this block was registered under, not the GVA
          * range: translate the pool GVA into that range (identity for hbm pools) */

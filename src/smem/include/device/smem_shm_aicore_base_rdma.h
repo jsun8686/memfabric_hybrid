@@ -47,9 +47,10 @@ struct AIVRDMAInfo {
     uint64_t rqPtr;  // pointer to receive queue address array of size [PE_NUM][qpNum]
     uint64_t scqPtr; // pointer to send completion queue address array of size [PE_NUM][qpNum]
     uint64_t rcqPtr; // pointer to receive completion queue address array of size [PE_NUM][qpNum]
-    uint64_t memPtr; // pointer to memory region array of size [rankCount], entry layout must stay
-                     // binary-identical to RdmaMemRegionInfo in dl_hccp_def.h (filled host-side
-                     // by FixedRanksQpManager::FillQpInfo)
+    uint64_t memPtr; // pointer to memory region array of size [rankCount][SMEM_SHM_MR_SLOTS_PER_RANK],
+                     // entry layout must stay binary-identical to RdmaMemRegionInfo in dl_hccp_def.h
+                     // (filled host-side by FixedRanksQpManager::FillQpInfo); unused slots stay
+                     // zero-filled (addr == 0 never matches)
 };
 
 struct memInfo {
@@ -60,6 +61,10 @@ struct memInfo {
     uint64_t regAddress;  // device-dma base the MR was registered under (equals addr for hbm)
 }; /* must stay binary-identical to RdmaMemRegionInfo in dl_hccp_def.h: the host side fills the
     * table via FixedRanksQpManager::FillQpInfo with RdmaMemRegionInfo entries */
+
+constexpr uint32_t SMEM_SHM_MR_SLOTS_PER_RANK = 8; /* vendored copy of MR_SLOTS_PER_RANK
+                                                    * (dl_hccp_def.h): pool block MR slots per
+                                                    * rank in the table at memPtr */
 
 enum class DBMode : int32_t { INVALID_DB = -1, HW_DB = 0, SW_DB };
 
@@ -122,6 +127,27 @@ struct HybmDeviceMeta {
     uint64_t qpInfoAddress;
     uint64_t reserved[12]; // total 128B, equal HYBM_DEVICE_PRE_META_SIZE
 };
+
+/**
+ * @brief Look up the pool memory region covering addr among the SMEM_SHM_MR_SLOTS_PER_RANK slots
+ *        of rankId (unused slots stay zero-filled: addr == 0 never matches). Used for both
+ *        endpoints of a WQE: the remote target under its owning rank and the local source under
+ *        this rank's own slots.
+ * @return the covering slot, or nullptr when no slot of that rank matches.
+ */
+SMEM_SHM_INLINE_AICORE __gm__ memInfo *smem_shm_lookup_pool_mr(uint64_t memInfoTable, uint32_t rankId,
+                                                               uint64_t addr)
+{
+    __gm__ memInfo *slots =
+        (__gm__ memInfo *)(memInfoTable + sizeof(memInfo) * rankId * SMEM_SHM_MR_SLOTS_PER_RANK);
+    for (uint32_t i = 0; i < SMEM_SHM_MR_SLOTS_PER_RANK; i++) {
+        __gm__ memInfo *slot = slots + i;
+        if (slot->addr != 0 && addr >= slot->addr && addr < slot->addr + slot->size) {
+            return slot;
+        }
+    }
+    return nullptr;
+}
 
 /**
  * @brief RDMA Poll Completion Queue (CQ) function. Return status: 0 means success, non-zero means error.
@@ -269,7 +295,11 @@ SMEM_SHM_INLINE_AICORE void smem_shm_rdma_post_send(__gm__ uint8_t *remoteAddr, 
     *(__gm__ uint32_t *)(wqeAddr + 8) = 0;          // immtdata is always 0 till we provide poll CQ flow in AIV
     *(__gm__ uint32_t *)(wqeAddr + 12) = 1 << 24;   // [120:127] num_sge = 1
     *(__gm__ uint32_t *)(wqeAddr + 16) = 0;         // [128:151] start_sge_index = 0
-    __gm__ memInfo *remoteMemInfo = (__gm__ memInfo *)(memInfoTable + sizeof(memInfo) * destRankId);
+    __gm__ memInfo *remoteMemInfo = smem_shm_lookup_pool_mr(memInfoTable, destRankId, (uint64_t)remoteAddr);
+    if (remoteMemInfo == nullptr) {
+        // remote endpoint outside every pool MR slot of that rank: skip the WQE
+        return;
+    }
     *(__gm__ uint32_t *)(wqeAddr + 20) = remoteMemInfo->rkey;  // rkey
     // the rkey covers the device-dma range the remote MR was registered under: translate the
     // pool GVA into that range (identity for hbm pools where regAddress == addr)
@@ -281,7 +311,12 @@ SMEM_SHM_INLINE_AICORE void smem_shm_rdma_post_send(__gm__ uint8_t *remoteAddr, 
     // Write SGE to HBM
     __gm__ uint8_t *sgeAddr = wqeAddr + sizeof(wqeCtx);
     *(__gm__ uint32_t *)(sgeAddr) = messageLen; // message size in bytes
-    __gm__ memInfo *localMemInfo = (__gm__ memInfo *)(memInfoTable + sizeof(memInfo) * smem_shm_get_global_rank(0));
+    __gm__ memInfo *localMemInfo = smem_shm_lookup_pool_mr(memInfoTable, smem_shm_get_global_rank(0),
+                                                            (uint64_t)localAddr);
+    if (localMemInfo == nullptr) {
+        // local endpoint outside every pool MR slot of this rank: skip the WQE
+        return;
+    }
     *(__gm__ uint32_t *)(sgeAddr + 4) = localMemInfo->lkey;  // lkey
     // same translation for the local endpoint (identity for hbm pools where regAddress == addr)
     uint64_t localRegAddr = (localMemInfo->regAddress != 0)
@@ -419,11 +454,14 @@ SMEM_SHM_INLINE_AICORE void smem_shm_roce_qpinfo_test(__gm__ uint8_t *gva, uint3
 
     // Write WQE to HBM
     __gm__ uint8_t *wqeAddr = (__gm__ uint8_t *)(sqBaseAddr + wqeSize * (curHead % depth));
-    __gm__ memInfo *remoteMemInfo = (__gm__ memInfo *)(memInfoTable + sizeof(memInfo) * destRankId);
+    __gm__ memInfo *remoteMemInfo = (__gm__ memInfo *)(memInfoTable +
+                                                       sizeof(memInfo) * destRankId * SMEM_SHM_MR_SLOTS_PER_RANK);
     *(__gm__ uint64_t *)(gva + 88) = (uint64_t)(remoteMemInfo->rkey);
 
     // Write SGE to HBM
-    __gm__ memInfo *localMemInfo = (__gm__ memInfo *)(memInfoTable + sizeof(memInfo) * smem_shm_get_global_rank(0));
+    __gm__ memInfo *localMemInfo =
+        (__gm__ memInfo *)(memInfoTable +
+                           sizeof(memInfo) * smem_shm_get_global_rank(0) * SMEM_SHM_MR_SLOTS_PER_RANK);
     *(__gm__ uint64_t *)(gva + 96) = (uint64_t)(localMemInfo->lkey);
     ; // lkey
 

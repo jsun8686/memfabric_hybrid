@@ -365,13 +365,19 @@ struct RdmaMemRegionInfo {
     uint64_t regAddress{0}; // device-dma base the MR was registered under (equals addr for hbm)
 };
 
+/* MR slots per rank in the device-visible table below: a pool block may be re-sliced (dynamic
+ * join / extend), so each rank exposes up to this many block MRs; the rest of the slots stay
+ * zero-filled (addr == 0 never matches a range lookup). Keep in sync with the vendored copies:
+ * smem_ralloc_aicore_base_rdma.h and smem_shm_aicore_base_rdma.h. */
+constexpr uint32_t MR_SLOTS_PER_RANK = 8;
+
 struct AiQpRMAQueueInfo {
     uint32_t count;
     struct AiQpRMAWQ *sq;
     struct AiQpRMAWQ *rq;
     struct AiQpRMACQ *scq;
     struct AiQpRMACQ *rcq;
-    RdmaMemRegionInfo *mr;
+    RdmaMemRegionInfo *mr; /* array of [rankCount * MR_SLOTS_PER_RANK] */
 };
 
 /**

@@ -147,6 +147,17 @@ int32_t FakeAclrtMemcpyOk(void* dst, size_t dstSize, const void* src, size_t src
     return 0;
 }
 
+std::vector<uint8_t> g_memcpyCapture;
+
+int32_t FakeAclrtMemcpyCapture(void* dst, size_t dstSize, const void* src, size_t srcSize, uint32_t kind)
+{
+    (void)dst;
+    (void)dstSize;
+    (void)kind;
+    g_memcpyCapture.assign(static_cast<const uint8_t*>(src), static_cast<const uint8_t*>(src) + srcSize);
+    return 0;
+}
+
 int FakeAclrtSetDeviceOk(uint32_t deviceId)
 {
     (void)deviceId;
@@ -1246,6 +1257,116 @@ TEST(FixedRanksQpManagerTestTest, FillQpInfoMissingConnectionForRemoteMr)
     manager.currentRanksInfo_ = ranks;
 
     EXPECT_EQ(manager.FillQpInfo(), BM_ERROR);
+}
+
+TEST(FixedRanksQpManagerTestTest, FillQpInfoMultiMrSlotsSuccess)
+{
+    sockaddr_in devNet{};
+    inet_aton("127.0.0.1", &devNet.sin_addr);
+    devNet.sin_port = htons(12345);
+    devNet.sin_family = AF_INET;
+
+    FixedRanksQpManagerTest manager(0, 0, 2, devNet);
+
+    DlAclApiFnGuard aclGuard;
+    DlAclApi::pAclrtMalloc = &FakeAclrtMallocOk;
+    DlAclApi::pAclrtMemcpy = &FakeAclrtMemcpyCapture;
+
+    EXPECT_TRUE(manager.ReserveQpInfoSpace());
+
+    // rank0(self): two block MRs (addresses 0x1000 and 0x2000); rank1: empty, skipped.
+    std::unordered_map<uint32_t, ConnectRankInfo> ranks;
+    sockaddr_in net0{};
+    inet_aton("192.168.1.1", &net0.sin_addr);
+    net0.sin_port = htons(12345);
+    net0.sin_family = AF_INET;
+
+    RegMemKeyUnion keyLow{};
+    keyLow.deviceKey = RegMemResult(0x1000, 0x100, reinterpret_cast<void*>(0x11UL), 1, 2);
+    RegMemKeyUnion keyHigh{};
+    keyHigh.deviceKey = RegMemResult(0x2000, 0x100, reinterpret_cast<void*>(0x22UL), 3, 4);
+    std::vector<TransportMemoryKey> bothKeys{keyLow.commonKey, keyHigh.commonKey};
+    ranks.emplace(0, ConnectRankInfo(HYBM_ROLE_PEER, net0, bothKeys));
+
+    sockaddr_in net1{};
+    inet_aton("192.168.1.2", &net1.sin_addr);
+    net1.sin_port = htons(12346);
+    net1.sin_family = AF_INET;
+    ranks.emplace(1, ConnectRankInfo(HYBM_ROLE_PEER, net1, std::vector<TransportMemoryKey>{}));
+
+    manager.currentRanksInfo_ = ranks;
+
+    EXPECT_EQ(manager.FillQpInfo(), BM_OK);
+
+    // the captured buffer mirrors the whole qpInfo_ block: header + 2*(WQ+CQ)*ranks + 8 MR slots per rank
+    const size_t rankCount = 2;
+    const size_t expectedSize = sizeof(AiQpRMAQueueInfo) +
+                                 rankCount * (2 * (sizeof(AiQpRMAWQ) + sizeof(AiQpRMACQ)) +
+                                              MR_SLOTS_PER_RANK * sizeof(RdmaMemRegionInfo));
+    ASSERT_EQ(g_memcpyCapture.size(), expectedSize);
+    size_t mrBase = sizeof(AiQpRMAQueueInfo) + rankCount * 2 * (sizeof(AiQpRMAWQ) + sizeof(AiQpRMACQ));
+    auto mr0 = reinterpret_cast<const RdmaMemRegionInfo*>(g_memcpyCapture.data() + mrBase);
+    auto mr1 = mr0 + MR_SLOTS_PER_RANK; // rank1's slot group
+
+    // rank0: slot0 holds the highest address (map is descending), slot1 the other MR, rest empty
+    EXPECT_EQ(mr0[0].addr, 0x2000UL);
+    EXPECT_EQ(mr0[0].size, 0x100UL);
+    EXPECT_EQ(mr0[0].lkey, 3U);
+    EXPECT_EQ(mr0[0].rkey, 4U);
+    EXPECT_EQ(mr0[0].regAddress, 0x2000UL);
+    EXPECT_EQ(mr0[1].addr, 0x1000UL);
+    EXPECT_EQ(mr0[1].lkey, 1U);
+    EXPECT_EQ(mr0[1].rkey, 2U);
+    for (uint32_t slot = 2; slot < MR_SLOTS_PER_RANK; slot++) {
+        EXPECT_EQ(mr0[slot].addr, 0UL) << "slot " << slot << " must stay zero-filled";
+    }
+    // rank1: empty memoryMap -> all slots zero
+    for (uint32_t slot = 0; slot < MR_SLOTS_PER_RANK; slot++) {
+        EXPECT_EQ(mr1[slot].addr, 0UL) << "rank1 slot " << slot << " must stay zero-filled";
+    }
+}
+
+TEST(FixedRanksQpManagerTestTest, FillQpInfoMrSlotsOverflowTruncated)
+{
+    sockaddr_in devNet{};
+    inet_aton("127.0.0.1", &devNet.sin_addr);
+    devNet.sin_port = htons(12345);
+    devNet.sin_family = AF_INET;
+
+    FixedRanksQpManagerTest manager(0, 0, 2, devNet);
+
+    DlAclApiFnGuard aclGuard;
+    DlAclApi::pAclrtMalloc = &FakeAclrtMallocOk;
+    DlAclApi::pAclrtMemcpy = &FakeAclrtMemcpyCapture;
+
+    EXPECT_TRUE(manager.ReserveQpInfoSpace());
+
+    // rank0(self): 9 MRs (0x1000..0x9000) > MR_SLOTS_PER_RANK: expect WARN + truncation to the
+    // 8 highest addresses (0x2000..0x9000); 0x1000 must not appear in any slot.
+    std::unordered_map<uint32_t, ConnectRankInfo> ranks;
+    sockaddr_in net0{};
+    inet_aton("192.168.1.1", &net0.sin_addr);
+    net0.sin_port = htons(12345);
+    net0.sin_family = AF_INET;
+
+    std::vector<TransportMemoryKey> keys;
+    for (uint32_t i = 1; i <= 9; i++) {
+        RegMemKeyUnion key{};
+        key.deviceKey = RegMemResult(0x1000UL * i, 0x100, reinterpret_cast<void*>(0x11UL), i, i);
+        keys.push_back(key.commonKey);
+    }
+    ranks.emplace(0, ConnectRankInfo(HYBM_ROLE_PEER, net0, keys));
+
+    manager.currentRanksInfo_ = ranks;
+
+    EXPECT_EQ(manager.FillQpInfo(), BM_OK);
+
+    size_t mrBase = sizeof(AiQpRMAQueueInfo) + 2 * 2 * (sizeof(AiQpRMAWQ) + sizeof(AiQpRMACQ));
+    auto mr0 = reinterpret_cast<const RdmaMemRegionInfo*>(g_memcpyCapture.data() + mrBase);
+    // slots hold the 8 highest addresses in descending order; the 9th (0x1000) is truncated away
+    for (uint32_t slot = 0; slot < MR_SLOTS_PER_RANK; slot++) {
+        EXPECT_EQ(mr0[slot].addr, 0x1000UL * (9 - slot)) << "slot " << slot;
+    }
 }
 
 TEST(FixedRanksQpManagerTestTest, CloseConnections)
