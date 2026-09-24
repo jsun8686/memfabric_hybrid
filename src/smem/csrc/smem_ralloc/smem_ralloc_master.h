@@ -59,6 +59,11 @@ public:
 
     Result OnPlacement(SmemRallocRpcMsg &msg);
 
+    /* contributor notifies that a granted block failed to land (extend/create failed on the
+     * executor): drop the matching optimistic reservation so the load view recovers before
+     * the TTL backstop; unknown node / no matching grant is a benign no-op */
+    Result OnGrantFail(SmemRallocRpcMsg &msg);
+
     /* local callback fed by the store rank-down watch: erase the candidate whose store
      * link broke (store heartbeat detects death in seconds); idempotent, a transient
      * flap self-heals on the node's next periodic REGISTER */
@@ -66,8 +71,9 @@ public:
 
 private:
     /* one optimistically added placement grant: issued by OnPlacement, confirmed (dropped)
-     * by the growth of the candidate's next REGISTER report, expired by TTL when its
-     * executor-side extend failed and it will never land */
+     * by the growth of the candidate's next REGISTER report, actively released by the
+     * executor's GRANT_FAIL when its extend failed, expired by TTL when the NACK/report
+     * was lost and the grant will never land */
     struct InflightGrant {
         uint64_t size;                              /* granted bytes */
         bool deviceMedia;                           /* grant media */

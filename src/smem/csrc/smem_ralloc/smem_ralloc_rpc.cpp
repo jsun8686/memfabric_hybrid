@@ -107,6 +107,12 @@ Result SmemRallocRpcService::Start(const SmemRallocRpcEndpoint &localEp, const s
         }
         return SmemRallocMasterService::Instance().OnPlacement(m);
     });
+    RegisterHandler(SMEMRA_RPC_OP_GRANT_FAIL, [](SmemRallocRpcMsg &m) -> Result {
+        if (!SmemRallocMasterService::Instance().IsRunning()) {
+            return SM_NOT_STARTED;
+        }
+        return SmemRallocMasterService::Instance().OnGrantFail(m);
+    });
 
     started_ = true;
     SM_LOG_INFO("ralloc rpc server started, rank: " << localEp_.rankId << " endpoint: " << localEp_.ip << ":"
@@ -162,7 +168,8 @@ void SmemRallocRpcService::RegisterHandler(uint16_t op, const RpcHandler &h)
     handlers_[op] = h;
 }
 
-Result SmemRallocRpcService::SyncCall(const SmemRallocRpcEndpoint &remote, SmemRallocRpcMsg &msg)
+Result SmemRallocRpcService::SyncCall(const SmemRallocRpcEndpoint &remote, SmemRallocRpcMsg &msg,
+                                      uint32_t timeoutMs)
 {
     SM_VALIDATE_RETURN(started_, "rpc service not started", SM_NOT_STARTED);
     SM_VALIDATE_RETURN(strlen(remote.ip) != 0, "remote ip is empty", SM_INVALID_PARAM);
@@ -211,7 +218,7 @@ Result SmemRallocRpcService::SyncCall(const SmemRallocRpcEndpoint &remote, SmemR
     }
 
     std::unique_lock<std::mutex> locker(pending->mtx);
-    bool finished = pending->cond.wait_for(locker, std::chrono::milliseconds(timeoutMs_),
+    bool finished = pending->cond.wait_for(locker, std::chrono::milliseconds(timeoutMs),
                                            [&pending]() { return pending->done; });
     if (!finished) {
         locker.unlock();

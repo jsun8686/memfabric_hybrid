@@ -25,11 +25,13 @@ namespace smem {
  * interval is 30s, 3 missed periods = death); false positives self-heal on next REGISTER */
 constexpr uint32_t SMEMRA_CANDIDATE_STALE_SEC = 90U;
 
-/* backstop lifetime of an in-flight grant: a grant that landed is confirmed by the poked
- * REGISTER within a few seconds (2s poke throttle + transit), so an entry surviving this
- * long is a grant whose executor-side extend failed (e.g. window guard) or whose report
- * was lost; drop it instead of pinning the candidate load forever */
-constexpr uint32_t SMEMRA_INFLIGHT_GRANT_TTL_SEC = 15U;
+/* backstop lifetime of an in-flight grant: a grant must survive in the load view until the
+ * slowest slice lands (a 100 GB bootstrap takes tens of seconds: mmap + MR register + join)
+ * and the poked REGISTER confirms it only after that, so a short TTL expires live grants
+ * and re-grants stack on a stale-empty view; executor-side failures are released actively
+ * by GRANT_FAIL, so this TTL only bounds a lost NACK/report and is aligned with
+ * SMEMRA_CANDIDATE_STALE_SEC: a silent node and a silent grant die together */
+constexpr uint32_t SMEMRA_INFLIGHT_GRANT_TTL_SEC = 90U;
 
 SmemRallocMasterService &SmemRallocMasterService::Instance()
 {
@@ -182,9 +184,9 @@ Result SmemRallocMasterService::OnPlacement(SmemRallocRpcMsg &msg)
         }
         /* pick the least loaded candidate of the requested media, never place on the
          * requester itself; load = last reported committed bytes plus grants issued since
-         * (optimistic in-flight add, reconciled by the next REGISTER): concurrent
-         * placements no longer stack on a stale view, and the map-order tie-break only
-         * decides genuinely equal loads */
+         * (optimistic in-flight add, reconciled by the next REGISTER or released by
+         * GRANT_FAIL): concurrent placements no longer stack on a stale view, and the
+         * map-order tie-break only decides genuinely equal loads */
         const bool deviceMedia = msg.memType == SMEM_RALLOC_MEM_TYPE_DEVICE;
         const uint64_t window = deviceMedia ? msg.maxHbmSize : msg.maxDramSize;
         uint32_t chosen = SMEM_RALLOC_INVALID_RANK;
@@ -194,7 +196,7 @@ Result SmemRallocMasterService::OnPlacement(SmemRallocRpcMsg &msg)
                 continue;
             }
             ++alive;
-            /* expire grants that never landed (executor failure / lost report) */
+            /* expire grants whose GRANT_FAIL / report was lost (backstop, see the TTL comment) */
             for (auto grant = it.second.inflight.begin(); grant != it.second.inflight.end();) {
                 if (now - grant->at > std::chrono::seconds(SMEMRA_INFLIGHT_GRANT_TTL_SEC)) {
                     grant = it.second.inflight.erase(grant);
@@ -242,6 +244,31 @@ Result SmemRallocMasterService::OnPlacement(SmemRallocRpcMsg &msg)
                                                  << " size: " << msg.size << " load: " << chosenLoad
                                                  << " -> rank: " << msg.nodeRank << " endpoint: "
                                                  << msg.nodeIp << ":" << msg.nodePort);
+    return SM_OK;
+}
+
+Result SmemRallocMasterService::OnGrantFail(SmemRallocRpcMsg &msg)
+{
+    SM_VALIDATE_RETURN(msg.size != 0, "grant failure with size 0", SM_INVALID_PARAM);
+    SM_VALIDATE_RETURN(msg.memType == SMEM_RALLOC_MEM_TYPE_HOST || msg.memType == SMEM_RALLOC_MEM_TYPE_DEVICE,
+        "grant failure with invalid mem type", SM_INVALID_PARAM);
+
+    const bool deviceMedia = msg.memType == SMEM_RALLOC_MEM_TYPE_DEVICE;
+    std::lock_guard<std::mutex> guard(mutex_);
+    auto it = candidates_.find(msg.nodeRank);
+    if (it == candidates_.end()) {
+        /* node unknown: its ledger died with the candidate entry, nothing to release */
+        return SM_OK;
+    }
+    for (auto grant = it->second.inflight.begin(); grant != it->second.inflight.end(); ++grant) {
+        if (grant->size == msg.size && grant->deviceMedia == deviceMedia) {
+            it->second.inflight.erase(grant);
+            SM_LOG_INFO("in-flight grant released, rank: " << msg.nodeRank << " size: " << msg.size
+                                                           << " memType: " << msg.memType);
+            return SM_OK;
+        }
+    }
+    /* no matching grant: already confirmed by a report or expired, nothing to do */
     return SM_OK;
 }
 

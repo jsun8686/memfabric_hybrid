@@ -33,6 +33,7 @@ include_directories(
         ${PROJECT_SMEM_SRC_BASE}/csrc/config_store/ha
         ${PROJECT_SMEM_SRC_BASE}/csrc/config_store/tcp_store
         ${PROJECT_SMEM_SRC_BASE}/csrc/smem_bm
+        ${PROJECT_SMEM_SRC_BASE}/csrc/smem_ralloc
 
         ${PROJECT_ACCLINKS_SRC_BASE}/include
         ${PROJECT_ACCLINKS_SRC_BASE}/csrc

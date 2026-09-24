@@ -57,8 +57,11 @@ public:
 
     const SmemRallocRpcEndpoint &GetLocalEndpoint() const;
 
-    /* send one request to remote endpoint and wait for response, msg.result carries remote result */
-    Result SyncCall(const SmemRallocRpcEndpoint &remote, SmemRallocRpcMsg &msg);
+    /* send one request to remote endpoint and wait for response, msg.result carries remote
+     * result; timeoutMs overrides the service-wide default for long ops (JOIN_ALLOC may
+     * park behind a slice bootstrap plus queued extends on the contributor) */
+    Result SyncCall(const SmemRallocRpcEndpoint &remote, SmemRallocRpcMsg &msg,
+                    uint32_t timeoutMs = SMEM_DEFAUT_WAIT_TIME * SECOND_TO_MILLSEC);
 
     void RegisterHandler(uint16_t op, const RpcHandler &h);
 

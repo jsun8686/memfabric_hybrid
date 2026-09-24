@@ -432,6 +432,9 @@ SMEM_API int32_t smem_ralloc_extend_remote_mem(smem_ralloc_t handle, smem_ralloc
      * before the eviction lands, back off one beat and re-place */
     constexpr uint32_t joinRounds = 4U;
     constexpr uint32_t sameNodeBackoffSec = 2U;
+    /* the contributor may park this call behind a pool bootstrap plus already queued
+     * extends (each slice materialization takes tens of seconds), budget accordingly */
+    constexpr uint32_t joinAllocTimeoutMs = 180U * SECOND_TO_MILLSEC;
     Result lastErr = SM_ERROR;
     uint32_t failedRank = SMEM_RALLOC_INVALID_RANK;
     const auto &coreOptions = entry->GetCoreOptions();
@@ -487,7 +490,7 @@ SMEM_API int32_t smem_ralloc_extend_remote_mem(smem_ralloc_t handle, smem_ralloc
         allocMsg.flags = coreOptions.flags;
         allocMsg.enable56BitsGva = coreOptions.enable56BitsGva;
         allocMsg.memType = static_cast<uint32_t>(memType);
-        ret = rpc.SyncCall(node, allocMsg);
+        ret = rpc.SyncCall(node, allocMsg, joinAllocTimeoutMs);
         if (ret == SM_OK && allocMsg.result == SM_OK && allocMsg.gva != 0) {
             /* 3. deliver the block info, gva is usable at once: the contributor replies strictly
              * after its GroupJoin/GroupUpdate barrier returned, by then this node has imported

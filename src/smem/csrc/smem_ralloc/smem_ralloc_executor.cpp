@@ -69,6 +69,9 @@ Result SmemRallocExecutor::OnJoinAlloc(SmemRallocRpcMsg &msg)
         auto extRet = existEntry->ExtendLocalMem(static_cast<smem_ralloc_mem_type_t>(msg.memType), msg.size, &info);
         if (extRet != SM_OK) {
             SM_LOG_ERROR("join alloc extend failed, pool: " << msg.poolId << " ret: " << extRet);
+            /* release the master's optimistic reservation: this grant will never land,
+             * parking it in the load view until the TTL would skew future placements */
+            manager.NotifyPlacementFailure(msg);
             return extRet;
         }
         /* invariant: reply below is sent strictly after ExtendLocalMem returned. Its internal
@@ -132,9 +135,14 @@ Result SmemRallocExecutor::OnJoinAlloc(SmemRallocRpcMsg &msg)
     options.scene = HYBM_SCENE_DEFAULT;
     options.dramShmFd = -1;
 
+    /* from here on, concurrent extends park in WaitForBootstrap until this branch
+     * finishes, instead of failing fast on the not-yet-inited entry */
+    entry->MarkBootstrapRunning();
     ret = entry->Initialize(options);
     if (ret != SM_OK) {
         SM_LOG_ERROR("join alloc entry init failed, result: " << ret);
+        entry->MarkBootstrapDone(false);
+        manager.NotifyPlacementFailure(msg);
         (void)manager.RemoveEntryByPtr(reinterpret_cast<uintptr_t>(entry.Get()));
         return ret;
     }
@@ -145,6 +153,9 @@ Result SmemRallocExecutor::OnJoinAlloc(SmemRallocRpcMsg &msg)
     ret = entry->Join(0);
     if (ret != SM_OK) {
         SM_LOG_ERROR("join alloc entry join failed, result: " << ret);
+        /* wake parked extends before tearing the entry down under them */
+        entry->MarkBootstrapDone(false);
+        manager.NotifyPlacementFailure(msg);
         entry->UnInitialize();
         (void)manager.RemoveEntryByPtr(reinterpret_cast<uintptr_t>(entry.Get()));
         return ret;
@@ -155,6 +166,8 @@ Result SmemRallocExecutor::OnJoinAlloc(SmemRallocRpcMsg &msg)
     ret = entry->GetLocalMemInfo(&info);
     if (ret != SM_OK || info.gva == nullptr) {
         SM_LOG_ERROR("join alloc get local mem info failed, pool: " << msg.poolId << " ret: " << ret);
+        entry->MarkBootstrapDone(false);
+        manager.NotifyPlacementFailure(msg);
         entry->UnInitialize();
         (void)manager.RemoveEntryByPtr(reinterpret_cast<uintptr_t>(entry.Get()));
         return ret != SM_OK ? ret : SM_ERROR;
@@ -164,6 +177,7 @@ Result SmemRallocExecutor::OnJoinAlloc(SmemRallocRpcMsg &msg)
     msg.ownerRank = manager.GetRankId();
     SM_LOG_INFO("join alloc success, pool: " << msg.poolId << " requester: " << msg.reqRank
                                              << " size: " << msg.size << " gva: " << info.gva);
+    entry->MarkBootstrapDone(true); /* wake extends parked in WaitForBootstrap */
     manager.PokeReporter(); /* refresh master LB view without waiting a full period */
     return SM_OK;
 }

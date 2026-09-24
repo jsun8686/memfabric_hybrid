@@ -385,7 +385,7 @@ src/smem/csrc/smem_ralloc/
   smem_ralloc.cpp                    # C API（init/create/extend/查询/copy）
   smem_ralloc_entry.{h,cpp}          # 编排（三件套模式，无记账）
   smem_ralloc_entry_manager.{h,cpp}
-  smem_ralloc_rpc.{h,cpp}            # acc_tcp 封装（REGISTER/PLACEMENT/JOIN_ALLOC/PING）
+  smem_ralloc_rpc.{h,cpp}            # acc_tcp 封装（REGISTER/PLACEMENT/JOIN_ALLOC/GRANT_FAIL/PING）
   smem_ralloc_master.{h,cpp}         # 候选表+LB+计数
   smem_ralloc_executor.{h,cpp}       # X 侧被动执行器（JOIN_ALLOC create-or-extend）
 include/host/smem_ralloc.h           # 公共头

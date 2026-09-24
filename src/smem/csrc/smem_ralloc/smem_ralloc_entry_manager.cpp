@@ -32,6 +32,10 @@ namespace {
 constexpr int64_t SMEMRA_MASTER_DISCOVER_TIMEOUT_MS = 10000; /* 10s */
 constexpr uint32_t SMEMRA_CANDIDATE_REGISTER_RETRY = 3U;
 constexpr uint32_t SMEMRA_MASTER_CHANGE_THROTTLE_SEC = 2U; /* min gap between poke-triggered reports */
+
+/* short budget for the best-effort GRANT_FAIL: it runs on the executor failure path and
+ * must not stall the error reply to the requester; a lost NACK is bounded by the grant TTL */
+constexpr uint32_t SMEMRA_GRANT_FAIL_TIMEOUT_MS = 5000U;
 }
 
 SmemRallocEntryManager &SmemRallocEntryManager::Instance()
@@ -614,6 +618,24 @@ bool SmemRallocEntryManager::ReportCommittedBytes(uint32_t retry)
      * next cycle or the master-key watch converges to the new master */
     RefreshMasterEndpoint();
     return false;
+}
+
+void SmemRallocEntryManager::NotifyPlacementFailure(const SmemRallocRpcMsg &req)
+{
+    if (!HasMaster()) {
+        return;
+    }
+    SmemRallocRpcMsg msg{};
+    msg.op = SMEMRA_RPC_OP_GRANT_FAIL;
+    msg.nodeRank = config_.rankId;
+    msg.size = req.size;
+    msg.memType = req.memType;
+    auto &rpc = SmemRallocRpcService::Instance();
+    auto ret = rpc.SyncCall(GetMasterEndpoint(), msg, SMEMRA_GRANT_FAIL_TIMEOUT_MS);
+    if (ret != SM_OK || msg.result != SM_OK) {
+        SM_LOG_WARN("notify placement failure to master failed, ret: " << ret << " result: " << msg.result);
+        RefreshMasterEndpoint();
+    }
 }
 
 void SmemRallocEntryManager::ReapEmptyPools()

@@ -468,8 +468,54 @@ Result SmemRallocEntry::Join(uint32_t flags)
     }
 }
 
+void SmemRallocEntry::MarkBootstrapRunning()
+{
+    {
+        std::lock_guard<std::mutex> lock(bsMutex_);
+        bsState_ = BootstrapState::RUNNING;
+    }
+    bsCv_.notify_all();
+}
+
+void SmemRallocEntry::MarkBootstrapDone(bool ok)
+{
+    {
+        std::lock_guard<std::mutex> lock(bsMutex_);
+        bsState_ = ok ? BootstrapState::READY : BootstrapState::FAILED;
+    }
+    bsCv_.notify_all();
+}
+
+Result SmemRallocEntry::WaitForBootstrap()
+{
+    /* bounded by the client-side JOIN_ALLOC rpc timeout (180s), so the wait must stay
+     * below it: 90s covers a 100 GB bootstrap with headroom while still failing the
+     * caller in finite time when the builder thread died silently */
+    const uint32_t waitSec =
+        mf::MfEnvUtil::GetOptionalUintOrDefault("MF_RALLOC_BOOTSTRAP_WAIT_SEC", 90U);
+    std::unique_lock<std::mutex> lock(bsMutex_);
+    if (bsState_ != BootstrapState::RUNNING) {
+        /* NONE: entry built by the synchronous create path, no concurrent bootstrap;
+         * READY / FAILED: a bootstrap already finished */
+        return bsState_ == BootstrapState::FAILED ? SM_NOT_INITIALIZED : SM_OK;
+    }
+    bool finished = bsCv_.wait_for(lock, std::chrono::seconds(waitSec),
+                                   [this]() { return bsState_ != BootstrapState::RUNNING; });
+    if (!finished) {
+        return SM_NOT_INITIALIZED;
+    }
+    return bsState_ == BootstrapState::READY ? SM_OK : SM_NOT_INITIALIZED;
+}
+
 Result SmemRallocEntry::ExtendLocalMem(smem_ralloc_mem_type_t memType, uint64_t size, smem_ralloc_mem_info_t *info)
 {
+    /* a concurrent first JOIN_ALLOC may still be building this pool (a 100 GB slice
+     * bootstrap takes tens of seconds): park until it finishes instead of failing fast,
+     * so the master's grant reservation lands on a slice that really exists */
+    auto bootRet = WaitForBootstrap();
+    if (bootRet != SM_OK) {
+        return bootRet;
+    }
     SM_ASSERT_RETURN(inited_, SM_NOT_INITIALIZED);
     SM_ASSERT_RETURN(memType == SMEM_RALLOC_MEM_TYPE_HOST || memType == SMEM_RALLOC_MEM_TYPE_DEVICE,
         SM_NOT_SUPPORTED);

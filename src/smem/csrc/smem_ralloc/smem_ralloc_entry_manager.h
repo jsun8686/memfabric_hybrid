@@ -101,6 +101,10 @@ public:
     /* wake the reporter for an immediate committed-bytes report (master change / join alloc / reap) */
     void PokeReporter();
 
+    /* best-effort GRANT_FAIL to the master: a granted block failed to land on this node,
+     * release its optimistic reservation so the load view recovers before the TTL */
+    void NotifyPlacementFailure(const SmemRallocRpcMsg &req);
+
 private:
     int32_t PrepareStore();
     int32_t RacingForStoreServer();

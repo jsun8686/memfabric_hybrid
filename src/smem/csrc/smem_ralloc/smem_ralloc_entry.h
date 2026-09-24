@@ -19,6 +19,7 @@
 #include "smem_ralloc.h"
 
 #include <atomic>
+#include <condition_variable>
 #include <map>
 #include <vector>
 
@@ -101,6 +102,17 @@ public:
      * than graceSec, ready for self teardown by the manager reaper */
     bool IsPoolEmptyExpired(uint64_t graceSec) const;
 
+    /* lifecycle of the executor-driven first JOIN_ALLOC (create branch): mark RUNNING
+     * before Initialize, mark done after Join succeeded / on every failure path; extend
+     * calls park on the cv instead of failing fast while the first slice builds */
+    void MarkBootstrapRunning();
+
+    void MarkBootstrapDone(bool ok);
+
+    /* park until a concurrent bootstrap finishes; SM_OK when no bootstrap is running
+     * (never started or READY), SM_NOT_INITIALIZED when it failed or timed out */
+    Result WaitForBootstrap();
+
 private:
     bool AddrInHostGva(const void *address, uint64_t size);
 
@@ -160,6 +172,14 @@ private:
     std::atomic<uint64_t> poolEmptySinceUs_{0};
     std::atomic<uint64_t> committedBytes_{0};
     std::atomic<uint64_t> deviceCommittedBytes_{0};
+
+    /* first-JOIN_ALLOC bootstrap state, see MarkBootstrapRunning; guarded by its own mutex
+     * because the bootstrap thread never takes mutex_ and extend waiters must not queue
+     * behind a mutex_ held for a whole slice materialization */
+    enum class BootstrapState { NONE, RUNNING, READY, FAILED };
+    std::mutex bsMutex_;
+    std::condition_variable bsCv_;
+    BootstrapState bsState_ = BootstrapState::NONE;
 };
 using SmemRallocEntryPtr = SmRef<SmemRallocEntry>;
 
