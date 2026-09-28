@@ -83,9 +83,10 @@ kill -TERM <daemon_pid>
 | B5 | 注册后填充 | cache 脏 | 巨页 | 页粒度对照 |
 | B6 | **fault+数据已驻留** | DRAM | 4K | OK ⇒ 翻译正确联到已备页 |
 | B6b | 同 B6 缓冲 | 重写后 cache 脏 | 4K | OK ⇒ 一致读成立 ⇒ 库修法=注册前 touch |
+| B7 | 注册后填充 | cache 脏 | 4K @**低 VA**（hint 3TB，<2^47） | OK ⇒ **VA 高度约束实锤**（已知可用注册全在 2^47 以下，python 默认 mmap 在 0xfffd… 以上） |
 | C2 | dst 预驱逐干净 | — | 4K | user 作宿（far 经池→池灌入） |
 
-  组合判读：**B6+B6b OK 而 B/B4 FAIL** ⇒ 双坑=未 fault 注册断连 + 注册时丢脏行，库级修复=`RegisterMemCommon` 注册前逐页 touch（池路径 `LvaShmReservePhysicalMemory` 同款），vendor 提单附证；**B6 FAIL** ⇒ 已备页翻译仍错（纯 vendor）；**B4 OK** ⇒ 读非一致（DRAM-only 可见）；**B5 OK** ⇒ 巨页可绕。
+  组合判读：**B7 OK 而 B/B4/B5/B6 全败** ⇒ 约束在 VA 高度（驱动 SVM/RA 对 ≥2^47 的 host VA 映射失效）——workaround=低 VA 分配（hint mmap），vendor 提单；**B6+B6b OK 而 B/B4 FAIL** ⇒ 双坑=未 fault 注册断连 + 注册时丢脏行，库级修复=`RegisterMemCommon` 注册前逐页 touch（池路径 `LvaShmReservePhysicalMemory` 同款）；**B6 FAIL 且 B7 FAIL** ⇒ 已备页/低 VA 翻译仍错（纯 vendor）；**B4 OK** ⇒ 读非一致（DRAM-only 可见）。
 - 数据面行为（调查中）：结论随探针矩阵判定更新，vendor 提单随附探针日志与 `register MR result`/`query memory key` 行。
 - 数据层：warmup 与 verify 两次独立校验，replay 后 verify 再次校验，覆盖"图重放期间数据未漂移"。
 - 负例层：对齐负例在注册入口被拒（错误日志含 `reject_unaligned_dram`）；注销后拷贝在主机预检查被拒。
@@ -97,6 +98,7 @@ kill -TERM <daemon_pid>
 | 注册返回非 0，日志 `reject_unaligned_dram` | 地址或大小非 4K 对齐（torch pinned tensor、`ctypes.create_string_buffer` 均不保证，请用 `mmap`） |
 | `[probe A] FAIL` | 池数据面/环境问题（与 user MR 无关）：核对大页、QP 连接、双端版本 |
 | `[probe B] FAIL`（far=[0,0,...] 全零） | 已知现象（未 fault 注册 + 脏行，双坑叠加）；按矩阵判根因 |
+| `[probe B7] OK`（其余用户探针全败） | **VA 高度约束**：host 缓冲须落在 2^47 以下（hint mmap）——短期 workaround + vendor 提单 |
 | `[probe B4] FAIL` + `[probe B6] [probe B6b] OK` | 未 fault 注册断连（零页钉扎/COW）：库修法=注册前 touch 页；vendor 提单附证 |
 | `[probe B6] FAIL` | 已备页翻译仍错（纯 vendor）：上报 `register MR result`、`query memory key` 行与探针日志 |
 | `[probe B4] OK` | user-iova 读非一致（仅 DRAM 数据可见）：vendor 提单；短期可改用巨页缓冲（B5 方案） |

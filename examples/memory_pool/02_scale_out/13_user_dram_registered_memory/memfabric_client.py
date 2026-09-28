@@ -8,10 +8,11 @@ Same topology and skeleton as 10_user_registered_memory, but the local copy endp
 host-DRAM MR carries a distinct device-dma base (HalHostRegister iova) in the v2 user-MR
 table, so the AICore RDMA kernel addresses the SGE as regAddress + (localAddr - addr) under
 the MR's lkey. Known issue under investigation: a user 4K-anon buffer as the device READ
-source yields zeros regardless of write timing. Probe matrix A/B/B4/B5/B6/B6b/C2 varies the
-page state at register (unfaulted vs faulted+DRAM-resident), data residency at DMA (dirty
-vs DRAM) and page size; B6+B6b OK would pin the library fix to "touch pages before
-HalHostRegister" (the pool path already does this via LvaShmReservePhysicalMemory).
+source yields zeros regardless of write timing. Probe matrix A/B/B4/B5/B6/B6b/B7/C2 varies
+the page state at register (unfaulted vs faulted+DRAM-resident), data residency at DMA
+(dirty vs DRAM), page size and VA height (<2^47 vs python's default ~0xfffd... placement);
+B7 OK would pin the constraint on the VA height (all known-good registrations live below
+2^47), B6+B6b OK on the page-fault/invalidation handling.
 Flow: register src/dst unfaulted -> fill+evict -> register b6 DRAM-resident ->
 probes -> closed round-trip -> capture/replay the WRITE -> unregister ->
 expect the host precheck to reject further copies.
@@ -42,6 +43,8 @@ GIB = 1 << 30
 DRAM_ALIGN = 4096
 HUGEPAGE_2M = 2 * 1024 * 1024
 EVICT_BYTES = 512 << 20    # cache-eviction sweep size (>> L3) for probe B4
+LOW_VA_HINT = 0x300000000000  # 3TB: below bit 47, clear of the pool windows (0x288..-0x2a8..)
+VA_BIT47 = 1 << 47
 
 DATA_OP = ralloc.RallocDataOpType.DEVICE_RDMA | ralloc.RallocDataOpType.DEVICE_SCHEDULE
 MEM_TYPE = ralloc.RallocMemType.HOST
@@ -132,6 +135,21 @@ def _unmap_buffer(addr, size):
     libc.munmap(ctypes.c_void_p(addr), ctypes.c_size_t(size))
 
 
+def _map_low_buffer(size):
+    """plain anonymous mapping placed at a low VA hint (below bit 47): every registration
+    that ever worked (HBM tensors, pool slots) lives below 2^47 while python's default mmap
+    placement sits at ~0xfffd... above it -- this probe isolates the VA height. The hint is
+    non-fixed: if the kernel maps elsewhere the verdict is skipped (see the run log)."""
+    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    libc.mmap.restype = ctypes.c_void_p
+    libc.mmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int,
+                          ctypes.c_int, ctypes.c_long]
+    addr = libc.mmap(LOW_VA_HINT, size, 0x3, 0x22, -1, 0)  # PROT_READ|WRITE, MAP_PRIVATE|ANON
+    if addr is None or addr == ctypes.c_void_p(-1).value:
+        raise RuntimeError("mmap at the low-VA hint failed")
+    return addr
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--store", required=True,
@@ -174,8 +192,8 @@ def main():
         raise RuntimeError(f"--size ({size}) must be 4-byte aligned (int32 verify pattern)")
     if size > block:
         raise RuntimeError(f"--size ({size}) exceeds --block-size ({block})")
-    if 8 * size > block:
-        raise RuntimeError(f"--block-size ({block}) must hold 8 probe windows of --size ({size})")
+    if 9 * size > block:
+        raise RuntimeError(f"--block-size ({block}) must hold 9 probe windows of --size ({size})")
     if block > max_pool:
         raise RuntimeError(f"--block-size ({block}) exceeds --max-pool-size ({max_pool})")
     if max_pool % GIB != 0:
@@ -189,6 +207,7 @@ def main():
     ralloc_inited = False
     src_mm = dst_mm = b6_mm = None
     hp_addr = 0
+    low_addr = 0
     try:
         import numpy as np
         import torch
@@ -299,6 +318,11 @@ def main():
         ctypes.memmove(hp_addr, expect.tobytes(), size)                # B5 source, post-register fill
         _log(f"[client] B5 buffer: 0x{hp_addr:x} ({HUGEPAGE_2M} bytes, {hp_kind}, "
              f"2M-aligned={hp_addr % HUGEPAGE_2M == 0})")
+        low_addr = _map_low_buffer(size)
+        low_hint_ok = low_addr < VA_BIT47
+        assert handle.register(low_addr, size) == 0, "register(low-VA buffer) failed"
+        ctypes.memmove(low_addr, expect.tobytes(), size)               # B7 source, post-register fill
+        _log(f"[client] B7 buffer: 0x{low_addr:x} ({size} bytes, low-VA hint honored={low_hint_ok})")
         with torch.npu.stream(side):
             stream_ptr = torch.npu.current_stream().npu_stream
             assert handle.device_copy(local_gva, far_gva, size, stream_ptr) == 0, "probe A write failed"
@@ -316,6 +340,9 @@ def main():
             assert handle.device_copy(hp_addr, far_gva, size, stream_ptr) == 0, "probe B5 write failed"
             assert handle.device_copy(far_gva, local_gva + 5 * size, size, stream_ptr) == 0, \
                 "probe B5 readback failed"
+            assert handle.device_copy(low_addr, far_gva, size, stream_ptr) == 0, "probe B7 write failed"
+            assert handle.device_copy(far_gva, local_gva + 8 * size, size, stream_ptr) == 0, \
+                "probe B7 readback failed"
             assert handle.device_copy(b6_addr, far_gva, size, stream_ptr) == 0, "probe B6 write failed"
             assert handle.device_copy(far_gva, local_gva + 6 * size, size, stream_ptr) == 0, \
                 "probe B6 readback failed"
@@ -337,6 +364,7 @@ def main():
         b5Far = np.frombuffer(_bytes_at(local_gva + 5 * size, size), dtype=np.int32)
         b6Far = np.frombuffer(_bytes_at(local_gva + 6 * size, size), dtype=np.int32)
         b6bFar = np.frombuffer(_bytes_at(local_gva + 7 * size, size), dtype=np.int32)
+        b7Far = np.frombuffer(_bytes_at(local_gva + 8 * size, size), dtype=np.int32)
         c2Dst = np.frombuffer(bytes(dst_mm[:]), dtype=np.int32)
         okA = np.array_equal(aGot, probeA)
         okB = np.array_equal(bFar, expect)
@@ -345,6 +373,13 @@ def main():
         okB6 = np.array_equal(b6Far, expect6)
         okB6b = np.array_equal(b6bFar, expect6b)
         okC2 = np.array_equal(c2Dst, expect)
+        if not low_hint_ok:
+            okB7 = True
+            _log(f"[probe B7] SKIP: low-VA hint not honored, mapped at 0x{low_addr:x}")
+        else:
+            okB7 = np.array_equal(b7Far, expect)
+            _log("[probe B7] user buffer at low VA (<2^47) as WRITE source: " + ("OK" if okB7 else "FAIL")
+                 + ("" if okB7 else f", far={b7Far[:8].tolist()} want={expect[:8].tolist()}"))
         _log("[probe A] pool slot source, cache-dirty (baseline): " + ("OK" if okA else "FAIL")
              + ("" if okA else f", got={aGot[:8].tolist()} want={probeA[:8].tolist()}"))
         _log("[probe B] user 4K-anon, registered unfaulted, dirty fill: " + ("OK" if okB else "FAIL")
@@ -361,11 +396,11 @@ def main():
         _log("[probe C2] user sink, far seeded via pool (dst pre-evicted): "
              + ("OK" if okC2 else "FAIL")
              + ("" if okC2 else f", dst={c2Dst[:8].tolist()} want={expect[:8].tolist()}"))
-        assert okA and okB and okB4 and okB5 and okB6 and okB6b and okC2, \
-            f"probes failed: A={okA} B={okB} B4={okB4} B5={okB5} B6={okB6} B6b={okB6b} C2={okC2} " \
-            f"(B6/B6b OK => library fix = touch pages before HalHostRegister; " \
-            f"B4/B6 FAIL => vendor translation bug)"
-        _log("[client] probes A/B/B4/B5/B6/B6b/C2 OK (kernel library loaded)")
+        assert okA and okB and okB4 and okB5 and okB6 and okB6b and okB7 and okC2, \
+            f"probes failed: A={okA} B={okB} B4={okB4} B5={okB5} B6={okB6} B6b={okB6b} B7={okB7} " \
+            f"C2={okC2} (B7 OK => VA-height constraint, allocate user buffers below 2^47; " \
+            f"B6/B6b OK => library fix = touch pages before HalHostRegister; see README)"
+        _log("[client] probes A/B/B4/B5/B6/B6b/B7/C2 OK (kernel library loaded)")
 
         # closed round-trip user -> FAR -> user2 (the original warmup, now with a value dump)
         np.frombuffer(dst_mm, dtype=np.int32)[:] = 0
@@ -419,9 +454,12 @@ def main():
 
         assert handle.unregister(src_addr) == 0, "unregister(src buffer) failed"
         assert handle.unregister(b6_addr) == 0, "unregister(b6 buffer) failed"
+        assert handle.unregister(low_addr) == 0, "unregister(low-VA buffer) failed"
         assert handle.unregister(hp_addr) == 0, "unregister(hugepage buffer) failed"
         _unmap_buffer(hp_addr, HUGEPAGE_2M)
         hp_addr = 0
+        _unmap_buffer(low_addr, size)
+        low_addr = 0
         b6_mm.close()
         b6_mm = None
         dst_mm.close()
@@ -434,6 +472,8 @@ def main():
     finally:
         if hp_addr != 0:
             _unmap_buffer(hp_addr, HUGEPAGE_2M)
+        if low_addr != 0:
+            _unmap_buffer(low_addr, size)
         if b6_mm is not None:
             b6_mm.close()
         if dst_mm is not None:
