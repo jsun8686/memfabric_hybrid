@@ -826,8 +826,11 @@ Result SmemRallocEntry::PublishUserMrTable()
         *(reinterpret_cast<uint32_t *>(buf.data() + offset + 20)) = iter->second.rkey;
         /* device-dma base of the MR: equals devAddr for HBM registrations, the
          * HalHostRegister iova for host-DRAM ones -- the kernel derives the SGE address
-         * as regAddress + (localAddr - devAddr) */
-        entry[4] = iter->second.regAddress;
+         * as regAddress + (localAddr - devAddr). Byte layout must match the kernel
+         * SmemRallocUserMrEntry exactly: addr +0, size +8, lkey +16, rkey +20,
+         * regAddress +24 (uint64_t index 3). Writing at index 4 (+32) leaves the kernel
+         * reading 0 and falling back to the raw user VA, which only works for HBM. */
+        entry[3] = iter->second.regAddress;
         offset += tableEntrySize;
     }
 
