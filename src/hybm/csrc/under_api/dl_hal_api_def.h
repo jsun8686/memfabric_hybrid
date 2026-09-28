@@ -27,11 +27,7 @@ extern "C" {
 
 #define HAL_OUT_OF_MEMORY_ERROR     6
 
-/* in sync with the installed driver enum drvRegisterTpye (driver/ascend_hal_define.h):
- * HOST_MEM_MAP_DEV=0, HOST_SVM_MAP_DEV=1, DEV_SVM_MAP_HOST=2, HOST_MEM_MAP_DEV_PCIE_TH=3, ...
- * device DMA of host memory must use HOST_MEM_MAP_DEV; value 3 (DEV_PCIE_TH) builds a
- * pcie-through mapping that the on-package RoCE path does not resolve (probe-proven zeros) */
-#define HOST_MEM_MAP_DEV 0
+#define HOST_MEM_MAP_DEV 3
 
 #define RT_MAX_THREAD_NUM_PER_WARP (32U)
 #define RT_SIMT_DEFAULT_STACK_SIZE_THREAD (256U)
