@@ -7,9 +7,10 @@ Same topology and skeleton as 10_user_registered_memory, but the local copy endp
 4K-aligned anonymous mmap buffers on the host instead of NPU HBM tensors. The registered
 host-DRAM MR carries a distinct device-dma base (HalHostRegister iova) in the v2 user-MR
 table, so the AICore RDMA kernel addresses the SGE as regAddress + (localAddr - addr) under
-the MR's lkey. Flow: reject an unaligned register -> register both buffers -> WRITE buffer ->
-FAR pool slot -> READ FAR slot -> buffer2 -> verify -> capture/replay the WRITE ->
-unregister -> expect the host precheck to reject further copies.
+the MR's lkey. Flow: reject an unaligned register -> register both buffers -> probes A/B/C
+(pool->pool baseline, user buffer as WRITE source, user buffer as READ sink) -> closed
+round-trip buffer -> FAR slot -> buffer2 -> capture/replay the WRITE -> unregister ->
+expect the host precheck to reject further copies.
 """
 
 import argparse
@@ -76,12 +77,19 @@ def _parse_size(tok):
 
 
 def _map_buffer(size):
-    """anonymous page-aligned mapping: the kernel guarantees 4K alignment for mmap bases"""
+    """anonymous page-aligned mapping: the kernel guarantees 4K alignment for mmap bases.
+    The ctypes view is transient so the mapping carries no long-lived buffer export --
+    mm.close() then works on every exit path (no BufferError after exceptions)."""
     mm = mmap.mmap(-1, size)
-    view = ctypes.c_char.from_buffer(mm)  # keeps the mapping exported and writable
-    addr = ctypes.addressof(view)
+    addr = ctypes.addressof(ctypes.c_char.from_buffer(mm))
     assert addr % DRAM_ALIGN == 0, f"mmap base 0x{addr:x} not page aligned"
-    return mm, view, addr
+    return mm, addr
+
+
+def _bytes_at(addr, nbytes):
+    """read n bytes of host memory at a raw address (pool HOST slots are MAP_FIXED host
+    VMAs: their gva is directly CPU-readable, used by the probes as a trusted landing zone)"""
+    return ctypes.string_at(addr, nbytes)
 
 
 def main():
@@ -126,6 +134,8 @@ def main():
         raise RuntimeError(f"--size ({size}) must be 4-byte aligned (int32 verify pattern)")
     if size > block:
         raise RuntimeError(f"--size ({size}) exceeds --block-size ({block})")
+    if 4 * size > block:
+        raise RuntimeError(f"--block-size ({block}) must hold 4 probe windows of --size ({size})")
     if block > max_pool:
         raise RuntimeError(f"--block-size ({block}) exceeds --max-pool-size ({max_pool})")
     if max_pool % GIB != 0:
@@ -138,7 +148,6 @@ def main():
     assert mf.initialize() == 0, "mf.initialize failed"
     ralloc_inited = False
     src_mm = dst_mm = None
-    src_view = dst_view = None
     try:
         import numpy as np
         import torch
@@ -181,7 +190,7 @@ def main():
         _log(f"[client rank {rank}] remote landing slot from FAR rank {far_rank} (gva=0x{far_gva:x}, npu {dev})")
 
         # ---- negative case 1: an unaligned host-DRAM address must be rejected at register time ----
-        neg_mm, neg_view, neg_base = _map_buffer(2 * DRAM_ALIGN)
+        neg_mm, neg_base = _map_buffer(2 * DRAM_ALIGN)
         unaligned_addr = neg_base + DRAM_ALIGN + 128
         ret = handle.register(unaligned_addr, DRAM_ALIGN)
         assert ret != 0, "register() accepted an unaligned host-DRAM address: must be 4K aligned"
@@ -189,13 +198,12 @@ def main():
         ret = handle.register(neg_base, DRAM_ALIGN // 2)  # aligned addr, unaligned size
         assert ret != 0, "register() accepted an unaligned host-DRAM size: must be a 4K multiple"
         mf.get_and_clear_last_err_msg()
-        del neg_view
         neg_mm.close()
         _log("[client] unaligned host-DRAM register rejected as expected (4K alignment rule)")
 
         # ---- host buffers as copy endpoints ----
-        src_mm, src_view, src_addr = _map_buffer(size)
-        dst_mm, dst_view, dst_addr = _map_buffer(size)
+        src_mm, src_addr = _map_buffer(size)
+        dst_mm, dst_addr = _map_buffer(size)
         assert src_addr != dst_addr, "buffer mapping failed"
         words = size // 4
         seed = rank + 1
@@ -209,18 +217,54 @@ def main():
         assert handle.register(dst_addr, size) == 0, "register(dst buffer) failed"
         _log("[client] both host buffers registered (user MR table v2: regAddress = HalHostRegister iova)")
 
-        # warmup round-trip on a side stream, OUTSIDE any graph: the first device_copy
-        # dlopens and loads the kernel library, which is illegal inside capture
+        # ---- probes A/B/C on a side stream, OUTSIDE any graph (the first device_copy also
+        # dlopens and loads the kernel library, which is illegal inside capture):
+        # A: pool->pool sanity incl. CPU visibility of NIC-written pool pages (known-good legs);
+        # B: user host-DRAM as WRITE source, far content verified through a pool-slot readback;
+        # C: user host-DRAM as READ sink, dst compared against the far content probe B left.
+        # All three run unconditionally so one failing leg still logs the other two. ----
         side = torch.npu.Stream()
         side.wait_stream(torch.npu.current_stream())
+        probeA = np.arange(words, dtype=np.int32) * 3 + 0x41410
+        ctypes.memmove(local_gva, probeA.tobytes(), size)  # CPU writes the local pool slot
+        with torch.npu.stream(side):
+            stream_ptr = torch.npu.current_stream().npu_stream
+            assert handle.device_copy(local_gva, far_gva, size, stream_ptr) == 0, "probe A write failed"
+            assert handle.device_copy(far_gva, local_gva + size, size, stream_ptr) == 0, "probe A readback failed"
+            assert handle.device_copy(src_addr, far_gva, size, stream_ptr) == 0, "probe B write failed"
+            assert handle.device_copy(far_gva, local_gva + 2 * size, size, stream_ptr) == 0, \
+                "probe B readback failed"
+            assert handle.device_copy(far_gva, dst_addr, size, stream_ptr) == 0, "probe C read failed"
+        torch.npu.synchronize()
+
+        aGot = np.frombuffer(_bytes_at(local_gva + size, size), dtype=np.int32)
+        bFar = np.frombuffer(_bytes_at(local_gva + 2 * size, size), dtype=np.int32)
+        cDst = np.frombuffer(bytes(dst_mm[:]), dtype=np.int32)
+        okA = np.array_equal(aGot, probeA)
+        okB = np.array_equal(bFar, expect)
+        okC = np.array_equal(cDst, bFar)
+        _log("[probe A] pool->pool round-trip (baseline + CPU visibility): " + ("OK" if okA else "FAIL")
+             + ("" if okA else f", got={aGot[:8].tolist()} want={probeA[:8].tolist()}"))
+        _log("[probe B] user host-DRAM as WRITE source (far readback via pool): " + ("OK" if okB else "FAIL")
+             + ("" if okB else f", far={bFar[:8].tolist()} want={expect[:8].tolist()}"))
+        _log("[probe C] user host-DRAM as READ sink (dst == far content): " + ("OK" if okC else "FAIL")
+             + ("" if okC else f", dst={cDst[:8].tolist()} far={bFar[:8].tolist()}"))
+        assert okA and okB and okC, \
+            f"device-scheduled copy probes failed: A={okA} B={okB} C={okC} " \
+            f"(A: pool data plane, B: user MR as source SGE, C: user MR as sink SGE)"
+        _log("[client] probes A/B/C OK (user MR SGE works as source and sink, kernel library loaded)")
+
+        # closed round-trip user -> FAR -> user2 (the original warmup, now with a value dump)
+        np.frombuffer(dst_mm, dtype=np.int32)[:] = 0
         with torch.npu.stream(side):
             stream_ptr = torch.npu.current_stream().npu_stream
             assert handle.device_copy(src_addr, far_gva, size, stream_ptr) == 0, "warmup write failed"
             assert handle.device_copy(far_gva, dst_addr, size, stream_ptr) == 0, "warmup read failed"
         torch.npu.synchronize()
         got = np.frombuffer(bytes(dst_mm[:]), dtype=np.int32)
-        assert np.array_equal(got, expect), "warmup round-trip mismatch"
-        _log("[client] warmup round-trip OK (host buffer -> FAR slot -> host buffer2, kernel library loaded)")
+        assert np.array_equal(got, expect), \
+            f"warmup round-trip mismatch: got={got[:8].tolist()} want={expect[:8].tolist()}"
+        _log("[client] warmup round-trip OK (host buffer -> FAR slot -> host buffer2)")
 
         # capture the WRITE into an NPU graph: host buffer -> FAR pool slot + quiet
         graph = torch.npu.NPUGraph()
@@ -261,7 +305,6 @@ def main():
         _log("[client] post-unregister copy rejected as expected (host precheck)")
 
         assert handle.unregister(src_addr) == 0, "unregister(src buffer) failed"
-        del dst_view, src_view
         dst_mm.close()
         src_mm.close()
         dst_mm = src_mm = None

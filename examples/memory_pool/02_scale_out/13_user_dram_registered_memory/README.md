@@ -36,7 +36,7 @@ kill -TERM <daemon_pid>
 
 ## 生命周期
 
-`create`（DEVICE_RDMA | DEVICE_SCHEDULE）→ `extend_local_mem`（本地 DRAM 槽，保证实体 dramSegment 就绪）→ `extend_remote_mem`（FAR 落地槽）→ 对齐负例 ×2 → `register(src/dst)` → warmup 双向 → `NPUGraph` 捕获 WRITE → `replay` ×N → 默认流 READ 回读校验 → `unregister(dst)` + 预检查负例 → `unregister(src)` → `destroy` → `uninitialize`。
+`create`（DEVICE_RDMA | DEVICE_SCHEDULE）→ `extend_local_mem`（本地 DRAM 槽，保证实体 dramSegment 就绪）→ `extend_remote_mem`（FAR 落地槽）→ 对齐负例 ×2 → `register(src/dst)` → 探针 A/B/C（池内闭环基线、user 作源、user 作宿）→ warmup 闭环双向 → `NPUGraph` 捕获 WRITE → `replay` ×N → 默认流 READ 回读校验 → `unregister(dst)` + 预检查负例 → `unregister(src)` → `destroy` → `uninitialize`。
 
 ## 参数
 
@@ -61,15 +61,17 @@ kill -TERM <daemon_pid>
 
 1. 客户端日志出现 `unaligned host-DRAM register rejected as expected (4K alignment rule)`。
 2. `both host buffers registered (user MR table v2: regAddress = HalHostRegister iova)`，且 near 日志有两条 `RegisterMem ok`。
-3. `warmup round-trip OK (host buffer -> FAR slot -> host buffer2, ...)`。
-4. `graph captured` 后 `N replays done`，吞吐量级与例 10 相当（同为单流单拷贝，量级参考即可）。
-5. `verify OK: FAR rank <r> slot matches the host pattern`。
-6. `post-unregister copy rejected as expected (host precheck)`。
-7. 退出前 `mf.get_last_err_msg()` 为空，FAR 守护各 contributor `stopped cleanly`。
+3. 探针三连：`[probe A] pool->pool round-trip ...: OK`、`[probe B] user host-DRAM as WRITE source ...: OK`、`[probe C] user host-DRAM as READ sink ...: OK`（失败时行尾附带首 8 字 dump）。
+4. `warmup round-trip OK (host buffer -> FAR slot -> host buffer2)`。
+5. `graph captured` 后 `N replays done`，吞吐量级与例 10 相当（同为单流单拷贝，量级参考即可）。
+6. `verify OK: FAR rank <r> slot matches the host pattern`。
+7. `post-unregister copy rejected as expected (host precheck)`。
+8. 退出前 `mf.get_last_err_msg()` 为空，FAR 守护各 contributor `stopped cleanly`。
 
 ## 判读
 
 - 注册层：near 日志 `RegisterMem ok: addr=0x... size=...`；宿主 `query memory key ok` 行应显示 `mrAddr` 等于注册地址、`regAddress` 为另一 IOVA 值（host-DRAM 特征，HBM 时两者相等）。
+- 探针层：A=池→池闭环 + NIC 写池页的 CPU 可见性（全已知好路径基线）；B=user MR 作 WRITE 源（far 内容经池槽回读校验）；C=user MR 作 READ 宿（dst 与 far 实际内容比对）。三者独立定位故障腿，失败行尾带首 8 字 dump（全零=WR 未生效，垃圾=写错落点）。
 - 数据层：warmup 与 verify 两次独立校验，replay 后 verify 再次校验，覆盖"图重放期间数据未漂移"。
 - 负例层：对齐负例在注册入口被拒（错误日志含 `reject_unaligned_dram`）；注销后拷贝在主机预检查被拒。
 
@@ -78,6 +80,9 @@ kill -TERM <daemon_pid>
 | 现象 | 首查 |
 | --- | --- |
 | 注册返回非 0，日志 `reject_unaligned_dram` | 地址或大小非 4K 对齐（torch pinned tensor、`ctypes.create_string_buffer` 均不保证，请用 `mmap`） |
+| `[probe A] FAIL` | 池数据面/环境问题（与 user MR 无关）：核对大页、QP 连接、双端版本 |
+| `[probe B] FAIL`（far 空/旧值） | user MR 作源失效：NIC 不接受 DRAM-lkey SGE 读 host iova——核对 `register MR result` 行 regAddress 与 lkey，上报留档 |
+| `[probe C] FAIL`（dst 空） | user MR 作宿失效：同上方向为 NIC 写 host iova；A/B 通过而 C 失败时优先怀疑落点翻译 |
 | warmup/verify mismatch | 双端 `memfabric_hybrid` 版本不一致（v2 表 regAddress 未填充）；确认两节点同 commit |
 | `query memory key failed` | 实体无 dramSegment：确认建池 `max_dram_size > 0` 且 `extend_local_mem` 已成功 |
 | register 报表满 `user_mr_table_full` | 单进程用户 MR 上限 2040 条 |
