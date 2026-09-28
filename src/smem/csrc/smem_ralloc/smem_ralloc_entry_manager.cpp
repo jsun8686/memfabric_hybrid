@@ -36,6 +36,9 @@ constexpr uint32_t SMEMRA_MASTER_CHANGE_THROTTLE_SEC = 2U; /* min gap between po
 /* short budget for the best-effort GRANT_FAIL: it runs on the executor failure path and
  * must not stall the error reply to the requester; a lost NACK is bounded by the grant TTL */
 constexpr uint32_t SMEMRA_GRANT_FAIL_TIMEOUT_MS = 5000U;
+
+/* sentinel for NextReapLeadSec: no pool-empty mark is counting down */
+constexpr uint32_t SMEMRA_REAP_NO_PENDING = UINT32_MAX;
 }
 
 SmemRallocEntryManager &SmemRallocEntryManager::Instance()
@@ -424,6 +427,11 @@ void SmemRallocEntryManager::SubscribeRankDownWatch()
                 return;
             }
             SmemRallocMasterService::Instance().OnRankDown(rank);
+            /* the same signal also feeds the pool lifecycle: a rank whose store link
+             * broke is gone, so it must not keep blocking the pool-empty reap as a
+             * phantom member (failed join / missed leave); still erase-only + local
+             * state, no rpc on this thread */
+            SmemRallocEntryManager::Instance().OnRankLinkDown(rank);
         },
         wid);
     if (ret == SM_OK && wid != UINT32_MAX) {
@@ -463,6 +471,29 @@ void SmemRallocEntryManager::PokeReporter()
         reporterPoke_ = true;
     }
     reporterCv_.notify_one();
+}
+
+void SmemRallocEntryManager::OnRankLinkDown(uint32_t rank)
+{
+    std::vector<SmemRallocEntryPtr> farEntries;
+    {
+        std::lock_guard<std::mutex> guard(entryMutex_);
+        for (auto &it : entryIdMap_) {
+            if (it.second != nullptr && it.second->GetRole() == SMEM_RALLOC_ROLE_FAR) {
+                farEntries.push_back(it.second);
+            }
+        }
+    }
+    if (farEntries.empty()) {
+        return;
+    }
+    /* entries are refcounted, safe to touch outside entryMutex_; MarkMemberDeparted
+     * evaluates pool emptiness which may (re)set the teardown mark, then the poke
+     * sends the reporter down the fast path (sleep to the grace boundary, reap) */
+    for (auto &entry : farEntries) {
+        entry->MarkMemberDeparted(rank);
+    }
+    PokeReporter();
 }
 
 void SmemRallocEntryManager::RefreshMasterEndpoint()
@@ -535,10 +566,17 @@ void SmemRallocEntryManager::ReporterLoop()
     SM_LOG_INFO("ralloc reporter started, interval: " << reportIntervalSec_ << "s grace: " << poolGraceSec_ << "s");
     auto lastReport = std::chrono::steady_clock::now();
     while (!reporterStop_.load()) {
+        /* sleep at most one period; less when a pool-empty mark is counting down its
+         * grace so the reap lands ~grace seconds after the leave (poke-driven) instead
+         * of up to a full period later; floored at 1s so a fresh 0s lead can never spin */
+        auto lead = NextReapLeadSec();
+        auto waitSec = (lead == SMEMRA_REAP_NO_PENDING)
+                           ? reportIntervalSec_
+                           : std::max(1U, std::min(lead, reportIntervalSec_));
         bool poked = false;
         {
             std::unique_lock<std::mutex> lock(reporterMutex_);
-            reporterCv_.wait_for(lock, std::chrono::seconds(reportIntervalSec_),
+            reporterCv_.wait_for(lock, std::chrono::seconds(waitSec),
                                  [this]() { return reporterPoke_ || reporterStop_.load(); });
             poked = reporterPoke_;
             reporterPoke_ = false;
@@ -644,8 +682,14 @@ void SmemRallocEntryManager::ReapEmptyPools()
     {
         std::lock_guard<std::mutex> guard(entryMutex_);
         for (auto &it : entryIdMap_) {
-            if (it.second != nullptr && it.second->GetRole() == SMEM_RALLOC_ROLE_FAR &&
-                it.second->IsPoolEmptyExpired(poolGraceSec_)) {
+            if (it.second == nullptr || it.second->GetRole() != SMEM_RALLOC_ROLE_FAR) {
+                continue;
+            }
+            /* convergent re-evaluation: event paths may miss (silently cleared mark,
+             * phantom member left by a failed join) -- recomputing emptiness every
+             * cycle guarantees the reap converges regardless of the event history */
+            it.second->RefreshPoolEmpty();
+            if (it.second->IsPoolEmptyExpired(poolGraceSec_)) {
                 victims.push_back(it.second);
             }
         }
@@ -673,6 +717,23 @@ void SmemRallocEntryManager::ReapEmptyPools()
     if (!victims.empty()) {
         ReportCommittedBytes(0U); /* refresh master accounting right after the teardown */
     }
+}
+
+uint32_t SmemRallocEntryManager::NextReapLeadSec()
+{
+    uint32_t lead = SMEMRA_REAP_NO_PENDING;
+    std::lock_guard<std::mutex> guard(entryMutex_);
+    for (auto &it : entryIdMap_) {
+        if (it.second == nullptr || it.second->GetRole() != SMEM_RALLOC_ROLE_FAR ||
+            !it.second->PoolEmptyMarked()) {
+            continue;
+        }
+        auto remain = it.second->PoolEmptyRemainingSec(poolGraceSec_);
+        if (remain < lead) {
+            lead = remain;
+        }
+    }
+    return lead;
 }
 
 void SmemRallocEntryManager::Destroy()

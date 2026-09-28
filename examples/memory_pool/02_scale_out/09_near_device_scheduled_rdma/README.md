@@ -100,7 +100,9 @@ kill -TERM <daemon_pid>
   6. `verify OK: far rank <R> slot matches the pattern`
   7. `[client] device-scheduled RDMA under NPU graph finished cleanly`，exit 0
 - 守护侧正常常驻、停机 `all contributors stopped cleanly`
-- 可连跑多轮客户端（守护复用范式）
+- 可连跑多轮客户端（守护复用范式）：客户端退出后 FAR 实体在宽限（默认 5s，`MF_RALLOC_POOL_GRACE_SEC`）+
+  断链检测内自毁，下一轮命中全新实体，无需人为等待；若上一轮异常退出后立刻重跑仍撞上垂死实体
+  （create 挂 ~60s 后 `create qp ... failed: -7`），等待 ~10s 再跑即自愈，无需重启守护
 
 ## 判读
 - replay 吞吐 = `replays × size / 计时`（计时含末次 synchronize）；单边 WRITE 串行提交 +

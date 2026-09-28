@@ -105,6 +105,11 @@ public:
      * release its optimistic reservation so the load view recovers before the TTL */
     void NotifyPlacementFailure(const SmemRallocRpcMsg &req);
 
+    /* a rank's store link broke (watch callback): mark it departed on every FAR entry so
+     * a phantom member of a failed join stops blocking the pool-empty reap, then wake
+     * the reporter for the fast path; erase-only semantics, no rpc on the caller thread */
+    void OnRankLinkDown(uint32_t rank);
+
 private:
     int32_t PrepareStore();
     int32_t RacingForStoreServer();
@@ -126,6 +131,10 @@ private:
     void OnMasterKeyChanged(int result, const std::vector<uint8_t> &value);
     bool ReportCommittedBytes(uint32_t retry);
     void ReapEmptyPools();
+    /* seconds until the nearest pending pool-empty mark expires (ceil), SMEMRA_REAP_NO_PENDING
+     * when nothing is pending: lets the reporter sleep to the boundary instead of a full
+     * period, so a pool left empty self-tears-down ~grace seconds after the leave */
+    uint32_t NextReapLeadSec();
 
 private:
     std::mutex entryMutex_;

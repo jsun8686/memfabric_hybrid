@@ -321,15 +321,26 @@ import+mmap 完毕；executor 回执严格后置于 barrier 返回，因此**获
 ### 6.5 FAR entry 组空自毁
 
 ```
-每个 entry 维护 memberRoles_（rank→角色）：
+每个 entry 维护 memberRoles_（rank→角色）+ departedRanks_（store 断链确认离线的 rank）：
   · join 前节点在池前缀 store 写 RA_ROLE_<rank>（写先于 join 事件 CAS，次序安全）
-  · JoinHandle(rk)：读键入表 + 清自毁标记；自身 join 成功时经 GetMemberRanks() 种子化全表
+  · JoinHandle(rk)：读键入表 + 清自毁标记 + 撤销该 rank 的 departed 记录（重连即复活）；
+    自身 join 成功时经 GetMemberRanks() 种子化全表
   · LeaveHandle(rk)（LINK_DOWN 与 LEAVE 共口）：出表后评估
-判定（仅 FAR entry）：其余在组成员角色全为 FAR（含"无其余成员"）→ 记 poolEmptySinceUs_
-reaper（manager 周期线程，FAR 节点）：FAR entry 且标记超过宽限（默认 5s，MF_RALLOC_POOL_GRACE_SEC）
-  → UnInitialize(含 GroupLeave) + RemoveEntryByPtr + 即时上报 master
+判定（仅 FAR entry）：其余在组成员中剔除 departedRanks_ 后角色全为 FAR（含"无其余成员"）
+  → 记 poolEmptySinceUs_；join 进行中（joinActive_）跳过，由 EndJoinActive 收口重估
+reaper（manager 周期线程，FAR 节点）：
+  · 每周期先对每个 FAR entry 收敛式重估（RefreshPoolEmpty）——事件路径丢标/幽灵成员
+    也能在下一周期收敛，不再依赖一次性事件标记
+  · FAR entry 且标记超过宽限（默认 5s，MF_RALLOC_POOL_GRACE_SEC）→ UnInitialize(含
+    GroupLeave) + RemoveEntryByPtr + 即时上报 master
+  · reporter 等待 = min(周期, 最近到期边界)：断链/离开后 poke 立即唤醒，~宽限即回收
+断链联动：store WATCH_RANK_LINK_DOWN 回调 → OnRankLinkDown(rank) → 各 FAR entry
+  MarkMemberDeparted（入 departed 集、出角色表，纯本地无 rpc）+ poke reporter
 ```
 
+- **失败 join 的幽灵成员**：垂死 join（撞上未及回收的陈旧实体）在组视图留下幽灵 NEAR 成员且
+  无补偿剔除——departedRanks_ + 断链联动 + 收敛式重估三者联合兜底：客户端进程退出（store 链断）
+  即被标记离线，~宽限后实体回收，后续重跑命中全新实体（910B 验证过的"整体换新"路径）
 - **多 FAR 同池**（A 两块分置 X1/X2）：A 离开后 {X1,X2} 互见为 FAR → 对称触发、双双回收（事件 CAS 串行化+宽限兜底）
 - B 仍在则不触发（NEAR 在表）；B 走后才触发；A 崩溃经 LinkDown 与主动 destroy 同路
 - 角色键读不到时 fail-safe 按 NEAR 处理（宁漏不误杀）；宽限期内新 NEAR 加入即清标记

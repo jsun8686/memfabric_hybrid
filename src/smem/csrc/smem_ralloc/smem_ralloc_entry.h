@@ -21,6 +21,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <map>
+#include <set>
 #include <vector>
 
 namespace ock {
@@ -113,6 +114,22 @@ public:
     /* true when no live NEAR member is left in the pool (same rule as EvaluatePoolEmpty) */
     bool PoolEmpty() const;
 
+    /* record a member rank as departed (its store link broke): the rank no longer blocks
+     * pool-empty evaluation -- this is what un-blocks the reap after a failed join left
+     * a phantom NEAR member in the group view; a later re-join of the same rank cancels
+     * the departure (UpdateMemberRole). No rpc on this path (store watch thread). */
+    void MarkMemberDeparted(uint32_t rk);
+
+    /* re-run the pool-empty evaluation (idempotent, skips while a join is in flight):
+     * the reaper calls it every cycle so a silently cleared mark or a missed leave
+     * event still converges instead of dead-ending the reap */
+    void RefreshPoolEmpty();
+
+    /* pool-empty countdown state for the reporter fast path: marked + seconds until
+     * the grace expires (0 when already expired or not marked) */
+    bool PoolEmptyMarked() const;
+    uint32_t PoolEmptyRemainingSec(uint64_t graceSec) const;
+
     /* lifecycle of the executor-driven first JOIN_ALLOC (create branch): mark RUNNING
      * before Initialize, mark done after Join succeeded / on every failure path; extend
      * calls park on the cv instead of failing fast while the first slice builds */
@@ -183,6 +200,7 @@ private:
     /* pool lifecycle bookkeeping: role of every member rank, maintained from group events */
     mutable std::mutex roleMutex_;
     std::map<uint32_t, smem_ralloc_role_t> memberRoles_;
+    std::set<uint32_t> departedRanks_; /* store-link-confirmed gone, never blocks reap */
     bool joinActive_ = false;   /* guarded by roleMutex_: a JoinHandle is in flight */
     bool tearingDown_ = false;  /* guarded by roleMutex_: reaper/UnInitialize owns the entry */
     std::atomic<uint64_t> poolEmptySinceUs_{0};

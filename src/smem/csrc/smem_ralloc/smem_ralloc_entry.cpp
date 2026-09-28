@@ -426,13 +426,19 @@ void SmemRallocEntry::UpdateMemberRole(uint32_t rk)
         }
         std::lock_guard<std::mutex> guard(roleMutex_);
         memberRoles_ = roles;
-        poolEmptySinceUs_.store(0);
+        departedRanks_.clear(); /* own (re)join: the whole member view was just refreshed */
+        if (poolEmptySinceUs_.exchange(0) != 0) {
+            SM_LOG_INFO("pool-empty mark cancelled by own join, id: " << options_.id);
+        }
         return;
     }
     auto role = ReadRoleKey(rk);
     std::lock_guard<std::mutex> guard(roleMutex_);
     memberRoles_[rk] = role;
-    poolEmptySinceUs_.store(0);
+    departedRanks_.erase(rk); /* the rank demonstrably produced a group event: alive again */
+    if (poolEmptySinceUs_.exchange(0) != 0) {
+        SM_LOG_INFO("pool-empty mark cancelled by member event, rank: " << rk << " id: " << options_.id);
+    }
 }
 
 void SmemRallocEntry::EvaluatePoolEmpty()
@@ -443,8 +449,13 @@ void SmemRallocEntry::EvaluatePoolEmpty()
     std::vector<uint32_t> ranks;
     globalGroup_->GetMemberRanks(ranks);
     std::lock_guard<std::mutex> guard(roleMutex_);
+    if (joinActive_) {
+        /* an in-flight join owns the mark lifecycle: BeginJoinActive cleared it and
+         * EndJoinActive re-evaluates -- setting it here would race the joiner away */
+        return;
+    }
     for (auto r : ranks) {
-        if (r == options_.rank) {
+        if (r == options_.rank || departedRanks_.count(r) != 0) {
             continue;
         }
         auto it = memberRoles_.find(r);
@@ -465,6 +476,48 @@ bool SmemRallocEntry::IsPoolEmptyExpired(uint64_t graceSec) const
         return false;
     }
     return (mf::MonotonicTime::TimeUs() - marked) >= graceSec * 1000000ULL;
+}
+
+void SmemRallocEntry::MarkMemberDeparted(uint32_t rk)
+{
+    if (rk == options_.rank) {
+        return; /* own link state is not observed here */
+    }
+    {
+        std::lock_guard<std::mutex> guard(roleMutex_);
+        if (departedRanks_.insert(rk).second) {
+            SM_LOG_INFO("member rank departed (store link down), rank: " << rk << " id: " << options_.id);
+        }
+        memberRoles_.erase(rk);
+    }
+    /* evaluate outside roleMutex_ (EvaluatePoolEmpty takes it): a departing last NEAR
+     * member may now complete the pool-empty mark; deferred without loss when a join
+     * is in flight -- EndJoinActive re-evaluates with the same departed set */
+    EvaluatePoolEmpty();
+}
+
+void SmemRallocEntry::RefreshPoolEmpty()
+{
+    EvaluatePoolEmpty();
+}
+
+bool SmemRallocEntry::PoolEmptyMarked() const
+{
+    return poolEmptySinceUs_.load() != 0;
+}
+
+uint32_t SmemRallocEntry::PoolEmptyRemainingSec(uint64_t graceSec) const
+{
+    auto marked = poolEmptySinceUs_.load();
+    if (marked == 0) {
+        return 0;
+    }
+    auto elapsedUs = mf::MonotonicTime::TimeUs() - marked;
+    auto graceUs = graceSec * 1000000ULL;
+    if (elapsedUs >= graceUs) {
+        return 0;
+    }
+    return static_cast<uint32_t>((graceUs - elapsedUs + 999999ULL) / 1000000ULL); /* ceil */
 }
 
 bool SmemRallocEntry::BeginJoinActive()
@@ -510,7 +563,7 @@ bool SmemRallocEntry::PoolEmpty() const
     globalGroup_->GetMemberRanks(ranks);
     std::lock_guard<std::mutex> guard(roleMutex_);
     for (auto r : ranks) {
-        if (r == options_.rank) {
+        if (r == options_.rank || departedRanks_.count(r) != 0) {
             continue;
         }
         auto it = memberRoles_.find(r);
