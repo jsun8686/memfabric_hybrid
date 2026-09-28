@@ -7,12 +7,14 @@ Same topology and skeleton as 10_user_registered_memory, but the local copy endp
 4K-aligned anonymous mmap buffers on the host instead of NPU HBM tensors. The registered
 host-DRAM MR carries a distinct device-dma base (HalHostRegister iova) in the v2 user-MR
 table, so the AICore RDMA kernel addresses the SGE as regAddress + (localAddr - addr) under
-the MR's lkey. Known issue under investigation: a user 4K-anon buffer as the device READ
-source yields zeros regardless of write timing. Probe matrix A/B/B4/B5/B6/B6b/B7/C2 varies
-the page state at register (unfaulted vs faulted+DRAM-resident), data residency at DMA
-(dirty vs DRAM), page size and VA height (<2^47 vs python's default ~0xfffd... placement);
-B7 OK would pin the constraint on the VA height (all known-good registrations live below
-2^47), B6+B6b OK on the page-fault/invalidation handling.
+the MR's lkey. Known issue under investigation: a user buffer OUTSIDE the pool GVA window as
+the device READ source yields zeros regardless of page state/size/VA height, while pool
+slices (in-window VMAs) work under the same HalHostRegister flag. Probe matrix
+A/B/B4/B5/B6/B6b/B7/B8/C2 varies the page state at register (unfaulted vs
+faulted+DRAM-resident), data residency at DMA (dirty vs DRAM), page size, VA height
+(<2^47 vs python's default ~0xfffd... placement) and window placement (B8: MAP_FIXED inside
+the pool GVA window -- OK pins the constraint on the in-window placement, FAIL sends the
+evidence chain to the vendor).
 Flow: register src/dst unfaulted -> fill+evict -> register b6 DRAM-resident ->
 probes -> closed round-trip -> capture/replay the WRITE -> unregister ->
 expect the host precheck to reject further copies.
@@ -45,6 +47,8 @@ HUGEPAGE_2M = 2 * 1024 * 1024
 EVICT_BYTES = 512 << 20    # cache-eviction sweep size (>> L3) for probe B4
 LOW_VA_HINT = 0x300000000000  # 3TB: below bit 47, clear of the pool windows (0x288..-0x2a8..)
 VA_BIT47 = 1 << 47
+WINDOW_PROBE_OFFSET = 1 << 40  # B8 probe lives 1TB above the local slot, inside the 2TB
+                               # pool GVA window and far above any slice this example extends
 
 DATA_OP = ralloc.RallocDataOpType.DEVICE_RDMA | ralloc.RallocDataOpType.DEVICE_SCHEDULE
 MEM_TYPE = ralloc.RallocMemType.HOST
@@ -135,6 +139,21 @@ def _unmap_buffer(addr, size):
     libc.munmap(ctypes.c_void_p(addr), ctypes.c_size_t(size))
 
 
+def _map_window_buffer(addr, size):
+    """MAP_FIXED hugepage mapping at a given address inside the pool GVA window (probe B8):
+    same page kind and registration path as the pool slices, but mapped and registered as
+    user memory -- isolates the in-window vs out-of-window factor."""
+    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    libc.mmap.restype = ctypes.c_void_p
+    libc.mmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int,
+                          ctypes.c_int, ctypes.c_long]
+    flags = 0x22 | 0x40000 | 0x10  # MAP_PRIVATE | MAP_ANON | MAP_HUGETLB | MAP_FIXED
+    got = libc.mmap(ctypes.c_void_p(addr), size, 0x3, flags, -1, 0)
+    if got is None or got == ctypes.c_void_p(-1).value or got != addr:
+        raise RuntimeError(f"MAP_FIXED hugepage at 0x{addr:x} failed")
+    return got
+
+
 def _map_low_buffer(size):
     """plain anonymous mapping placed at a low VA hint (below bit 47): every registration
     that ever worked (HBM tensors, pool slots) lives below 2^47 while python's default mmap
@@ -192,8 +211,8 @@ def main():
         raise RuntimeError(f"--size ({size}) must be 4-byte aligned (int32 verify pattern)")
     if size > block:
         raise RuntimeError(f"--size ({size}) exceeds --block-size ({block})")
-    if 9 * size > block:
-        raise RuntimeError(f"--block-size ({block}) must hold 9 probe windows of --size ({size})")
+    if 10 * size > block:
+        raise RuntimeError(f"--block-size ({block}) must hold 10 probe windows of --size ({size})")
     if block > max_pool:
         raise RuntimeError(f"--block-size ({block}) exceeds --max-pool-size ({max_pool})")
     if max_pool % GIB != 0:
@@ -208,6 +227,7 @@ def main():
     src_mm = dst_mm = b6_mm = None
     hp_addr = 0
     low_addr = 0
+    b8_addr = 0
     try:
         import numpy as np
         import torch
@@ -307,6 +327,8 @@ def main():
         #      reads are coherent once pages are connected => the hazards are registration-
         #      time invalidation + unfaulted registration => library fix = touch pages
         #      before HalHostRegister (LvaShmReservePhysicalMemory equivalent);
+        # B8:  user hugepage MAP_FIXED INSIDE the pool GVA window: OK => the constraint is
+        #      in-window placement (fix = carve user DRAM from the window), FAIL => vendor;
         # C2:  user sink, far seeded via a pool->pool write, dst pre-evicted clean.
         side = torch.npu.Stream()
         side.wait_stream(torch.npu.current_stream())
@@ -323,6 +345,11 @@ def main():
         assert handle.register(low_addr, size) == 0, "register(low-VA buffer) failed"
         ctypes.memmove(low_addr, expect.tobytes(), size)               # B7 source, post-register fill
         _log(f"[client] B7 buffer: 0x{low_addr:x} ({size} bytes, low-VA hint honored={low_hint_ok})")
+        b8_addr = _map_window_buffer(local_gva + WINDOW_PROBE_OFFSET, HUGEPAGE_2M)
+        assert handle.register(b8_addr, HUGEPAGE_2M) == 0, "register(in-window buffer) failed"
+        ctypes.memmove(b8_addr, expect.tobytes(), size)                # B8 source, post-register fill
+        _log(f"[client] B8 buffer: 0x{b8_addr:x} ({HUGEPAGE_2M} bytes MAP_FIXED hugepage inside the "
+             f"pool GVA window, local slot at 0x{local_gva:x})")
         with torch.npu.stream(side):
             stream_ptr = torch.npu.current_stream().npu_stream
             assert handle.device_copy(local_gva, far_gva, size, stream_ptr) == 0, "probe A write failed"
@@ -343,6 +370,9 @@ def main():
             assert handle.device_copy(low_addr, far_gva, size, stream_ptr) == 0, "probe B7 write failed"
             assert handle.device_copy(far_gva, local_gva + 8 * size, size, stream_ptr) == 0, \
                 "probe B7 readback failed"
+            assert handle.device_copy(b8_addr, far_gva, size, stream_ptr) == 0, "probe B8 write failed"
+            assert handle.device_copy(far_gva, local_gva + 9 * size, size, stream_ptr) == 0, \
+                "probe B8 readback failed"
             assert handle.device_copy(b6_addr, far_gva, size, stream_ptr) == 0, "probe B6 write failed"
             assert handle.device_copy(far_gva, local_gva + 6 * size, size, stream_ptr) == 0, \
                 "probe B6 readback failed"
@@ -365,6 +395,7 @@ def main():
         b6Far = np.frombuffer(_bytes_at(local_gva + 6 * size, size), dtype=np.int32)
         b6bFar = np.frombuffer(_bytes_at(local_gva + 7 * size, size), dtype=np.int32)
         b7Far = np.frombuffer(_bytes_at(local_gva + 8 * size, size), dtype=np.int32)
+        b8Far = np.frombuffer(_bytes_at(local_gva + 9 * size, size), dtype=np.int32)
         c2Dst = np.frombuffer(bytes(dst_mm[:]), dtype=np.int32)
         okA = np.array_equal(aGot, probeA)
         okB = np.array_equal(bFar, expect)
@@ -393,14 +424,17 @@ def main():
              + ("" if okB6 else f", far={b6Far[:8].tolist()} want={expect6[:8].tolist()}"))
         _log("[probe B6b] same buffer, dirty post-register rewrite: " + ("OK" if okB6b else "FAIL")
              + ("" if okB6b else f", far={b6bFar[:8].tolist()} want={expect6b[:8].tolist()}"))
+        okB8 = np.array_equal(b8Far, expect)
+        _log("[probe B8] user hugepage inside the pool GVA window as source: " + ("OK" if okB8 else "FAIL")
+             + ("" if okB8 else f", far={b8Far[:8].tolist()} want={expect[:8].tolist()}"))
         _log("[probe C2] user sink, far seeded via pool (dst pre-evicted): "
              + ("OK" if okC2 else "FAIL")
              + ("" if okC2 else f", dst={c2Dst[:8].tolist()} want={expect[:8].tolist()}"))
-        assert okA and okB and okB4 and okB5 and okB6 and okB6b and okB7 and okC2, \
+        assert okA and okB and okB4 and okB5 and okB6 and okB6b and okB7 and okB8 and okC2, \
             f"probes failed: A={okA} B={okB} B4={okB4} B5={okB5} B6={okB6} B6b={okB6b} B7={okB7} " \
-            f"C2={okC2} (B7 OK => VA-height constraint, allocate user buffers below 2^47; " \
-            f"B6/B6b OK => library fix = touch pages before HalHostRegister; see README)"
-        _log("[client] probes A/B/B4/B5/B6/B6b/B7/C2 OK (kernel library loaded)")
+            f"B8={okB8} C2={okC2} (B8 OK => constraint = inside the pool GVA window, fix = carve " \
+            f"user DRAM from the window; B8 FAIL => vendor escalation; see README)"
+        _log("[client] probes A/B/B4/B5/B6/B6b/B7/B8/C2 OK (kernel library loaded)")
 
         # closed round-trip user -> FAR -> user2 (the original warmup, now with a value dump)
         np.frombuffer(dst_mm, dtype=np.int32)[:] = 0
@@ -455,9 +489,12 @@ def main():
         assert handle.unregister(src_addr) == 0, "unregister(src buffer) failed"
         assert handle.unregister(b6_addr) == 0, "unregister(b6 buffer) failed"
         assert handle.unregister(low_addr) == 0, "unregister(low-VA buffer) failed"
+        assert handle.unregister(b8_addr) == 0, "unregister(in-window buffer) failed"
         assert handle.unregister(hp_addr) == 0, "unregister(hugepage buffer) failed"
         _unmap_buffer(hp_addr, HUGEPAGE_2M)
         hp_addr = 0
+        _unmap_buffer(b8_addr, HUGEPAGE_2M)
+        b8_addr = 0
         _unmap_buffer(low_addr, size)
         low_addr = 0
         b6_mm.close()
@@ -472,6 +509,8 @@ def main():
     finally:
         if hp_addr != 0:
             _unmap_buffer(hp_addr, HUGEPAGE_2M)
+        if b8_addr != 0:
+            _unmap_buffer(b8_addr, HUGEPAGE_2M)
         if low_addr != 0:
             _unmap_buffer(low_addr, size)
         if b6_mm is not None:
