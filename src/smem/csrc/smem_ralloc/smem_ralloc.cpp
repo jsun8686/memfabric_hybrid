@@ -639,13 +639,16 @@ static int32_t SmemRallocDeviceSegCheck(smem_ralloc_t handle, const void *src, c
     enum class DevEndType { INVALID, LOCAL_POOL, PEER_POOL, USER };
     auto classifyEnd = [entry, localRank](const void *addr, uint64_t len, DevEndType &type,
                                           uint32_t &rank) -> int32_t {
+        /* explicit user registration outranks the window heuristic: a user buffer carved
+         * from inside a GVA window (or overlapping one) must resolve to its user MR,
+         * not to the rank slice the address happens to fall into */
+        if (entry->IsUserRegistered(reinterpret_cast<uint64_t>(addr), len)) {
+            type = DevEndType::USER;
+            return SM_OK;
+        }
         rank = entry->GetRankIdByGva(const_cast<void *>(addr));
         if (rank != UINT32_MAX) {
             type = (rank == localRank) ? DevEndType::LOCAL_POOL : DevEndType::PEER_POOL;
-            return SM_OK;
-        }
-        if (entry->IsUserRegistered(reinterpret_cast<uint64_t>(addr), len)) {
-            type = DevEndType::USER;
             return SM_OK;
         }
         type = DevEndType::INVALID;

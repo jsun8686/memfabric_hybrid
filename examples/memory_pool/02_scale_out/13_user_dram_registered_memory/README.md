@@ -8,7 +8,7 @@
 
 前置约束：host-DRAM 端点要求**地址与大小均 4K 对齐**（IOVA 映射的页粒度），不对齐的注册在入口被拒（`SM_INVALID_PARAM`）；例 10 中"host-DRAM 注册被拒"的负例在本例反转为正例 + 对齐负例。
 
-**数据面行为（调查中）**：用户 4K 匿名缓冲作为设备侧**读源**时 NIC 读到全零——注册前/后写入均失败。代码排查已定位路径差异：池槽注册前经 `LvaShmReservePhysicalMemory` **逐页 fault 驻留**（hybm_conn_based_segment.cpp:511），用户注册（RegisterMemCommon）**无任何页驻留准备**——`HalHostRegister` 对未 fault 匿名页可能钉住共享零页（后续 CPU 写 COW 换页、iova 断连），对已 fault 页可能丢弃注册时的脏缓存行。探针矩阵按"注册时页状态 × DMA 时数据驻留 × 页大小"三因素切割（见判读），B6+B6b OK ⇒ 库级修复 = 注册前 touch 页（池路径同款）。
+**数据面行为（调查中）**：用户缓冲作为设备侧**读源**时 NIC 读到全零。已排除因素（探针矩阵实证）：页型（4K/巨页）、注册时页状态（未 fault/已驻留）、DMA 时数据驻留（cache 脏/DRAM）、cache 一致性、VA 高度（hint 至 2^47 以下仍败）、MR 权限与表布局。flag 实验结论：`HOST_MEM_MAP_DEV(0)` 在本驱动（C23/23.x）上注册直接失败（65534，LMCache#91 同款，需 ≥24.1）；`DEV_PCIE_TH(3)` 对池 VMA（GVA 窗内）建出可用映射、对窗外用户 VMA 建出读零映射。当前唯一未排除变量 = **是否落在池 GVA 预留窗内**——探针 B8（MAP_FIXED 巨页缓冲落进池窗口）即为此而设。
 
 ## 拓扑与角色
 
@@ -38,7 +38,7 @@ kill -TERM <daemon_pid>
 
 ## 生命周期
 
-`create`（DEVICE_RDMA | DEVICE_SCHEDULE）→ `extend_local_mem`（本地 DRAM 槽，保证实体 dramSegment 就绪）→ `extend_remote_mem`（FAR 落地槽）→ 对齐负例 ×2 → src/dst **未 fault 注册** → 填充+驱逐 → b6 **DRAM 驻留注册** + src 重弄脏 + 巨页缓冲注册 → 探针 A/B/B4/B5/B6/B6b/C2 三阶段（设备段间夹 CPU 驱逐/重写）→ warmup 闭环双向 → `NPUGraph` 捕获 WRITE → `replay` ×N → 默认流 READ 回读校验 → `unregister` ×4 + 预检查负例 → `destroy` → `uninitialize`。
+`create`（DEVICE_RDMA | DEVICE_SCHEDULE）→ `extend_local_mem`（本地 DRAM 槽，保证实体 dramSegment 就绪）→ `extend_remote_mem`（FAR 落地槽）→ 对齐负例 ×2 → src/dst **未 fault 注册** → 填充+驱逐 → b6 **DRAM 驻留注册** + src 重弄脏 + 巨页缓冲注册 + B7 低 VA 缓冲注册 + B8 窗内缓冲（MAP_FIXED 至池 GVA 窗内）注册 → 探针 A/B/B4/B5/B6/B6b/B7/B8/C2 三阶段（设备段间夹 CPU 驱逐/重写）→ warmup 闭环双向 → `NPUGraph` 捕获 WRITE → `replay` ×N → 默认流 READ 回读校验 → `unregister` ×5 + 预检查负例 → `destroy` → `uninitialize`。
 
 ## 参数
 
@@ -62,8 +62,8 @@ kill -TERM <daemon_pid>
 ## 验收标准
 
 1. 客户端日志出现 `unaligned host-DRAM register rejected as expected (4K alignment rule)`。
-2. `src/dst registered unfaulted` 与 `b6 registered DRAM-resident; src re-dirtied`，near 日志有对应 `RegisterMem ok` ×4（src/dst/b6/巨页）。
-3. 探针组七连（判读见下）：`[probe A] pool slot source, cache-dirty (baseline): OK`、`[probe B] ... registered unfaulted, dirty fill`、`[probe B4] ... after 512MB eviction`、`[probe B5] hugepage-backed ...`、`[probe B6] ... DRAM-resident at register`、`[probe B6b] ... dirty post-register rewrite`、`[probe C2] ... far seeded via pool (dst pre-evicted)`（失败时行尾附首 8 字 dump）。
+2. `src/dst registered unfaulted` 与 `b6 registered DRAM-resident; src re-dirtied`，near 日志有对应 `RegisterMem ok` ×6（src/dst/b6/巨页/低VA/窗内）。
+3. 探针组八连（判读见下）：`[probe A] pool slot source, cache-dirty (baseline): OK`、`[probe B] ... registered unfaulted, dirty fill`、`[probe B4] ... after 512MB eviction`、`[probe B5] hugepage-backed ...`、`[probe B6] ... DRAM-resident at register`、`[probe B6b] ... dirty post-register rewrite`、`[probe B7] user buffer at low VA ...`、`[probe B8] user hugepage inside the pool GVA window ...`、`[probe C2] ... far seeded via pool (dst pre-evicted)`（失败时行尾附首 8 字 dump）。
 4. `warmup round-trip OK (host buffer -> FAR slot -> host buffer2)`。
 5. `graph captured` 后 `N replays done`，吞吐量级与例 10 相当（同为单流单拷贝，量级参考即可）。
 6. `verify OK: FAR rank <r> slot matches the host pattern`。
@@ -83,10 +83,11 @@ kill -TERM <daemon_pid>
 | B5 | 注册后填充 | cache 脏 | 巨页 | 页粒度对照 |
 | B6 | **fault+数据已驻留** | DRAM | 4K | OK ⇒ 翻译正确联到已备页 |
 | B6b | 同 B6 缓冲 | 重写后 cache 脏 | 4K | OK ⇒ 一致读成立 ⇒ 库修法=注册前 touch |
-| B7 | 注册后填充 | cache 脏 | 4K @**低 VA**（hint 3TB，<2^47） | OK ⇒ **VA 高度约束实锤**（已知可用注册全在 2^47 以下，python 默认 mmap 在 0xfffd… 以上） |
+| B7 | 注册后填充 | cache 脏 | 4K @**低 VA**（hint 3TB，<2^47） | OK ⇒ VA 高度约束（实测 FAIL：高度非分界） |
+| B8 | 注册后填充 | cache 脏 | 巨页 @**池 GVA 窗内**（MAP_FIXED 本地槽 +1TB） | **OK ⇒ 约束=窗内落位**（修法=用户 DRAM 从窗口切分）；FAIL ⇒ vendor |
 | C2 | dst 预驱逐干净 | — | 4K | user 作宿（far 经池→池灌入） |
 
-  组合判读：**B7 OK 而 B/B4/B5/B6 全败** ⇒ 约束在 VA 高度（驱动 SVM/RA 对 ≥2^47 的 host VA 映射失效）——workaround=低 VA 分配（hint mmap），vendor 提单；**B6+B6b OK 而 B/B4 FAIL** ⇒ 双坑=未 fault 注册断连 + 注册时丢脏行，库级修复=`RegisterMemCommon` 注册前逐页 touch（池路径 `LvaShmReservePhysicalMemory` 同款）；**B6 FAIL 且 B7 FAIL** ⇒ 已备页/低 VA 翻译仍错（纯 vendor）；**B4 OK** ⇒ 读非一致（DRAM-only 可见）。
+  组合判读：**B8 OK 而 B/B4/B5/B6/B6b/B7 全败** ⇒ 约束实锤=必须落在池 GVA 预留窗内（`HalHostRegister(DEV_PCIE_TH)` 仅对窗内 VMA 建可用映射）——修法=库提供窗内用户 DRAM 分配（池窗口切分）或文档化约束，同时 vendor 提单（窗外 VMA 映射失效）；**B8 FAIL** ⇒ 窗内/窗外亦非分界，vendor 提单（同 flag 同 API、窗内池槽通、窗内用户缓冲仍零）；**B6+B6b OK 而 B/B4 FAIL** ⇒ 双坑=未 fault 注册断连 + 注册时丢脏行，库级修复=`RegisterMemCommon` 注册前逐页 touch。
 - 数据面行为（调查中）：结论随探针矩阵判定更新，vendor 提单随附探针日志与 `register MR result`/`query memory key` 行。
 - 数据层：warmup 与 verify 两次独立校验，replay 后 verify 再次校验，覆盖"图重放期间数据未漂移"。
 - 负例层：对齐负例在注册入口被拒（错误日志含 `reject_unaligned_dram`）；注销后拷贝在主机预检查被拒。
@@ -98,7 +99,8 @@ kill -TERM <daemon_pid>
 | 注册返回非 0，日志 `reject_unaligned_dram` | 地址或大小非 4K 对齐（torch pinned tensor、`ctypes.create_string_buffer` 均不保证，请用 `mmap`） |
 | `[probe A] FAIL` | 池数据面/环境问题（与 user MR 无关）：核对大页、QP 连接、双端版本 |
 | `[probe B] FAIL`（far=[0,0,...] 全零） | 已知现象（未 fault 注册 + 脏行，双坑叠加）；按矩阵判根因 |
-| `[probe B7] OK`（其余用户探针全败） | **VA 高度约束**：host 缓冲须落在 2^47 以下（hint mmap）——短期 workaround + vendor 提单 |
+| `[probe B7] OK`（其余用户探针全败） | VA 高度约束（实测 B7 亦 FAIL，高度已排除） |
+| `[probe B8] OK`（其余用户探针全败） | **窗内落位约束**：用户 DRAM 须落在池 GVA 窗口内——短期由库切分窗口分配，vendor 提单窗外失效 |
 | `[probe B4] FAIL` + `[probe B6] [probe B6b] OK` | 未 fault 注册断连（零页钉扎/COW）：库修法=注册前 touch 页；vendor 提单附证 |
 | `[probe B6] FAIL` | 已备页翻译仍错（纯 vendor）：上报 `register MR result`、`query memory key` 行与探针日志 |
 | `[probe B4] OK` | user-iova 读非一致（仅 DRAM 数据可见）：vendor 提单；短期可改用巨页缓冲（B5 方案） |
