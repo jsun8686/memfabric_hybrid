@@ -7,9 +7,11 @@ Same topology and skeleton as 10_user_registered_memory, but the local copy endp
 4K-aligned anonymous mmap buffers on the host instead of NPU HBM tensors. The registered
 host-DRAM MR carries a distinct device-dma base (HalHostRegister iova) in the v2 user-MR
 table, so the AICore RDMA kernel addresses the SGE as regAddress + (localAddr - addr) under
-the MR's lkey. Flow: reject an unaligned register -> register both buffers -> probes A/B/C
-(pool->pool baseline, user buffer as WRITE source, user buffer as READ sink) -> closed
-round-trip buffer -> FAR slot -> buffer2 -> capture/replay the WRITE -> unregister ->
+the MR's lkey. Cache contract: HalHostRegister drops CPU dirty lines at registration, so
+buffer content must be written AFTER register(). Flow: reject an unaligned register ->
+register both buffers -> fill the pattern post-register -> probes A/B/C (pool->pool
+baseline, user buffer as WRITE source, user buffer as READ sink) -> closed round-trip
+buffer -> FAR slot -> buffer2 -> capture/replay the WRITE -> unregister ->
 expect the host precheck to reject further copies.
 """
 
@@ -208,8 +210,6 @@ def main():
         words = size // 4
         seed = rank + 1
         expect = np.arange(words, dtype=np.int32) * 7 + seed
-        np.frombuffer(src_mm, dtype=np.int32)[:] = expect
-        np.frombuffer(dst_mm, dtype=np.int32)[:] = 0
         _log(f"[client] host buffers: src=0x{src_addr:x} dst=0x{dst_addr:x} ({size} bytes each, "
              f"page-aligned anonymous mmap)")
 
@@ -217,11 +217,21 @@ def main():
         assert handle.register(dst_addr, size) == 0, "register(dst buffer) failed"
         _log("[client] both host buffers registered (user MR table v2: regAddress = HalHostRegister iova)")
 
+        # cache contract: HalHostRegister drops the CPU dirty lines of the range while
+        # establishing the device mapping -- content written BEFORE register() is lost for
+        # device DMA (the NIC then reads the bare anonymous-page zeros, probe-proven).
+        # Fill the buffers only AFTER registration.
+        np.frombuffer(src_mm, dtype=np.int32)[:] = expect
+        np.frombuffer(dst_mm, dtype=np.int32)[:] = 0
+        _log("[client] pattern filled after register (pre-register writes are dropped by the mapping)")
+
         # ---- probes A/B/C on a side stream, OUTSIDE any graph (the first device_copy also
         # dlopens and loads the kernel library, which is illegal inside capture):
         # A: pool->pool sanity incl. CPU visibility of NIC-written pool pages (known-good legs);
-        # B: user host-DRAM as WRITE source, far content verified through a pool-slot readback;
-        # C: user host-DRAM as READ sink, dst compared against the far content probe B left.
+        # B: user host-DRAM as WRITE source, far content verified through a pool-slot readback
+        #    against the pattern (filled post-register per the cache contract);
+        # C: user host-DRAM as READ sink, dst compared against the same pattern (far holds it
+        #    after B, so the comparison is non-vacuous).
         # All three run unconditionally so one failing leg still logs the other two. ----
         side = torch.npu.Stream()
         side.wait_stream(torch.npu.current_stream())
@@ -242,13 +252,13 @@ def main():
         cDst = np.frombuffer(bytes(dst_mm[:]), dtype=np.int32)
         okA = np.array_equal(aGot, probeA)
         okB = np.array_equal(bFar, expect)
-        okC = np.array_equal(cDst, bFar)
+        okC = np.array_equal(cDst, expect)
         _log("[probe A] pool->pool round-trip (baseline + CPU visibility): " + ("OK" if okA else "FAIL")
              + ("" if okA else f", got={aGot[:8].tolist()} want={probeA[:8].tolist()}"))
-        _log("[probe B] user host-DRAM as WRITE source (far readback via pool): " + ("OK" if okB else "FAIL")
+        _log("[probe B] user host-DRAM as WRITE source (far readback == pattern): " + ("OK" if okB else "FAIL")
              + ("" if okB else f", far={bFar[:8].tolist()} want={expect[:8].tolist()}"))
-        _log("[probe C] user host-DRAM as READ sink (dst == far content): " + ("OK" if okC else "FAIL")
-             + ("" if okC else f", dst={cDst[:8].tolist()} far={bFar[:8].tolist()}"))
+        _log("[probe C] user host-DRAM as READ sink (dst == pattern): " + ("OK" if okC else "FAIL")
+             + ("" if okC else f", dst={cDst[:8].tolist()} far={bFar[:8].tolist()} want={expect[:8].tolist()}"))
         assert okA and okB and okC, \
             f"device-scheduled copy probes failed: A={okA} B={okB} C={okC} " \
             f"(A: pool data plane, B: user MR as source SGE, C: user MR as sink SGE)"

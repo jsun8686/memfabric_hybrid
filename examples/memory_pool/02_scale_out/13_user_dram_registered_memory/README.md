@@ -8,6 +8,8 @@
 
 前置约束：host-DRAM 端点要求**地址与大小均 4K 对齐**（IOVA 映射的页粒度），不对齐的注册在入口被拒（`SM_INVALID_PARAM`）；例 10 中"host-DRAM 注册被拒"的负例在本例反转为正例 + 对齐负例。
 
+**数据面缓存契约**：`register()` 建立设备映射（HalHostRegister）时会丢弃该范围的 CPU 脏缓存行——**注册前写入的数据对设备 DMA 不可见**（NIC 读到匿名页零值；探针 B 曾实证 `far=[0,0,...]`），**缓冲内容必须在注册之后写入**；注册后的 CPU 写、NIC 读/写双向一致（探针 A/B/C 覆盖验证）。此为 vendor 层 `halHostRegister` 的 invalidate 语义，遗留建议改为 clean（写回）。
+
 ## 拓扑与角色
 
 - FAR 节点（1 台）：`memfabric_daemon.py` 贡献 NPU 卡内存，内置 store（`tcp://<far_ip>:8588`）。
@@ -36,7 +38,7 @@ kill -TERM <daemon_pid>
 
 ## 生命周期
 
-`create`（DEVICE_RDMA | DEVICE_SCHEDULE）→ `extend_local_mem`（本地 DRAM 槽，保证实体 dramSegment 就绪）→ `extend_remote_mem`（FAR 落地槽）→ 对齐负例 ×2 → `register(src/dst)` → 探针 A/B/C（池内闭环基线、user 作源、user 作宿）→ warmup 闭环双向 → `NPUGraph` 捕获 WRITE → `replay` ×N → 默认流 READ 回读校验 → `unregister(dst)` + 预检查负例 → `unregister(src)` → `destroy` → `uninitialize`。
+`create`（DEVICE_RDMA | DEVICE_SCHEDULE）→ `extend_local_mem`（本地 DRAM 槽，保证实体 dramSegment 就绪）→ `extend_remote_mem`（FAR 落地槽）→ 对齐负例 ×2 → `register(src/dst)` → **注册后填充 pattern（缓存契约）** → 探针 A/B/C（池内闭环基线、user 作源、user 作宿）→ warmup 闭环双向 → `NPUGraph` 捕获 WRITE → `replay` ×N → 默认流 READ 回读校验 → `unregister(dst)` + 预检查负例 → `unregister(src)` → `destroy` → `uninitialize`。
 
 ## 参数
 
@@ -61,8 +63,8 @@ kill -TERM <daemon_pid>
 
 1. 客户端日志出现 `unaligned host-DRAM register rejected as expected (4K alignment rule)`。
 2. `both host buffers registered (user MR table v2: regAddress = HalHostRegister iova)`，且 near 日志有两条 `RegisterMem ok`。
-3. 探针三连：`[probe A] pool->pool round-trip ...: OK`、`[probe B] user host-DRAM as WRITE source ...: OK`、`[probe C] user host-DRAM as READ sink ...: OK`（失败时行尾附带首 8 字 dump）。
-4. `warmup round-trip OK (host buffer -> FAR slot -> host buffer2)`。
+3. 探针三连：`[probe A] pool->pool round-trip ...: OK`、`[probe B] user host-DRAM as WRITE source (far readback == pattern): OK`、`[probe C] user host-DRAM as READ sink (dst == pattern): OK`（失败时行尾附带首 8 字 dump）。
+4. `pattern filled after register (pre-register writes are dropped by the mapping)` 与 `warmup round-trip OK (host buffer -> FAR slot -> host buffer2)`。
 5. `graph captured` 后 `N replays done`，吞吐量级与例 10 相当（同为单流单拷贝，量级参考即可）。
 6. `verify OK: FAR rank <r> slot matches the host pattern`。
 7. `post-unregister copy rejected as expected (host precheck)`。
@@ -71,7 +73,8 @@ kill -TERM <daemon_pid>
 ## 判读
 
 - 注册层：near 日志 `RegisterMem ok: addr=0x... size=...`；宿主 `query memory key ok` 行应显示 `mrAddr` 等于注册地址、`regAddress` 为另一 IOVA 值（host-DRAM 特征，HBM 时两者相等）。
-- 探针层：A=池→池闭环 + NIC 写池页的 CPU 可见性（全已知好路径基线）；B=user MR 作 WRITE 源（far 内容经池槽回读校验）；C=user MR 作 READ 宿（dst 与 far 实际内容比对）。三者独立定位故障腿，失败行尾带首 8 字 dump（全零=WR 未生效，垃圾=写错落点）。
+- 探针层：A=池→池闭环 + NIC 写池页的 CPU 可见性（全已知好路径基线）；B=user MR 作 WRITE 源（far 内容经池槽回读比对 pattern）；C=user MR 作 READ 宿（dst 与 pattern 比对；B 通过后 far 已持有 pattern，比对非虚真）。三者独立定位故障腿，失败行尾带首 8 字 dump（全零=WR 未生效或数据被缓存契约清掉，垃圾=写错落点）。
+- 缓存契约层：`pattern filled after register` 行确认填充时序正确——注册前写入的数据会被 HalHostRegister 丢弃（invalidate 语义），NIC 读到匿名页零值。
 - 数据层：warmup 与 verify 两次独立校验，replay 后 verify 再次校验，覆盖"图重放期间数据未漂移"。
 - 负例层：对齐负例在注册入口被拒（错误日志含 `reject_unaligned_dram`）；注销后拷贝在主机预检查被拒。
 
@@ -81,8 +84,9 @@ kill -TERM <daemon_pid>
 | --- | --- |
 | 注册返回非 0，日志 `reject_unaligned_dram` | 地址或大小非 4K 对齐（torch pinned tensor、`ctypes.create_string_buffer` 均不保证，请用 `mmap`） |
 | `[probe A] FAIL` | 池数据面/环境问题（与 user MR 无关）：核对大页、QP 连接、双端版本 |
-| `[probe B] FAIL`（far 空/旧值） | user MR 作源失效：NIC 不接受 DRAM-lkey SGE 读 host iova——核对 `register MR result` 行 regAddress 与 lkey，上报留档 |
-| `[probe C] FAIL`（dst 空） | user MR 作宿失效：同上方向为 NIC 写 host iova；A/B 通过而 C 失败时优先怀疑落点翻译 |
+| `[probe B] FAIL`（far=[0,0,...] 全零） | pattern 写于 register() 之前——缓存契约：注册前写入被 HalHostRegister 丢弃；确认 `pattern filled after register` 行先于探针出现 |
+| `[probe B] FAIL`（far 为垃圾/旧值） | user MR 作源失效：核对 `register MR result` 行 regAddress 与 lkey，上报留档 |
+| `[probe C] FAIL`（dst 空/垃圾） | user MR 作宿失效：A/B 通过而 C 失败时优先怀疑落点翻译；上报留档 |
 | warmup/verify mismatch | 双端 `memfabric_hybrid` 版本不一致（v2 表 regAddress 未填充）；确认两节点同 commit |
 | `query memory key failed` | 实体无 dramSegment：确认建池 `max_dram_size > 0` 且 `extend_local_mem` 已成功 |
 | register 报表满 `user_mr_table_full` | 单进程用户 MR 上限 2040 条 |
