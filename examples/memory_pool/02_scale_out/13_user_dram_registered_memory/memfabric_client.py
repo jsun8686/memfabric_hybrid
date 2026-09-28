@@ -6,15 +6,13 @@
 Same topology and skeleton as 10_user_registered_memory, but the local copy endpoints are
 4K-aligned anonymous mmap buffers on the host instead of NPU HBM tensors. The registered
 host-DRAM MR carries a distinct device-dma base (HalHostRegister iova) in the v2 user-MR
-table, so the AICore RDMA kernel addresses the SGE as regAddress + (localAddr - addr) under
-the MR's lkey. Known issue under investigation: a user buffer OUTSIDE the pool GVA window as
-the device READ source yields zeros regardless of page state/size/VA height, while pool
-slices (in-window VMAs) work under the same HalHostRegister flag. Probe matrix
-A/B/B4/B5/B6/B6b/B7/B8/C2 varies the page state at register (unfaulted vs
-faulted+DRAM-resident), data residency at DMA (dirty vs DRAM), page size, VA height
-(<2^47 vs python's default ~0xfffd... placement) and window placement (B8: MAP_FIXED inside
-the pool GVA window -- OK pins the constraint on the in-window placement, FAIL sends the
-evidence chain to the vendor).
+table (regAddress at entry byte offset +24), so the AICore RDMA kernel addresses the SGE
+as regAddress + (localAddr - addr) under the MR's lkey. History: this matrix located the
+regAddress serialization offset bug (host wrote +32, kernel read +24 -> kernel fell back
+to the raw user VA -> NIC zeros on every host-DRAM endpoint; HBM was masked by its
+identity regAddress). Probe matrix A/B/B4/B5/B6/B6b/B7/B8/C2 keeps every factor
+(register-time page state, DMA-time residency, page size, VA height, window placement)
+as a regression split -- all probes must stay OK.
 Flow: register src/dst unfaulted -> fill+evict -> register b6 DRAM-resident ->
 probes -> closed round-trip -> capture/replay the WRITE -> unregister ->
 expect the host precheck to reject further copies.

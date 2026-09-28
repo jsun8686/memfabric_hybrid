@@ -45,7 +45,7 @@ NEAR 节点 A 调用 ralloc_create（纯对齐：建窗+join，零本地提交�
 | `smem_ralloc_get_mem_ptr_by_rank(handle, rank, memType)` | 指定介质窗的槽基址，与上行同族命名（get_mem_*_by_rank），配对得有效区间 [ptr, ptr+size)，memType 默认 HOST |
 | `smem_ralloc_get_group_ranks(handle, rankIds, maxCount)` | 组成员快照枚举（含自身，引擎位图 GetMemberRanks 单次快照）：事件流单槽不可回放（前提 14），注册回调前的存量成员（含迟到 B 视角全员）由此发现；满容量按 worldSize 分配，返回实际数（>maxCount=截断可检测），UINT32_MAX=失败；配 get_mem_size_by_rank 区分"在组无提交"成员 |
 | `smem_ralloc_wait(handle)` / `get_rank_id()` / `set_group_event_handler(handle, cb, ctx)` | bm 同形 |
-| `smem_ralloc_register_user_mem(handle, addr, size)` / `smem_ralloc_unregister_user_mem(handle, addr)` | 用户本地内存注册（bm 同形）：`hybm_register_local_memory`/`hybm_free_local_memory` 直包，entry 幂等记账（registedSlice_，destroy 自动注销）；纯本地操作，不涉 master/RPC；按地址区间分流 HBM/DRAM，DEVICE_RDMA 池的 DRAM buffer 须 4K 对齐；DEVICE_SCHEDULE 池两类介质均可作设备调度端点（用户 MR 表 v2：HBM 恒等 regAddress，host-DRAM 填 HalHostRegister IOVA，内核按 regAddress+(localAddr-addr) 推 SGE，见例 10/13）；host-DRAM 已知限制（调查中）：4K 匿名页用户缓冲作为设备侧读源时 NIC 读到全零，与写入时序无关（例 13 探针 B 两轮实证）；池内巨页槽同链路正常（同 flag/同 HalHostRegister）。根因由例 13 探针 B4（缓存驱逐）/B5（巨页后备）切割：非一致读 vs 页级翻译钉错页，定案后更新；vendor 提单随附探针日志 |
+| `smem_ralloc_register_user_mem(handle, addr, size)` / `smem_ralloc_unregister_user_mem(handle, addr)` | 用户本地内存注册（bm 同形）：`hybm_register_local_memory`/`hybm_free_local_memory` 直包，entry 幂等记账（registedSlice_，destroy 自动注销）；纯本地操作，不涉 master/RPC；按地址区间分流 HBM/DRAM，DEVICE_RDMA 池的 DRAM buffer 须 4K 对齐；DEVICE_SCHEDULE 池两类介质均可作设备调度端点（用户 MR 表 v2：HBM 恒等 regAddress，host-DRAM 填 HalHostRegister IOVA，内核按 regAddress+(localAddr-addr) 推 SGE，见例 10/13）；host-DRAM 数据面已集群验证（例 13 九探针+warmup+图重放全绿，例 10/11 回归无影响）。历史缺陷（已修复）：用户 MR 表 regAddress 字段序列化偏移错位（发布侧写 +32、内核读 +24），内核恒读 0 回退裸用户 VA 作 SGE 而 MR 注册在 IOVA 窗口 → NIC 全零；HBM 因恒等映射回退地址恰好正确而掩蔽（v2 表此前无 regAddress≠addr 正例）。另：device_copy 端点分类改为显式用户注册优先于 GVA 窗口归属（classifyEnd 顺序，窗内用户注册按 USER 分类，为窗口切分用户 DRAM 铺路） |
 
 约束：`maxDramSize`/`maxHbmSize`/各 extend size 均 2M 对齐（hybm 大页约束，SMEM_RALLOC_SIZE_ALIGNMENT）；
 mem_type 枚举镜像 bm 取值（HOST/DEVICE，见 §11）；双介质池两窗任选其一大于 0 即建对应窗，两窗全 0 拒绝；
@@ -528,6 +528,9 @@ InitTagManager 把 op 位展开为同 tag 规则，rank 对 op 集 = 池声明�
 **register_user_mem 链路**（R14）：hybm_register_local_memory → RegisterLocalMemory（bm 场景优先
 dramSegment_，entity:242-246）→ RegisterMemCommon 按地址区间分流（HBM 区间纯 VaManager 登记；host 地址
 含 DEVICE_RDMA 位才 halHostRegister）。MR 随后注册（isHbm ? HBM : DRAM flag）。纯本地，不影响组视图。
+用户 MR 表 v2 发布（PublishUserMrTable）：regAddress 为条目内**字节偏移 +24**（uint64_t 下标 3），
+与内核 SmemRallocUserMrEntry 严格对齐——曾误写下标 4（+32）致内核读 0、host-DRAM 端点全零
+（HBM 恒等掩蔽），例 13 探针矩阵定位，勿回退。
 
 ## 12. 故障容错（R12：HA 切主联动 + 死 FAR 剔除）
 
