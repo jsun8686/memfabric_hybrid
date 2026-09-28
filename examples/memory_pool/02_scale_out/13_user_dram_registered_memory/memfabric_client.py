@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 # coding=utf-8
 # Copyright: (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
-"""User-registered NPU HBM tensors as device-scheduled copy endpoints (09 + register()).
+"""User-registered host-DRAM buffers as device-scheduled copy endpoints (10 + host memory).
 
-Same topology and skeleton as 09_near_device_scheduled_rdma, but the local copy endpoints
-are user torch tensors registered via handle.register(addr, size) instead of pool slots.
-The registered HBM MR keeps regAddress == addr, so the AICore RDMA kernel addresses the
-SGE directly under the user MR's lkey (4K-aligned host-DRAM is also accepted since the
-v2 user-MR table, see example 13). Flow: register both tensors -> WRITE tensor ->
-FAR pool slot -> READ FAR slot -> tensor2 -> verify -> capture/replay the WRITE ->
-unregister -> expect the host precheck to reject further copies -> expect an unaligned
-host-DRAM address to be rejected at register time.
+Same topology and skeleton as 10_user_registered_memory, but the local copy endpoints are
+4K-aligned anonymous mmap buffers on the host instead of NPU HBM tensors. The registered
+host-DRAM MR carries a distinct device-dma base (HalHostRegister iova) in the v2 user-MR
+table, so the AICore RDMA kernel addresses the SGE as regAddress + (localAddr - addr) under
+the MR's lkey. Flow: reject an unaligned register -> register both buffers -> WRITE buffer ->
+FAR pool slot -> READ FAR slot -> buffer2 -> verify -> capture/replay the WRITE ->
+unregister -> expect the host precheck to reject further copies.
 """
 
 import argparse
 import ctypes
+import mmap
 import os
 import socket
 import sys
@@ -26,7 +26,7 @@ from memfabric_hybrid import ralloc
 DEFAULT_WORLD = 512          # declared world capacity, actual members join dynamically
 NIC_PORT_BASE = 10010        # data-plane nic port base (set_nic); NOT the control rpc port
 RPC_PORT_BASE = 11105        # control rpc port = base + rankId (smem_ralloc_def.h default)
-DEFAULT_SIZE = "1M"          # bytes per tensor / per one-sided copy
+DEFAULT_SIZE = "1M"          # bytes per buffer / per one-sided copy (must be 4K aligned)
 DEFAULT_REPLAYS = 8          # graph replays after capture
 DEFAULT_BLOCK_SIZE = "64M"   # DRAM slot bytes committed on each side (FAR landing zone)
 DEFAULT_MAX_POOL_SIZE = "4G" # pool DRAM window, must be GB aligned (VMM segment rule)
@@ -34,6 +34,7 @@ META_HBM_WINDOW = 1 << 30    # minimal GB-aligned hbm window: hosts the fixed de
 EXTEND_RETRY_SEC = 5
 EXTEND_TIMEOUT_SEC = 300
 GIB = 1 << 30
+DRAM_ALIGN = 4096
 
 DATA_OP = ralloc.RallocDataOpType.DEVICE_RDMA | ralloc.RallocDataOpType.DEVICE_SCHEDULE
 MEM_TYPE = ralloc.RallocMemType.HOST
@@ -74,6 +75,15 @@ def _parse_size(tok):
     return n * mult
 
 
+def _map_buffer(size):
+    """anonymous page-aligned mapping: the kernel guarantees 4K alignment for mmap bases"""
+    mm = mmap.mmap(-1, size)
+    view = ctypes.c_char.from_buffer(mm)  # keeps the mapping exported and writable
+    addr = ctypes.addressof(view)
+    assert addr % DRAM_ALIGN == 0, f"mmap base 0x{addr:x} not page aligned"
+    return mm, view, addr
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--store", required=True,
@@ -81,7 +91,8 @@ def main():
     parser.add_argument("--dev", type=int, required=True,
                         help="NPU id this client runs on")
     parser.add_argument("--size", default=DEFAULT_SIZE,
-                        help=f"bytes per tensor / per one-sided copy (K/M/G suffix, default {DEFAULT_SIZE})")
+                        help=f"bytes per buffer / per one-sided copy, 4K aligned (K/M/G suffix, "
+                             f"default {DEFAULT_SIZE})")
     parser.add_argument("--replays", type=int, default=DEFAULT_REPLAYS,
                         help=f"graph replays after capture (default {DEFAULT_REPLAYS})")
     parser.add_argument("--block-size", default=DEFAULT_BLOCK_SIZE,
@@ -109,6 +120,8 @@ def main():
     size = _parse_size(args.size)
     block = _parse_size(args.block_size)
     max_pool = _parse_size(args.max_pool_size)
+    if size % DRAM_ALIGN != 0:
+        raise RuntimeError(f"--size ({size}) must be {DRAM_ALIGN} aligned (host-DRAM MR rule)")
     if size % 4 != 0:
         raise RuntimeError(f"--size ({size}) must be 4-byte aligned (int32 verify pattern)")
     if size > block:
@@ -124,7 +137,10 @@ def main():
     mf.set_log_level(1)
     assert mf.initialize() == 0, "mf.initialize failed"
     ralloc_inited = False
+    src_mm = dst_mm = None
+    src_view = dst_view = None
     try:
+        import numpy as np
         import torch
         import torch_npu  # noqa: F401 — registers the npu backend and torch.npu.*
 
@@ -141,7 +157,7 @@ def main():
 
         # device-scheduled pool on a DRAM window: the FAR side commits the landing slot.
         # max_hbm_size is GB aligned and hosts ONLY the fixed device meta window
-        # (rank/QP/MR context); the user tensors below live in torch's own HBM allocator
+        # (rank/QP/MR context); the user buffers below live in anonymous host mappings
         handle = ralloc.create(id=0, max_dram_size=max_pool, max_hbm_size=META_HBM_WINDOW, data_op_type=DATA_OP)
         _log(f"[client rank {rank}] device-scheduled pool created (DEVICE_RDMA | DEVICE_SCHEDULE)")
 
@@ -165,30 +181,33 @@ def main():
         _log(f"[client rank {rank}] remote landing slot from FAR rank {far_rank} (gva=0x{far_gva:x}, npu {dev})")
 
         # ---- negative case 1: an unaligned host-DRAM address must be rejected at register time ----
-        # (aligned host-DRAM is a supported endpoint class since the v2 user-MR table: example 13)
-        host_buf = ctypes.create_string_buffer(2 * 4096)
-        ret = handle.register(ctypes.addressof(host_buf) + 128, 4096)
+        neg_mm, neg_view, neg_base = _map_buffer(2 * DRAM_ALIGN)
+        unaligned_addr = neg_base + DRAM_ALIGN + 128
+        ret = handle.register(unaligned_addr, DRAM_ALIGN)
         assert ret != 0, "register() accepted an unaligned host-DRAM address: must be 4K aligned"
         mf.get_and_clear_last_err_msg()
+        ret = handle.register(neg_base, DRAM_ALIGN // 2)  # aligned addr, unaligned size
+        assert ret != 0, "register() accepted an unaligned host-DRAM size: must be a 4K multiple"
+        mf.get_and_clear_last_err_msg()
+        del neg_view
+        neg_mm.close()
         _log("[client] unaligned host-DRAM register rejected as expected (4K alignment rule)")
 
-        # ---- user tensors as copy endpoints ----
-        src = torch.empty(size, dtype=torch.uint8, device="npu")
-        dst = torch.empty(size, dtype=torch.uint8, device="npu")
-        src_addr = src.data_ptr()
-        dst_addr = dst.data_ptr()
-        assert src_addr != 0 and dst_addr != 0 and src_addr != dst_addr, "tensor allocation failed"
+        # ---- host buffers as copy endpoints ----
+        src_mm, src_view, src_addr = _map_buffer(size)
+        dst_mm, dst_view, dst_addr = _map_buffer(size)
+        assert src_addr != dst_addr, "buffer mapping failed"
         words = size // 4
         seed = rank + 1
-        expect = (torch.arange(words, dtype=torch.int32, device="npu") * 7 + seed)
-        src.view(torch.int32).copy_(expect)
-        dst.zero_()
-        torch.npu.synchronize()
-        _log(f"[client] tensors: src=0x{src_addr:x} dst=0x{dst_addr:x} ({size} bytes each, HBM)")
+        expect = np.arange(words, dtype=np.int32) * 7 + seed
+        np.frombuffer(src_mm, dtype=np.int32)[:] = expect
+        np.frombuffer(dst_mm, dtype=np.int32)[:] = 0
+        _log(f"[client] host buffers: src=0x{src_addr:x} dst=0x{dst_addr:x} ({size} bytes each, "
+             f"page-aligned anonymous mmap)")
 
-        assert handle.register(src_addr, size) == 0, "register(src tensor) failed"
-        assert handle.register(dst_addr, size) == 0, "register(dst tensor) failed"
-        _log("[client] both tensors registered (user MR table published to the meta window)")
+        assert handle.register(src_addr, size) == 0, "register(src buffer) failed"
+        assert handle.register(dst_addr, size) == 0, "register(dst buffer) failed"
+        _log("[client] both host buffers registered (user MR table v2: regAddress = HalHostRegister iova)")
 
         # warmup round-trip on a side stream, OUTSIDE any graph: the first device_copy
         # dlopens and loads the kernel library, which is illegal inside capture
@@ -199,10 +218,11 @@ def main():
             assert handle.device_copy(src_addr, far_gva, size, stream_ptr) == 0, "warmup write failed"
             assert handle.device_copy(far_gva, dst_addr, size, stream_ptr) == 0, "warmup read failed"
         torch.npu.synchronize()
-        assert torch.equal(dst.view(torch.int32), expect), "warmup round-trip mismatch"
-        _log("[client] warmup round-trip OK (tensor -> FAR slot -> tensor2, kernel library loaded)")
+        got = np.frombuffer(bytes(dst_mm[:]), dtype=np.int32)
+        assert np.array_equal(got, expect), "warmup round-trip mismatch"
+        _log("[client] warmup round-trip OK (host buffer -> FAR slot -> host buffer2, kernel library loaded)")
 
-        # capture the WRITE into an NPU graph: user tensor -> FAR pool slot + quiet
+        # capture the WRITE into an NPU graph: host buffer -> FAR pool slot + quiet
         graph = torch.npu.NPUGraph()
         torch.npu.synchronize()
         with torch.npu.stream(side):
@@ -211,7 +231,7 @@ def main():
                                       torch.npu.current_stream().npu_stream) == 0, \
                 "captured copy submit failed"
             graph.capture_end()
-        _log(f"[client] graph captured: 1 x {size} byte device-scheduled WRITE from the user tensor, "
+        _log(f"[client] graph captured: 1 x {size} byte device-scheduled WRITE from the host buffer, "
              f"no host interaction inside")
 
         t0 = time.perf_counter()
@@ -223,33 +243,41 @@ def main():
         _log(f"[client] {args.replays} replays done: {moved / GIB:.2f} GiB in {t_replay * 1e3:.2f} ms, "
              f"{moved / t_replay / GIB:.2f} GB/s device-scheduled")
 
-        # verify on the default stream: READ the far slot back into the second tensor
-        dst.zero_()
+        # verify on the default stream: READ the far slot back into the second buffer
+        np.frombuffer(dst_mm, dtype=np.int32)[:] = 0
         assert handle.device_copy(far_gva, dst_addr, size, 0) == 0, "verify read failed"
         torch.npu.synchronize()
-        assert torch.equal(dst.view(torch.int32), expect), \
-            f"verify failed: tensor2 != pattern after {args.replays} replays"
-        _log(f"[client] verify OK: FAR rank {far_rank} slot matches the tensor pattern "
+        got = np.frombuffer(bytes(dst_mm[:]), dtype=np.int32)
+        assert np.array_equal(got, expect), \
+            f"verify failed: buffer2 != pattern after {args.replays} replays"
+        _log(f"[client] verify OK: FAR rank {far_rank} slot matches the host pattern "
              f"({words} words, seed {seed})")
 
         # ---- negative case 2: after unregister the copy must fail the host precheck ----
-        assert handle.unregister(dst_addr) == 0, "unregister(dst tensor) failed"
+        assert handle.unregister(dst_addr) == 0, "unregister(dst buffer) failed"
         ret = handle.device_copy(far_gva, dst_addr, size, 0)
-        assert ret != 0, "device_copy into an unregistered tensor must fail"
+        assert ret != 0, "device_copy into an unregistered buffer must fail"
         mf.get_and_clear_last_err_msg()
         _log("[client] post-unregister copy rejected as expected (host precheck)")
 
-        assert handle.unregister(src_addr) == 0, "unregister(src tensor) failed"
-        del src, dst, expect
+        assert handle.unregister(src_addr) == 0, "unregister(src buffer) failed"
+        del dst_view, src_view
+        dst_mm.close()
+        src_mm.close()
+        dst_mm = src_mm = None
         handle.destroy()
         mf.get_and_clear_last_err_msg()
         assert mf.get_last_err_msg() == "", mf.get_last_err_msg()
-        _log(f"[client rank {rank}] tensors unregistered, remote block released, exiting")
+        _log(f"[client rank {rank}] buffers unregistered, remote block released, exiting")
     finally:
+        if dst_mm is not None:
+            dst_mm.close()
+        if src_mm is not None:
+            src_mm.close()
         if ralloc_inited:
             ralloc.uninitialize(0)
         mf.uninitialize()
-    _log("[client] user-registered HBM endpoints under NPU graph finished cleanly")
+    _log("[client] user-registered host-DRAM endpoints under NPU graph finished cleanly")
     return 0
 
 

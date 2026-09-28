@@ -156,6 +156,9 @@ private:
         uint64_t devAddr; /* GVA base of the region, == the registration key and the kernel
                            * match key; equals the device-dma base for HBM regions (P1: the only
                            * supported user-memory class, regAddress == addr) */
+        uint64_t regAddress; /* device-dma base the MR was registered under: == devAddr for HBM,
+                              * the HalHostRegister iova for 4K-aligned host-DRAM regions; the
+                              * kernel derives the SGE as regAddress + (localAddr - devAddr) */
         uint64_t size;
         uint32_t lkey;
         uint32_t rkey;

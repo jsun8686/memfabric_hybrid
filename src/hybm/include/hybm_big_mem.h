@@ -201,10 +201,13 @@ int32_t hybm_set_extra_context(hybm_entity_t e, const void *context, uint32_t si
  * @param size             [out] registered memory region size
  * @param lkey             [out] local memory key of the region
  * @param rkey             [out] remote memory key of the region
+ * @param regAddress       [out] device-dma base the MR was registered under: equals mrAddr
+ *                               for HBM registrations, the HalHostRegister iova for host-DRAM
+ *                               ones; the device SGE address derives from it
  * @return 0 if successful, error code otherwise
  */
 int32_t hybm_query_memory_key(hybm_entity_t e, uint64_t addr, uint64_t *mrAddr, uint64_t *size, uint32_t *lkey,
-                              uint32_t *rkey);
+                              uint32_t *rkey, uint64_t *regAddress);
 
 /**
  * @brief Convert GVA (Global Virtual Address) to VA (Virtual Address) with specified memory type

@@ -5,12 +5,12 @@
 
 - 09 例的本地端点只能是池 slot（DRAM 窗口）；torch 侧数据进出池需要额外一次卡内
   staging copy；
-- 本用例把 torch 张量地址经 `handle.register(addr, size)` 注册进池（P1：**仅支持 NPU
-  管理的 HBM 内存**，host 在注册入口按 HBM 地址段直接拒绝其他地址），HBM MR 满足
-  `regAddress == addr` 恒等，随包内核（AICore）在用户 MR 表中取 lkey 与地址直接收发；
+- 本用例把 torch 张量地址经 `handle.register(addr, size)` 注册进池（HBM MR 满足
+  `regAddress == addr` 恒等；4K 对齐的 host-DRAM 端点自用户 MR 表 v2 起同样支持，
+  见例 13），随包内核（AICore）在用户 MR 表中取 lkey 与地址直接收发；
 - 端到端流：注册双张量 → WRITE 张量→FAR 池 slot → READ FAR slot→张量2 → 校验 →
   NPUGraph 捕获/重放（注册先于捕获）→ unregister 后 copy 被 host 预检拒绝 →
-  host-DRAM 地址 register 被拒。
+  未对齐 host-DRAM 地址 register 被拒。
 
 ## 拓扑与角色
 
@@ -49,7 +49,7 @@ kill -TERM <daemon_pid>
 
 ## 生命周期
 - 客户端 create → extend（本地 + 远端 DRAM slot，FAR 侧为落点）→ 注册双张量 →
-  warmup → 捕获 → 重放 → 读回校验 → 负例（注销后 copy、host 地址注册）→ destroy
+  warmup → 捕获 → 重放 → 读回校验 → 负例（注销后 copy、未对齐 host 地址注册）→ destroy
   全链路自清理，退出无需通知守护
 - 守护生命周期与 09 完全一致
 - 客户端每次运行以 `"w"` 截断重写 `log/near_dev{N}.log`
@@ -81,7 +81,7 @@ kill -TERM <daemon_pid>
 ## 验收标准
 - 客户端关键行依次出现：
   1. `device-scheduled pool created (DEVICE_RDMA | DEVICE_SCHEDULE)`
-  2. `host-DRAM register rejected as expected (P1: NPU HBM only)`
+   2. `unaligned host-DRAM register rejected as expected (4K alignment rule)`
   3. `both tensors registered (user MR table published to the meta window)`
   4. `warmup round-trip OK (tensor -> FAR slot -> tensor2, kernel library loaded)`
   5. `graph captured: 1 x <size> byte device-scheduled WRITE from the user tensor, no host interaction inside`
@@ -100,7 +100,7 @@ kill -TERM <daemon_pid>
 ## 排障（精简）
 | 症状 | 处置 |
 |---|---|
-| register 报 `reject_non_hbm` | 传入地址不在平台 HBM 段：确认张量由 `device="npu"` 分配（P1 仅支持 HBM；host DRAM 属 P2） |
+| register 报 `reject_unaligned_dram` | host-DRAM 地址/大小非 4K 对齐（对齐的 host-DRAM 见例 13）；HBM 端点确认张量由 `device="npu"` 分配 |
 | device_copy 报 `copy endpoint falls neither into the pool device window nor a registered user region` | 张量未 register 或已 unregister（本用例负例 2 即验证该路径） |
 | 捕获阶段报错/崩溃 | 注册是否在捕获外完成（本用例已内置）；warmup 是否在捕获外执行过 |
 | 用户 MR 表 version 不符 | 一端为旧包：两端同步重装（表 v2 与旧内核互不识别） |

@@ -130,9 +130,10 @@ struct SmemRallocMemInfo { /* in sync with RdmaMemRegionInfo */
                             * this differs from addr (HalHostRegister iova), for hbm it equals addr */
 };
 
-/* ---- user MR table (P1), in sync with ralloc publish side (smem_ralloc_entry.cpp PublishUserMrTable) ----
+/* ---- user MR table, in sync with ralloc publish side (smem_ralloc_entry.cpp PublishUserMrTable) ----
  * published by the host into this entity's 64K user context region via hybm_set_extra_context;
- * lets device-scheduled RDMA use locally registered user HBM as the local endpoint */
+ * lets device-scheduled RDMA use locally registered user memory (NPU HBM, or 4K-aligned
+ * host-DRAM) as the local endpoint */
 constexpr uint32_t SMEM_RALLOC_USER_MR_TABLE_MAGIC = 0x31524D53; /* "SMR1" */
 constexpr uint32_t SMEM_RALLOC_USER_MR_TABLE_VERSION = 2;        /* v2: regAddress field filled */
 constexpr uint64_t SMEM_RALLOC_USER_MR_TABLE_HEADER_SIZE = 64;
@@ -143,12 +144,12 @@ constexpr uint64_t SMEM_RALLOC_USER_MR_TABLE_CAPACITY =
     SMEM_RALLOC_USER_MR_TABLE_ENTRY_SIZE; /* 2046 slots, host publishes at most 2040 */
 
 struct SmemRallocUserMrEntry { /* 32B, in sync with the ralloc publish side */
-    uint64_t addr;        /* GVA base returned by hybm_query_memory_key: the kernel match key */
+    uint64_t addr;        /* registration key (the user-registered address): the kernel match key */
     uint64_t size;
     uint32_t lkey;
     uint32_t rkey;
     uint64_t regAddress;  /* device-dma base of the MR: SGE address = regAddress + (localAddr -
-                           * addr). Equals addr for the only supported class (HBM, P1) */
+                           * addr). Equals addr for HBM, the HalHostRegister iova for host-DRAM */
 };
 
 struct SmemRallocUserMrTable { /* 64B header + entries, serialized into the 64K user context region */

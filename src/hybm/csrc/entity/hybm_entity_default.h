@@ -74,7 +74,7 @@ public:
     int32_t SetExtraContext(const void *context, uint32_t size) noexcept override;
 
     int32_t QueryMemoryKey(uint64_t addr, uint64_t &mrAddr, uint64_t &size, uint32_t &lkey,
-                           uint32_t &rkey) noexcept override;
+                           uint32_t &rkey, uint64_t &regAddress) noexcept override;
 
     int32_t Mmap() noexcept override;
     void Unmap() noexcept override;

@@ -702,17 +702,21 @@ Result SmemRallocEntry::Wait()
 Result SmemRallocEntry::RegisterMem(uint64_t addr, uint64_t size)
 {
     SM_ASSERT_RETURN(inited_, SM_NOT_INITIALIZED);
-    /* P1 supports NPU-managed HBM only: the device-side SGE translation relies on
-     * regAddress == addr, which holds for HBM registrations but NOT for host-DRAM ones (IOVA).
-     * Reject non-HBM addresses up front instead of letting device copies land on a wrong
-     * address silently. */
+    /* endpoint classification: NPU HBM keeps regAddress == addr (identity SGE), while
+     * host-DRAM goes through HalHostRegister and carries a distinct iova in regAddress --
+     * the kernel user-MR table (v2) translates both, so host-DRAM is accepted too, but
+     * it must be 4K aligned (page granularity of the iova mapping). */
     uint64_t hbmStart = 0;
     uint64_t hbmEnd = 0;
-    if (hybm_get_hbm_address_range(&hbmStart, &hbmEnd) != 0 || addr < hbmStart || addr >= hbmEnd) {
-        SM_LOG_ERROR("RegisterMem reject_non_hbm: addr=0x" << std::hex << addr << std::dec
-            << " hbm_range=[0x" << std::hex << hbmStart << ", 0x" << hbmEnd << ")"
-            << " -- device-scheduled user endpoints support NPU HBM memory only");
-        return SM_NOT_SUPPORTED;
+    const bool hbmKnown = (hybm_get_hbm_address_range(&hbmStart, &hbmEnd) == 0);
+    const bool isHbm = hbmKnown && addr >= hbmStart && addr < hbmEnd;
+    if (!isHbm) {
+        constexpr uint64_t dramAlign = 4096;
+        if (addr % dramAlign != 0 || size % dramAlign != 0) {
+            SM_LOG_ERROR("RegisterMem reject_unaligned_dram: addr=0x" << std::hex << addr << std::dec
+                << " size=" << size << " -- host-DRAM endpoints must be 4K aligned");
+            return SM_INVALID_PARAM;
+        }
     }
     std::lock_guard<std::mutex> lock(mutex_);
     auto iter = registedSlice_.find(addr);
@@ -735,15 +739,18 @@ Result SmemRallocEntry::RegisterMem(uint64_t addr, uint64_t size)
         }
         uint64_t devAddr = 0;
         uint64_t mrSize = 0;
+        uint64_t regAddr = 0;
         uint32_t lkey = 0;
         uint32_t rkey = 0;
-        auto keyRet = hybm_query_memory_key(entity_, addr, &devAddr, &mrSize, &lkey, &rkey);
+        auto keyRet = hybm_query_memory_key(entity_, addr, &devAddr, &mrSize, &lkey, &rkey, &regAddr);
         if (keyRet != 0) {
             SM_LOG_WARN("RegisterMem query_key_fail: addr=0x" << std::hex << addr << std::dec
                                                                << " ret=" << keyRet
                                                                << " (device-scheduled use disabled)");
         } else {
-            userMrs_.emplace(addr, UserMrInfo{devAddr, size, lkey, rkey});
+            /* devAddr field carries the registration key (== the address the kernel will
+             * match localAddr against); regAddr carries the device-dma base (iova for DRAM) */
+            userMrs_.emplace(addr, UserMrInfo{addr, regAddr, size, lkey, rkey});
             auto pubRet = PublishUserMrTable();
             if (pubRet != SM_OK) {
                 SM_LOG_WARN("RegisterMem publish_user_mr_table_fail: ret=" << pubRet
@@ -817,9 +824,10 @@ Result SmemRallocEntry::PublishUserMrTable()
         entry[1] = iter->second.size;
         *(reinterpret_cast<uint32_t *>(buf.data() + offset + 16)) = iter->second.lkey;
         *(reinterpret_cast<uint32_t *>(buf.data() + offset + 20)) = iter->second.rkey;
-        /* device-dma base of the MR: equals devAddr for the only supported class (HBM, P1) --
-         * the kernel derives the SGE address as regAddress + (localAddr - devAddr) */
-        entry[4] = iter->second.devAddr;
+        /* device-dma base of the MR: equals devAddr for HBM registrations, the
+         * HalHostRegister iova for host-DRAM ones -- the kernel derives the SGE address
+         * as regAddress + (localAddr - devAddr) */
+        entry[4] = iter->second.regAddress;
         offset += tableEntrySize;
     }
 
