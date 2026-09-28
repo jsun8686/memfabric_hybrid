@@ -12,8 +12,9 @@ copy job (one-sided WRITE/READ + quiet) NPU-graph capturable: capture once, repl
 times, zero host interaction per replay.
 
 The copy job is pool slot -> pool slot (local DRAM slot as WRITE source). The pattern is
-seeded into the local slot from a registered NPU tensor and verified by reading the FAR
-slot back into a second registered tensor: pool-slot GVA addresses are used as
+seeded into the FAR slot from a registered NPU tensor and mirrored into the local slot
+(a registered tensor may not feed the LOCAL pool slot directly); verification reads the
+FAR slot back into a second registered tensor: pool-slot GVA addresses are used as
 device-copy endpoints ONLY -- never dereferenced on the CPU (with --enable-56bits-gva
 the GVA window lives above 2^55 and is not CPU mapped).
 """
@@ -190,17 +191,21 @@ def main():
         _log(f"[client] pattern tensors registered: {size} bytes each (seed {seed})")
 
         # warmup on a side stream, OUTSIDE any graph: the first device_copy dlopens and
-        # loads the kernel library, which is illegal inside capture. Seed the local slot
-        # from the tensor, push it to the FAR slot, read it back and compare on device.
+        # loads the kernel library, which is illegal inside capture. Seed the FAR slot
+        # from the tensor, mirror it into the local slot, push local back to FAR, read
+        # it out and compare on device. The precheck demands one local endpoint and one
+        # peer pool slot per copy: a registered tensor (USER) may not feed the LOCAL
+        # pool slot directly, so the local slot is seeded via the FAR slot.
         side = torch.npu.Stream()
         side.wait_stream(torch.npu.current_stream())
         with torch.npu.stream(side):
             stream_ptr = torch.npu.current_stream().npu_stream
-            assert handle.device_copy(src_addr, local_gva, size, stream_ptr) == 0, "seed write failed"
+            assert handle.device_copy(src_addr, far_gva, size, stream_ptr) == 0, "seed write failed"
+            assert handle.device_copy(far_gva, local_gva, size, stream_ptr) == 0, "seed mirror failed"
             assert handle.device_copy(local_gva, far_gva, size, stream_ptr) == 0, "warmup write failed"
             assert handle.device_copy(far_gva, dst_addr, size, stream_ptr) == 0, "warmup read failed"
         torch.npu.synchronize()
-        assert torch.equal(dst, src), "warmup round-trip mismatch (tensor -> local -> FAR -> tensor2)"
+        assert torch.equal(dst, src), "warmup round-trip mismatch (tensor -> FAR -> local -> FAR -> tensor2)"
         _log("[client] warmup round-trip OK (kernel library loaded, both pool slots reachable)")
 
         # capture the whole copy job into an NPU graph: one-sided WRITE + quiet
