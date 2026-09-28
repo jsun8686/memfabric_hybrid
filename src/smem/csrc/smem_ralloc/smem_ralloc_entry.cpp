@@ -116,6 +116,10 @@ int32_t SmemRallocEntry::Initialize(const hybm_options &options)
 
 void SmemRallocEntry::UnInitialize()
 {
+    {
+        std::lock_guard<std::mutex> guard(roleMutex_);
+        tearingDown_ = true; /* new joins fail fast instead of hanging on the teardown */
+    }
     if (!inited_) {
         return;
     }
@@ -179,9 +183,31 @@ Result SmemRallocEntry::GroupOpBarrier(int32_t input)
     return SM_OK;
 }
 
+namespace {
+/* RAII: every JoinHandle exit path (early return, goto rollback, success) releases the
+ * join-active claim; the gotos below jump forward past this declaration inside one scope */
+class JoinActiveRaii {
+public:
+    explicit JoinActiveRaii(SmemRallocEntry *entry) : entry_(entry) {}
+    ~JoinActiveRaii()
+    {
+        entry_->EndJoinActive();
+    }
+
+private:
+    SmemRallocEntry *entry_;
+};
+} // namespace
+
 Result SmemRallocEntry::JoinHandle(uint32_t rk)
 {
     SM_ASSERT_RETURN(inited_, SM_NOT_INITIALIZED);
+    if (!BeginJoinActive()) {
+        SM_LOG_ERROR("join rejected: entry is tearing down, receive_rk: " << rk
+                       << ", pool: " << options_.id << " (retry after the stale entry is reaped)");
+        return SM_NOT_SUPPORTED;
+    }
+    JoinActiveRaii joinGuard(this);
     SM_LOG_INFO("do join func, local_rk: " << options_.rank << " receive_rk: " << rk
                                            << ", rank size is: " << globalGroup_->GetRankSize());
 
@@ -439,6 +465,60 @@ bool SmemRallocEntry::IsPoolEmptyExpired(uint64_t graceSec) const
         return false;
     }
     return (mf::MonotonicTime::TimeUs() - marked) >= graceSec * 1000000ULL;
+}
+
+bool SmemRallocEntry::BeginJoinActive()
+{
+    std::lock_guard<std::mutex> guard(roleMutex_);
+    if (tearingDown_) {
+        return false;
+    }
+    joinActive_ = true;
+    /* cancel the pending reap at join start (not after the join completes): the reaper
+     * re-checks under roleMutex_ and skips, instead of tearing the entry under this join */
+    poolEmptySinceUs_.store(0);
+    return true;
+}
+
+void SmemRallocEntry::EndJoinActive()
+{
+    {
+        std::lock_guard<std::mutex> guard(roleMutex_);
+        joinActive_ = false;
+    }
+    /* a failed/rolled-back join may have left the pool empty again: re-mark so the
+     * reaper still converges (the vanished joiner may never produce a leave event) */
+    EvaluatePoolEmpty();
+}
+
+bool SmemRallocEntry::MarkTearingDownIfIdle()
+{
+    std::lock_guard<std::mutex> guard(roleMutex_);
+    if (joinActive_ || !inited_) {
+        return false;
+    }
+    tearingDown_ = true;
+    return true;
+}
+
+bool SmemRallocEntry::PoolEmpty() const
+{
+    if (globalGroup_ == nullptr) {
+        return true;
+    }
+    std::vector<uint32_t> ranks;
+    globalGroup_->GetMemberRanks(ranks);
+    std::lock_guard<std::mutex> guard(roleMutex_);
+    for (auto r : ranks) {
+        if (r == options_.rank) {
+            continue;
+        }
+        auto it = memberRoles_.find(r);
+        if (it == memberRoles_.end() || it->second != SMEM_RALLOC_ROLE_FAR) {
+            return false; /* a live NEAR member (or unknown role) is still around */
+        }
+    }
+    return true;
 }
 
 Result SmemRallocEntry::Join(uint32_t flags)

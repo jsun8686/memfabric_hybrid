@@ -652,6 +652,20 @@ void SmemRallocEntryManager::ReapEmptyPools()
     }
     /* teardown outside the entry lock: UnInitialize does a group leave which may take long */
     for (auto &entry : victims) {
+        /* second arbitration under entryMutex_ + the entry's roleMutex_ (lock order
+         * entryMutex_ -> roleMutex_; joins only ever take roleMutex_): a join that
+         * arrived since collection has cleared the pool-empty mark (skip) or is in
+         * flight (skip this cycle); otherwise claim the entry so new joins fail fast
+         * instead of hanging on a torn-down group */
+        bool take = false;
+        {
+            std::lock_guard<std::mutex> guard(entryMutex_);
+            take = entry->IsPoolEmptyExpired(poolGraceSec_) && entry->MarkTearingDownIfIdle();
+        }
+        if (!take) {
+            SM_LOG_INFO("reap skipped: join active or pool-empty cancelled, id: " << entry->Id());
+            continue;
+        }
         SM_LOG_INFO("reap pool-empty entry, id: " << entry->Id());
         entry->UnInitialize();
         (void)RemoveEntryByPtr(reinterpret_cast<uintptr_t>(entry.Get()));

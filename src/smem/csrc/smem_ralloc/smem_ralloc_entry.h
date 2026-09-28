@@ -102,6 +102,17 @@ public:
      * than graceSec, ready for self teardown by the manager reaper */
     bool IsPoolEmptyExpired(uint64_t graceSec) const;
 
+    /* join-vs-reap arbitration: an active join cancels the pending pool-empty reap for
+     * this cycle; an entry taken over by the reaper (or UnInitialize) rejects new joins
+     * fast instead of hanging on a torn-down group. BeginJoinActive also clears the
+     * pool-empty mark at join START (not after), closing the reap-vs-join window */
+    bool BeginJoinActive();
+    void EndJoinActive();
+    /* atomically (with joins) claim the entry for teardown: false when a join is active */
+    bool MarkTearingDownIfIdle();
+    /* true when no live NEAR member is left in the pool (same rule as EvaluatePoolEmpty) */
+    bool PoolEmpty() const;
+
     /* lifecycle of the executor-driven first JOIN_ALLOC (create branch): mark RUNNING
      * before Initialize, mark done after Join succeeded / on every failure path; extend
      * calls park on the cv instead of failing fast while the first slice builds */
@@ -172,6 +183,8 @@ private:
     /* pool lifecycle bookkeeping: role of every member rank, maintained from group events */
     mutable std::mutex roleMutex_;
     std::map<uint32_t, smem_ralloc_role_t> memberRoles_;
+    bool joinActive_ = false;   /* guarded by roleMutex_: a JoinHandle is in flight */
+    bool tearingDown_ = false;  /* guarded by roleMutex_: reaper/UnInitialize owns the entry */
     std::atomic<uint64_t> poolEmptySinceUs_{0};
     std::atomic<uint64_t> committedBytes_{0};
     std::atomic<uint64_t> deviceCommittedBytes_{0};

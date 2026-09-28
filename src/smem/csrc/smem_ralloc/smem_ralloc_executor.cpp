@@ -65,6 +65,39 @@ Result SmemRallocExecutor::OnJoinAlloc(SmemRallocRpcMsg &msg)
     /* extend branch: pool already exists on this node, extend one more block on its local slot */
     SmemRallocEntryPtr existEntry;
     if (manager.GetEntryById(msg.poolId, existEntry) == SM_OK && existEntry != nullptr) {
+        /* pool-definition consistency: a leftover entry from a previous client (still inside
+         * the reap grace window) must not serve a pool with a different layout -- 56-bit GVA
+         * mismatch would pair a 64P-window joiner with a legacy-window entity */
+        const hybm_options &cur = existEntry->GetCoreOptions();
+        auto wantOp = SmemRallocHelper::TransHybmDataOpType(static_cast<smem_ralloc_data_op_type>(msg.dataOpType));
+        auto wantBt = ((msg.dataOpType & SMEMRA_DATA_OP_DEVICE_SCHEDULE) != 0U) ? HYBM_TYPE_AI_CORE_INITIATE
+                                                                                : HYBM_TYPE_HOST_INITIATE;
+        bool mismatch = (cur.maxDRAMSize != msg.maxDramSize) || (cur.maxHBMSize != msg.maxHbmSize) ||
+                        (cur.bmDataOpType != wantOp) || (cur.bmType != wantBt) ||
+                        (cur.enable56BitsGva != (msg.enable56BitsGva != 0U));
+        if (mismatch) {
+            if (existEntry->PoolEmpty()) {
+                SM_LOG_WARN("join alloc pool-definition mismatch on empty pool: " << msg.poolId
+                              << ", recycling the leftover entry (cur dram:" << cur.maxDRAMSize
+                              << " hbm:" << cur.maxHBMSize << " op:" << cur.bmDataOpType
+                              << " 56bits:" << cur.enable56BitsGva << ", want dram:" << msg.maxDramSize
+                              << " hbm:" << msg.maxHbmSize << " op:" << wantOp
+                              << " 56bits:" << (msg.enable56BitsGva != 0U) << ")");
+                existEntry->UnInitialize();
+                (void)manager.RemoveEntryByPtr(reinterpret_cast<uintptr_t>(existEntry.Get()));
+                existEntry = nullptr; /* fall through to the create branch with the requested params */
+            } else {
+                SM_LOG_ERROR("join alloc rejected: pool-definition mismatch on a pool with live members, pool: "
+                             << msg.poolId << " (cur dram:" << cur.maxDRAMSize << " hbm:" << cur.maxHBMSize
+                             << " op:" << cur.bmDataOpType << " 56bits:" << cur.enable56BitsGva
+                             << ", want dram:" << msg.maxDramSize << " hbm:" << msg.maxHbmSize
+                             << " op:" << wantOp << " 56bits:" << (msg.enable56BitsGva != 0U) << ")");
+                manager.NotifyPlacementFailure(msg);
+                return SM_INVALID_PARAM;
+            }
+        }
+    }
+    if (manager.GetEntryById(msg.poolId, existEntry) == SM_OK && existEntry != nullptr) {
         smem_ralloc_mem_info_t info{};
         auto extRet = existEntry->ExtendLocalMem(static_cast<smem_ralloc_mem_type_t>(msg.memType), msg.size, &info);
         if (extRet != SM_OK) {
