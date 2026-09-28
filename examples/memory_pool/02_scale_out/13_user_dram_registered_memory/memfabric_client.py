@@ -7,11 +7,13 @@ Same topology and skeleton as 10_user_registered_memory, but the local copy endp
 4K-aligned anonymous mmap buffers on the host instead of NPU HBM tensors. The registered
 host-DRAM MR carries a distinct device-dma base (HalHostRegister iova) in the v2 user-MR
 table, so the AICore RDMA kernel addresses the SGE as regAddress + (localAddr - addr) under
-the MR's lkey. Known issue under investigation: a 4K-anon user buffer as the device READ
-source yields zeros regardless of write timing; probes B4 (512MB cache-eviction sweep) and
-B5 (hugepage-backed buffer) discriminate non-coherent user-iova reads vs wrong-page pinning.
-Flow: reject an unaligned register -> register buffers -> fill post-register -> probes
-A/B/B4/B5/C2 -> closed round-trip -> capture/replay the WRITE -> unregister ->
+the MR's lkey. Known issue under investigation: a user 4K-anon buffer as the device READ
+source yields zeros regardless of write timing. Probe matrix A/B/B4/B5/B6/B6b/C2 varies the
+page state at register (unfaulted vs faulted+DRAM-resident), data residency at DMA (dirty
+vs DRAM) and page size; B6+B6b OK would pin the library fix to "touch pages before
+HalHostRegister" (the pool path already does this via LvaShmReservePhysicalMemory).
+Flow: register src/dst unfaulted -> fill+evict -> register b6 DRAM-resident ->
+probes -> closed round-trip -> capture/replay the WRITE -> unregister ->
 expect the host precheck to reject further copies.
 """
 
@@ -172,8 +174,8 @@ def main():
         raise RuntimeError(f"--size ({size}) must be 4-byte aligned (int32 verify pattern)")
     if size > block:
         raise RuntimeError(f"--size ({size}) exceeds --block-size ({block})")
-    if 6 * size > block:
-        raise RuntimeError(f"--block-size ({block}) must hold 6 probe windows of --size ({size})")
+    if 8 * size > block:
+        raise RuntimeError(f"--block-size ({block}) must hold 8 probe windows of --size ({size})")
     if block > max_pool:
         raise RuntimeError(f"--block-size ({block}) exceeds --max-pool-size ({max_pool})")
     if max_pool % GIB != 0:
@@ -185,7 +187,7 @@ def main():
     mf.set_log_level(1)
     assert mf.initialize() == 0, "mf.initialize failed"
     ralloc_inited = False
-    src_mm = dst_mm = None
+    src_mm = dst_mm = b6_mm = None
     hp_addr = 0
     try:
         import numpy as np
@@ -243,36 +245,50 @@ def main():
         # ---- host buffers as copy endpoints ----
         src_mm, src_addr = _map_buffer(size)
         dst_mm, dst_addr = _map_buffer(size)
-        assert src_addr != dst_addr, "buffer mapping failed"
+        b6_mm, b6_addr = _map_buffer(size)
+        assert src_addr != dst_addr and src_addr != b6_addr, "buffer mapping failed"
         words = size // 4
         seed = rank + 1
         expect = np.arange(words, dtype=np.int32) * 7 + seed
-        _log(f"[client] host buffers: src=0x{src_addr:x} dst=0x{dst_addr:x} ({size} bytes each, "
-             f"page-aligned anonymous mmap)")
+        expect6 = np.arange(words, dtype=np.int32) * 11 + 0x61
+        expect6b = np.arange(words, dtype=np.int32) * 13 + 0x62
+        _log(f"[client] host buffers: src=0x{src_addr:x} dst=0x{dst_addr:x} b6=0x{b6_addr:x} "
+             f"({size} bytes each, page-aligned anonymous mmap)")
 
+        # B premise: src/dst registered UNFAULTED (mapped but never touched)
         assert handle.register(src_addr, size) == 0, "register(src buffer) failed"
         assert handle.register(dst_addr, size) == 0, "register(dst buffer) failed"
-        _log("[client] both host buffers registered (user MR table v2: regAddress = HalHostRegister iova)")
+        _log("[client] src/dst registered unfaulted (user MR table v2: regAddress = HalHostRegister iova)")
 
-        # fill the buffers AFTER registration as the fixed probe protocol -- note the write
-        # ordering around register() has been proven irrelevant (the zero-read from a 4K-anon
-        # user source happens either way); root cause is discriminated by probes B4/B5
+        # fill everything, evict to DRAM, THEN register b6 (B6 premise: faulted +
+        # DRAM-resident data at registration); finally re-dirty src (B premise: its
+        # pattern is cache-dirty at DMA time) and leave dst clean-zeroed for the C2 sink
         np.frombuffer(src_mm, dtype=np.int32)[:] = expect
         np.frombuffer(dst_mm, dtype=np.int32)[:] = 0
-        _log("[client] pattern filled after register (fixed protocol; write timing proven irrelevant)")
+        np.frombuffer(b6_mm, dtype=np.int32)[:] = expect6
+        _evict_caches(np)  # sweep 0: all three patterns DRAM-resident, caches clean
+        assert handle.register(b6_addr, size) == 0, "register(b6 buffer) failed"
+        np.frombuffer(src_mm, dtype=np.int32)[:] = expect  # re-dirty src for probe B
+        _log("[client] b6 registered DRAM-resident; src re-dirtied (per-probe premises set)")
 
-        # ---- probes, OUTSIDE any graph (the first device_copy also dlopens and loads the
-        # kernel library, which is illegal inside capture). Two device phases with a CPU
-        # cache-eviction sweep in between; the single side stream keeps everything ordered:
-        # A:  pool->pool round-trip incl. CPU visibility of NIC-written pool pages (baseline,
-        #     known-good legs in both directions);
-        # B:  user 4K-anon buffer as WRITE source, pattern filled post-register;
-        # B4: SAME source re-sent after a 512MB eviction sweep (pattern forced to DRAM):
-        #     OK => user-iova reads are non-coherent (DRAM-only), FAIL => wrong pages pinned;
-        # B5: hugepage-backed user buffer (MAP_HUGETLB, THP fallback) as WRITE source:
-        #     OK => page-size/VMA sensitivity, practical workaround = hugepage buffers;
-        # C2: user buffer as READ sink, far seeded via a pool->pool write (self-sufficient).
-        # Every probe runs unconditionally so each leg logs its own verdict. ----
+        # ---- probe matrix (the first device_copy also dlopens and loads the kernel
+        # library, which is illegal inside capture). Three device phases on one side
+        # stream with CPU sweeps in between; per-probe factors under test = page state
+        # at register (unfaulted vs faulted+DRAM-resident), data residency at DMA
+        # (cache-dirty vs DRAM), page size:
+        # A:   pool slot source, 1M cache-dirty write -> DMA (baseline: pool iova reads
+        #      are coherent with CPU-dirty lines);
+        # B:   user 4K-anon, registered unfaulted, cache-dirty post-register fill;
+        # B4:  same buffer after a 512MB eviction sweep (pattern forced to DRAM): FAIL =>
+        #      registration diverged from the pages (zero-page pin + COW), OK => non-coherent;
+        # B5:  hugepage-backed user buffer (MAP_HUGETLB / THP fallback), post-register fill;
+        # B6:  user 4K-anon, faulted + pattern + evicted BEFORE register (DRAM-resident,
+        #      clean cache at registration): OK => translation aliases prepared pages;
+        # B6b: SAME buffer, cache-dirty post-register REWRITE (distinct pattern): OK =>
+        #      reads are coherent once pages are connected => the hazards are registration-
+        #      time invalidation + unfaulted registration => library fix = touch pages
+        #      before HalHostRegister (LvaShmReservePhysicalMemory equivalent);
+        # C2:  user sink, far seeded via a pool->pool write, dst pre-evicted clean.
         side = torch.npu.Stream()
         side.wait_stream(torch.npu.current_stream())
         probeA = np.arange(words, dtype=np.int32) * 3 + 0x41410
@@ -291,7 +307,7 @@ def main():
             assert handle.device_copy(far_gva, local_gva + 2 * size, size, stream_ptr) == 0, \
                 "probe B readback failed"
         torch.npu.synchronize()
-        _evict_caches(np)  # force the source pattern out of L1/L2/L3 into DRAM
+        _evict_caches(np)  # sweep 1: force the src pattern out to DRAM
         with torch.npu.stream(side):
             stream_ptr = torch.npu.current_stream().npu_stream
             assert handle.device_copy(src_addr, far_gva, size, stream_ptr) == 0, "probe B4 write failed"
@@ -300,6 +316,16 @@ def main():
             assert handle.device_copy(hp_addr, far_gva, size, stream_ptr) == 0, "probe B5 write failed"
             assert handle.device_copy(far_gva, local_gva + 5 * size, size, stream_ptr) == 0, \
                 "probe B5 readback failed"
+            assert handle.device_copy(b6_addr, far_gva, size, stream_ptr) == 0, "probe B6 write failed"
+            assert handle.device_copy(far_gva, local_gva + 6 * size, size, stream_ptr) == 0, \
+                "probe B6 readback failed"
+        torch.npu.synchronize()
+        ctypes.memmove(b6_addr, expect6b.tobytes(), size)  # dirty post-register rewrite
+        with torch.npu.stream(side):
+            stream_ptr = torch.npu.current_stream().npu_stream
+            assert handle.device_copy(b6_addr, far_gva, size, stream_ptr) == 0, "probe B6b write failed"
+            assert handle.device_copy(far_gva, local_gva + 7 * size, size, stream_ptr) == 0, \
+                "probe B6b readback failed"
             assert handle.device_copy(local_gva + 4 * size, far_gva, size, stream_ptr) == 0, \
                 "probe C2 seed write failed"
             assert handle.device_copy(far_gva, dst_addr, size, stream_ptr) == 0, "probe C2 read failed"
@@ -309,27 +335,37 @@ def main():
         bFar = np.frombuffer(_bytes_at(local_gva + 2 * size, size), dtype=np.int32)
         b4Far = np.frombuffer(_bytes_at(local_gva + 3 * size, size), dtype=np.int32)
         b5Far = np.frombuffer(_bytes_at(local_gva + 5 * size, size), dtype=np.int32)
+        b6Far = np.frombuffer(_bytes_at(local_gva + 6 * size, size), dtype=np.int32)
+        b6bFar = np.frombuffer(_bytes_at(local_gva + 7 * size, size), dtype=np.int32)
         c2Dst = np.frombuffer(bytes(dst_mm[:]), dtype=np.int32)
         okA = np.array_equal(aGot, probeA)
         okB = np.array_equal(bFar, expect)
         okB4 = np.array_equal(b4Far, expect)
         okB5 = np.array_equal(b5Far, expect)
+        okB6 = np.array_equal(b6Far, expect6)
+        okB6b = np.array_equal(b6bFar, expect6b)
         okC2 = np.array_equal(c2Dst, expect)
-        _log("[probe A] pool->pool round-trip (baseline + CPU visibility): " + ("OK" if okA else "FAIL")
+        _log("[probe A] pool slot source, cache-dirty (baseline): " + ("OK" if okA else "FAIL")
              + ("" if okA else f", got={aGot[:8].tolist()} want={probeA[:8].tolist()}"))
-        _log("[probe B] user 4K-anon as WRITE source: " + ("OK" if okB else "FAIL")
+        _log("[probe B] user 4K-anon, registered unfaulted, dirty fill: " + ("OK" if okB else "FAIL")
              + ("" if okB else f", far={bFar[:8].tolist()} want={expect[:8].tolist()}"))
-        _log("[probe B4] same source after 512MB cache eviction (DRAM-resident): "
+        _log("[probe B4] same source after 512MB eviction (DRAM-resident): "
              + ("OK" if okB4 else "FAIL")
              + ("" if okB4 else f", far={b4Far[:8].tolist()} want={expect[:8].tolist()}"))
-        _log("[probe B5] hugepage-backed user buffer as WRITE source: " + ("OK" if okB5 else "FAIL")
+        _log("[probe B5] hugepage-backed user buffer as source: " + ("OK" if okB5 else "FAIL")
              + ("" if okB5 else f", far={b5Far[:8].tolist()} want={expect[:8].tolist()}"))
-        _log("[probe C2] user buffer as READ sink (far seeded via pool): " + ("OK" if okC2 else "FAIL")
+        _log("[probe B6] user 4K-anon, DRAM-resident at register: " + ("OK" if okB6 else "FAIL")
+             + ("" if okB6 else f", far={b6Far[:8].tolist()} want={expect6[:8].tolist()}"))
+        _log("[probe B6b] same buffer, dirty post-register rewrite: " + ("OK" if okB6b else "FAIL")
+             + ("" if okB6b else f", far={b6bFar[:8].tolist()} want={expect6b[:8].tolist()}"))
+        _log("[probe C2] user sink, far seeded via pool (dst pre-evicted): "
+             + ("OK" if okC2 else "FAIL")
              + ("" if okC2 else f", dst={c2Dst[:8].tolist()} want={expect[:8].tolist()}"))
-        assert okA and okB and okB4 and okB5 and okC2, \
-            f"device-scheduled copy probes failed: A={okA} B={okB} B4={okB4} B5={okB5} C2={okC2} " \
-            f"(B4 OK => non-coherent reads; B4 FAIL + B5 OK => page-size sensitive; see README)"
-        _log("[client] probes A/B/B4/B5/C2 OK (kernel library loaded)")
+        assert okA and okB and okB4 and okB5 and okB6 and okB6b and okC2, \
+            f"probes failed: A={okA} B={okB} B4={okB4} B5={okB5} B6={okB6} B6b={okB6b} C2={okC2} " \
+            f"(B6/B6b OK => library fix = touch pages before HalHostRegister; " \
+            f"B4/B6 FAIL => vendor translation bug)"
+        _log("[client] probes A/B/B4/B5/B6/B6b/C2 OK (kernel library loaded)")
 
         # closed round-trip user -> FAR -> user2 (the original warmup, now with a value dump)
         np.frombuffer(dst_mm, dtype=np.int32)[:] = 0
@@ -382,9 +418,12 @@ def main():
         _log("[client] post-unregister copy rejected as expected (host precheck)")
 
         assert handle.unregister(src_addr) == 0, "unregister(src buffer) failed"
+        assert handle.unregister(b6_addr) == 0, "unregister(b6 buffer) failed"
         assert handle.unregister(hp_addr) == 0, "unregister(hugepage buffer) failed"
         _unmap_buffer(hp_addr, HUGEPAGE_2M)
         hp_addr = 0
+        b6_mm.close()
+        b6_mm = None
         dst_mm.close()
         src_mm.close()
         dst_mm = src_mm = None
@@ -395,6 +434,8 @@ def main():
     finally:
         if hp_addr != 0:
             _unmap_buffer(hp_addr, HUGEPAGE_2M)
+        if b6_mm is not None:
+            b6_mm.close()
         if dst_mm is not None:
             dst_mm.close()
         if src_mm is not None:

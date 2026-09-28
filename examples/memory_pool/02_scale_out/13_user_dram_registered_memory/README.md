@@ -8,7 +8,7 @@
 
 前置约束：host-DRAM 端点要求**地址与大小均 4K 对齐**（IOVA 映射的页粒度），不对齐的注册在入口被拒（`SM_INVALID_PARAM`）；例 10 中"host-DRAM 注册被拒"的负例在本例反转为正例 + 对齐负例。
 
-**数据面行为（调查中）**：4K 匿名页用户缓冲作为设备侧**读源**时 NIC 读到全零——**与写入时序无关**（注册前/注册后两轮实证，探针 B）；池内巨页槽同链路正常（探针 A：同 flag、同 `HalHostRegister`、同 lkey/SGE 数学）。根因由探针切割：**B4**（512MB 缓存驱逐迫使 pattern 落 DRAM 后再写）OK ⇒ user-iova 读非一致（仅 DRAM 数据可见）；**B5**（巨页后备缓冲）OK ⇒ 页粒度/VMA 敏感，workaround=巨页/THP 缓冲；两者皆败 ⇒ 注册翻译钉错页。定案后本节更新；vendor 提单随附探针日志与 `register MR result`/`query memory key` 行。
+**数据面行为（调查中）**：用户 4K 匿名缓冲作为设备侧**读源**时 NIC 读到全零——注册前/后写入均失败。代码排查已定位路径差异：池槽注册前经 `LvaShmReservePhysicalMemory` **逐页 fault 驻留**（hybm_conn_based_segment.cpp:511），用户注册（RegisterMemCommon）**无任何页驻留准备**——`HalHostRegister` 对未 fault 匿名页可能钉住共享零页（后续 CPU 写 COW 换页、iova 断连），对已 fault 页可能丢弃注册时的脏缓存行。探针矩阵按"注册时页状态 × DMA 时数据驻留 × 页大小"三因素切割（见判读），B6+B6b OK ⇒ 库级修复 = 注册前 touch 页（池路径同款）。
 
 ## 拓扑与角色
 
@@ -38,7 +38,7 @@ kill -TERM <daemon_pid>
 
 ## 生命周期
 
-`create`（DEVICE_RDMA | DEVICE_SCHEDULE）→ `extend_local_mem`（本地 DRAM 槽，保证实体 dramSegment 就绪）→ `extend_remote_mem`（FAR 落地槽）→ 对齐负例 ×2 → `register(src/dst)` + 巨页缓冲注册 → **注册后填充 pattern** → 探针 A/B/B4/B5/C2（池内闭环基线、4K 匿名作源、驱逐后重发、巨页作源、user 作宿）→ warmup 闭环双向 → `NPUGraph` 捕获 WRITE → `replay` ×N → 默认流 READ 回读校验 → `unregister` ×3 + 预检查负例 → `destroy` → `uninitialize`。
+`create`（DEVICE_RDMA | DEVICE_SCHEDULE）→ `extend_local_mem`（本地 DRAM 槽，保证实体 dramSegment 就绪）→ `extend_remote_mem`（FAR 落地槽）→ 对齐负例 ×2 → src/dst **未 fault 注册** → 填充+驱逐 → b6 **DRAM 驻留注册** + src 重弄脏 + 巨页缓冲注册 → 探针 A/B/B4/B5/B6/B6b/C2 三阶段（设备段间夹 CPU 驱逐/重写）→ warmup 闭环双向 → `NPUGraph` 捕获 WRITE → `replay` ×N → 默认流 READ 回读校验 → `unregister` ×4 + 预检查负例 → `destroy` → `uninitialize`。
 
 ## 参数
 
@@ -62,9 +62,9 @@ kill -TERM <daemon_pid>
 ## 验收标准
 
 1. 客户端日志出现 `unaligned host-DRAM register rejected as expected (4K alignment rule)`。
-2. `both host buffers registered (user MR table v2: regAddress = HalHostRegister iova)`，且 near 日志有两条 `RegisterMem ok`。
-3. 探针组（判读见下）：`[probe A] pool->pool round-trip ...: OK`、`[probe B] user 4K-anon as WRITE source ...`、`[probe B4] ... after 512MB cache eviction ...`、`[probe B5] hugepage-backed ...`、`[probe C2] ... READ sink ...`（失败时行尾附首 8 字 dump）。
-4. `pattern filled after register (fixed protocol; write timing proven irrelevant)` 与 `warmup round-trip OK (host buffer -> FAR slot -> host buffer2)`。
+2. `src/dst registered unfaulted` 与 `b6 registered DRAM-resident; src re-dirtied`，near 日志有对应 `RegisterMem ok` ×4（src/dst/b6/巨页）。
+3. 探针组七连（判读见下）：`[probe A] pool slot source, cache-dirty (baseline): OK`、`[probe B] ... registered unfaulted, dirty fill`、`[probe B4] ... after 512MB eviction`、`[probe B5] hugepage-backed ...`、`[probe B6] ... DRAM-resident at register`、`[probe B6b] ... dirty post-register rewrite`、`[probe C2] ... far seeded via pool (dst pre-evicted)`（失败时行尾附首 8 字 dump）。
+4. `warmup round-trip OK (host buffer -> FAR slot -> host buffer2)`。
 5. `graph captured` 后 `N replays done`，吞吐量级与例 10 相当（同为单流单拷贝，量级参考即可）。
 6. `verify OK: FAR rank <r> slot matches the host pattern`。
 7. `post-unregister copy rejected as expected (host precheck)`。
@@ -73,8 +73,20 @@ kill -TERM <daemon_pid>
 ## 判读
 
 - 注册层：near 日志 `RegisterMem ok: addr=0x... size=...`；宿主 `query memory key ok` 行应显示 `mrAddr` 等于注册地址、`regAddress` 为另一 IOVA 值（host-DRAM 特征，HBM 时两者相等）。
-- 探针层（判读树）：A=池→池闭环基线（含 NIC 写池页的 CPU 可见性）；B=4K 匿名 user 作 WRITE 源；B4=同源驱逐缓存后重发（pattern 落 DRAM）；B5=巨页后备缓冲（MAP_HUGETLB，THP 备选，日志注明实际方式与 2M 对齐性）作源；C2=user 作 READ 宿（far 由池→池 WRITE 灌入 pattern，自足不依赖 B）。**B4 OK ⇒ user-iova 读非一致；B4 FAIL + B5 OK ⇒ 页粒度敏感；B/C2 全零且 B4/B5 亦败 ⇒ 翻译钉错页**；垃圾值=写错落点。
-- 数据面行为（调查中）：4K 匿名读源全零与写入时序无关（B 两轮实证）；本节结论随 B4/B5 判定更新，vendor 提单随附探针日志。
+- 探针层（三因素矩阵：注册时页状态 × DMA 时数据驻留 × 页型）：
+
+| 探针 | 注册时页状态 | DMA 时数据 | 页型 | 切割 |
+|---|---|---|---|---|
+| A | 池槽（已驻留） | cache 脏 | 巨页 | 基线：池 iova 读一致（已证 OK） |
+| B | 未 fault | cache 脏 | 4K | 已知 FAIL（现状记录） |
+| B4 | 未 fault | DRAM（驱逐后） | 4K | FAIL ⇒ 零页钉扎/COW 断连；OK ⇒ 非一致读 |
+| B5 | 注册后填充 | cache 脏 | 巨页 | 页粒度对照 |
+| B6 | **fault+数据已驻留** | DRAM | 4K | OK ⇒ 翻译正确联到已备页 |
+| B6b | 同 B6 缓冲 | 重写后 cache 脏 | 4K | OK ⇒ 一致读成立 ⇒ 库修法=注册前 touch |
+| C2 | dst 预驱逐干净 | — | 4K | user 作宿（far 经池→池灌入） |
+
+  组合判读：**B6+B6b OK 而 B/B4 FAIL** ⇒ 双坑=未 fault 注册断连 + 注册时丢脏行，库级修复=`RegisterMemCommon` 注册前逐页 touch（池路径 `LvaShmReservePhysicalMemory` 同款），vendor 提单附证；**B6 FAIL** ⇒ 已备页翻译仍错（纯 vendor）；**B4 OK** ⇒ 读非一致（DRAM-only 可见）；**B5 OK** ⇒ 巨页可绕。
+- 数据面行为（调查中）：结论随探针矩阵判定更新，vendor 提单随附探针日志与 `register MR result`/`query memory key` 行。
 - 数据层：warmup 与 verify 两次独立校验，replay 后 verify 再次校验，覆盖"图重放期间数据未漂移"。
 - 负例层：对齐负例在注册入口被拒（错误日志含 `reject_unaligned_dram`）；注销后拷贝在主机预检查被拒。
 
@@ -84,10 +96,11 @@ kill -TERM <daemon_pid>
 | --- | --- |
 | 注册返回非 0，日志 `reject_unaligned_dram` | 地址或大小非 4K 对齐（torch pinned tensor、`ctypes.create_string_buffer` 均不保证，请用 `mmap`） |
 | `[probe A] FAIL` | 池数据面/环境问题（与 user MR 无关）：核对大页、QP 连接、双端版本 |
-| `[probe B] FAIL`（far=[0,0,...] 全零） | 已知现象（4K 匿名读源全零，写入时序无关）；按 B4/B5 行判根因 |
+| `[probe B] FAIL`（far=[0,0,...] 全零） | 已知现象（未 fault 注册 + 脏行，双坑叠加）；按矩阵判根因 |
+| `[probe B4] FAIL` + `[probe B6] [probe B6b] OK` | 未 fault 注册断连（零页钉扎/COW）：库修法=注册前 touch 页；vendor 提单附证 |
+| `[probe B6] FAIL` | 已备页翻译仍错（纯 vendor）：上报 `register MR result`、`query memory key` 行与探针日志 |
 | `[probe B4] OK` | user-iova 读非一致（仅 DRAM 数据可见）：vendor 提单；短期可改用巨页缓冲（B5 方案） |
-| `[probe B5] OK`（B4 FAIL） | 页粒度/VMA 敏感：巨页/THP 缓冲为 workaround；4K 匿名路径 vendor 提单 |
-| `[probe B4] [probe B5] 均 FAIL` | 注册翻译钉错页：上报 `register MR result`、`query memory key` 行与探针日志 |
+| `[probe B5] OK` | 页粒度/VMA 敏感：巨页/THP 缓冲为 workaround；4K 匿名路径 vendor 提单 |
 | `[probe C2] FAIL`（dst 空/垃圾） | user 作宿失效：A 正常时优先怀疑落点翻译；上报留档 |
 | warmup/verify mismatch | 双端 `memfabric_hybrid` 版本不一致（v2 表 regAddress 未填充）；确认两节点同 commit |
 | `query memory key failed` | 实体无 dramSegment：确认建池 `max_dram_size > 0` 且 `extend_local_mem` 已成功 |
