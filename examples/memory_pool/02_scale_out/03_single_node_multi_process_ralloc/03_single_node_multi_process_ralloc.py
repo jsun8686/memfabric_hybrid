@@ -55,7 +55,7 @@ def _wait_for_store(timeout_sec=60.0):
     raise RuntimeError(f"config store not reachable within {timeout_sec}s: {STORE_URL}")
 
 
-def _near_main(sync: mp.Barrier, media: str):
+def _near_main(sync: mp.Barrier, media: str, enable56: bool = False):
     mem_type, data_op, max_dram, max_hbm = _media_config(media)
     mf.set_log_level(3)
     assert mf.initialize() == 0, "mf.initialize failed"
@@ -78,6 +78,7 @@ def _near_main(sync: mp.Barrier, media: str):
             max_dram_size=max_dram,
             max_hbm_size=max_hbm,
             data_op_type=data_op,
+            enable_56bits_gva=enable56,
         )
         print(f"[rank {RANK_NEAR}] (2/5) pool created (pure alignment, no local commit)", flush=True)
 
@@ -148,13 +149,16 @@ def _far_main(sync: mp.Barrier, media: str):
 
 
 def main():
-    media = sys.argv[1].lower() if len(sys.argv) > 1 else "host"
+    argv = [a.lower() if i else a for i, a in enumerate(sys.argv[1:])]
+    media = argv[0] if argv else "host"
+    enable56 = "--enable-56bits-gva" in argv
     if media not in ("host", "device"):
-        raise RuntimeError("usage: python 03_single_node_multi_process_ralloc.py [host|device]")
+        raise RuntimeError("usage: python 03_single_node_multi_process_ralloc.py [host|device] "
+                           "[--enable-56bits-gva]")
     mp.set_start_method("spawn", force=True)
     sync = mp.Barrier(WORLD_SIZE)
 
-    p_near = mp.Process(target=_near_main, args=(sync, media))
+    p_near = mp.Process(target=_near_main, args=(sync, media, enable56))
     p_far = mp.Process(target=_far_main, args=(sync, media))
 
     p_near.start()
@@ -164,7 +168,7 @@ def main():
 
     if p_near.exitcode != 0 or p_far.exitcode != 0:
         raise RuntimeError(f"child failed: near={p_near.exitcode}, far={p_far.exitcode}")
-    print(f"(5/5) 03_single_node_multi_process_ralloc [{media}]: NEAR+FAR OK", flush=True)
+    print(f"(5/5) 03_single_node_multi_process_ralloc [{media}, 56bits={enable56}]: NEAR+FAR OK", flush=True)
 
 
 if __name__ == "__main__":

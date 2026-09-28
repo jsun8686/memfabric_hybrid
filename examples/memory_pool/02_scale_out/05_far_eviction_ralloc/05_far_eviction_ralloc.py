@@ -188,7 +188,8 @@ def _near_main(store_url, run_dir):
         # two pools -> two group engines + the master subscription share ONE store link
         pools = []
         for pool_id in (0, 1):
-            h = ralloc.create(id=pool_id, max_dram_size=ONE_GIB, max_hbm_size=0, data_op_type=DATA_OP)
+            h = ralloc.create(id=pool_id, max_dram_size=ONE_GIB, max_hbm_size=0, data_op_type=DATA_OP,
+                              enable_56bits_gva=os.environ.get("MF_ENABLE_56BITS_GVA") == "1")
             ret, info = h.extend_local_mem(MEM_TYPE, LOCAL_BYTES)
             assert ret == 0 and info["gva"] != 0, f"pool {pool_id} extend_local_mem: {ret} {info}"
             pools.append(h)
@@ -355,6 +356,10 @@ def main():
         else:
             _far_main(RANK_FAR1 if role == "far1" else RANK_FAR2, store_url, run_dir)
         return
+
+    if "--enable-56bits-gva" in args:  # export to the spawned children (env inheritance)
+        os.environ["MF_ENABLE_56BITS_GVA"] = "1"
+        args.remove("--enable-56bits-gva")
 
     store = args[0].lower() if args and args[0].lower() in ("tcp", "etcd") else "tcp"
     etcd_url = args[1] if len(args) > 1 else ETCD_STORE_URL

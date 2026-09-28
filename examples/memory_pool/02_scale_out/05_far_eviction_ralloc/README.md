@@ -45,4 +45,5 @@
 python3 05_far_eviction_ralloc.py            # tcp:// 变体（默认）
 python3 05_far_eviction_ralloc.py etcd       # etcd://127.0.0.1:2379 变体
 python3 05_far_eviction_ralloc.py etcd etcd://<ip>:2379
+python3 05_far_eviction_ralloc.py tcp --enable-56bits-gva   # 56-bit GVA 建池（near 子进程，GVA 仅设备端点）
 ```

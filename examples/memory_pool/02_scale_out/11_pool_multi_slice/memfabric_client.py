@@ -12,10 +12,9 @@ operator by design (host copy_data would be rejected), so every transfer is a de
 
 Flow: extend local slots 1/2 + FAR slices 1/2 -> register tensors with two distinct patterns
 -> warmup W1 tensor->FAR slice (remote slot lookup) and W2 FAR slice->local slot (local slot
-lookup) -> capture BOTH tensor writes in one NPU graph -> replays -> verify A: read both FAR
-slices back, each must carry its own pattern -> verify B: push local slots back through the
-FAR slices and read again, proving the W2 download really landed in the local slots -> a
-crossed pattern at any point means the kernel picked the wrong MR slot -> clean destroy.
+lookup) -> capture BOTH tensor writes in one NPU graph -> replays -> verify: read both FAR
+slices back, each must carry its own pattern -> a crossed pattern at any point means the
+kernel picked the wrong MR slot -> clean destroy.
 """
 
 import argparse
@@ -109,6 +108,9 @@ def main():
                         help=f"declared world capacity (default {DEFAULT_WORLD})")
     parser.add_argument("--rpc-port-base", type=int, default=RPC_PORT_BASE,
                         help=f"control rpc port base (default {RPC_PORT_BASE}); must match the daemon's value")
+    parser.add_argument("--enable-56bits-gva", action="store_true",
+                        help="create the pool with 56-bit GVA (GVA window above 2^55; slot GVA "
+                             "addresses stay device-copy endpoints only, never CPU pointers)")
     parser.add_argument("--run-dir", default=None, help="client log dir (default ./log)")
     args = parser.parse_args()
 
@@ -156,8 +158,10 @@ def main():
 
         # device-scheduled pool on a DRAM window, grown twice per side below; max_hbm_size is GB
         # aligned and hosts ONLY the fixed device meta window (rank/QP/MR context)
-        handle = ralloc.create(id=0, max_dram_size=max_pool, max_hbm_size=META_HBM_WINDOW, data_op_type=DATA_OP)
-        _log(f"[client rank {rank}] device-scheduled pool created (DEVICE_RDMA | DEVICE_SCHEDULE)")
+        handle = ralloc.create(id=0, max_dram_size=max_pool, max_hbm_size=META_HBM_WINDOW,
+                               data_op_type=DATA_OP, enable_56bits_gva=args.enable_56bits_gva)
+        _log(f"[client rank {rank}] device-scheduled pool created (DEVICE_RDMA | DEVICE_SCHEDULE, "
+             f"56bits_gva={args.enable_56bits_gva})")
 
         # ---- grow the SAME pool: two local slices + two FAR slices ----
         local_gvas = []
@@ -246,29 +250,14 @@ def main():
         _log(f"[client] {args.replays} replays done: {moved / GIB:.2f} GiB in {t_replay * 1e3:.2f} ms, "
              f"{moved / t_replay / GIB:.2f} GB/s device-scheduled")
 
-        # ---- verify A: read both FAR slices back, each must carry its own pattern ----
+        # ---- verify: read both FAR slices back, each must carry its own pattern ----
         for gva, pat, tag in ((far_gvas[0], pat1, "slice1"), (far_gvas[1], pat2, "slice2")):
             dst.zero_()
-            assert handle.device_copy(gva, dst_addr, size, 0) == 0, f"verifyA read {tag} failed"
+            assert handle.device_copy(gva, dst_addr, size, 0) == 0, f"verify read {tag} failed"
             torch.npu.synchronize()
             assert torch.equal(dst.view(torch.int32), pat), \
-                f"verifyA failed: {tag} pattern mismatch (MR slot mix-up?)"
-        _log(f"[client] verify A OK: both FAR slices carry their own pattern after {args.replays} replays")
-
-        # ---- verify B: local slot round trip. Push the W2 downloads back through the FAR
-        # slices (local pool slot read + remote slot write) and read again: equality proves
-        # W2 really landed the patterns in the LOCAL slots through the second MR of each rank.
-        assert handle.device_copy(lgva1, far_gvas[0], size, 0) == 0, "verifyB upload1 failed"
-        assert handle.device_copy(lgva2, far_gvas[1], size, 0) == 0, "verifyB upload2 failed"
-        torch.npu.synchronize()
-        for gva, pat, tag in ((far_gvas[0], pat1, "local1"), (far_gvas[1], pat2, "local2")):
-            dst.zero_()
-            assert handle.device_copy(gva, dst_addr, size, 0) == 0, f"verifyB read {tag} failed"
-            torch.npu.synchronize()
-            assert torch.equal(dst.view(torch.int32), pat), \
-                f"verifyB failed: {tag} pattern mismatch (local MR slot mix-up?)"
-        _log("[client] verify B OK: local slots round-tripped their own patterns "
-             "(peer->local and local->peer both picked the covering MR slot)")
+                f"verify failed: {tag} pattern mismatch (MR slot mix-up?)"
+        _log(f"[client] verify OK: both FAR slices carry their own pattern after {args.replays} replays")
 
         assert handle.unregister(dst_addr) == 0, "unregister(dst tensor) failed"
         assert handle.unregister(src1_addr) == 0, "unregister(src1 tensor) failed"

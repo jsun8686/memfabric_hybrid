@@ -39,7 +39,7 @@ def _media_config(media):
     return ralloc.RallocMemType.HOST, ralloc.RallocDataOpType.HOST_RDMA, ONE_GIB, 0
 
 
-def _run_near(head_node_ip: str, media: str) -> None:
+def _run_near(head_node_ip: str, media: str, enable56: bool = False) -> None:
     mem_type, data_op, max_dram, max_hbm = _media_config(media)
     store_url = f"tcp://{head_node_ip}:{STORE_PORT}"
     mf.set_log_level(3)
@@ -60,8 +60,10 @@ def _run_near(head_node_ip: str, media: str) -> None:
             max_dram_size=max_dram,
             max_hbm_size=max_hbm,
             data_op_type=data_op,
+            enable_56bits_gva=enable56,
         )
-        print(f"[near] pool created (store={store_url}) — waiting for the FAR contributor on node B ...", flush=True)
+        print(f"[near] pool created (store={store_url}, 56bits={enable56}) — "
+              f"waiting for the FAR contributor on node B ...", flush=True)
 
         ret, info = 0, {"rank_id": 0xFFFFFFFF, "gva": 0}
         deadline = time.time() + FAR_WAIT_TIMEOUT_SEC
@@ -140,13 +142,17 @@ def main() -> None:
         args.remove("device")
     elif "host" in args:
         args.remove("host")
+    enable56 = "--enable-56bits-gva" in args
+    if enable56:
+        args.remove("--enable-56bits-gva")
     if len(args) < 1 or args[0] not in ("0", "1"):
-        raise RuntimeError("usage: python3 04_multi_node_ralloc.py <0|1> [head_ip] [host|device]")
+        raise RuntimeError("usage: python3 04_multi_node_ralloc.py <0|1> [head_ip] [host|device] "
+                           "[--enable-56bits-gva]")
     head_ip = (args[1] if len(args) > 1 else input("Head node IP: ")).strip()
     if not head_ip:
         raise RuntimeError("head node IP required")
     if int(args[0]) == 0:
-        _run_near(head_ip, media)
+        _run_near(head_ip, media, enable56)
     else:
         _run_far(head_ip)
 

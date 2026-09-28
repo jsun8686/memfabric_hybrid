@@ -38,4 +38,6 @@ python3 04_multi_node_ralloc.py 0 <head_ip>
 # HBM 介质变体（两节点均追加 device 参数）
 python3 04_multi_node_ralloc.py 1 <head_ip> device
 python3 04_multi_node_ralloc.py 0 <head_ip> device
+# 56-bit GVA 变体（head 侧追加，GVA 窗位于 2^55 以上、槽地址仅作拷贝端点）
+python3 04_multi_node_ralloc.py 0 <head_ip> host --enable-56bits-gva
 ```

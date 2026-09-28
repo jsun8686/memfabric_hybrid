@@ -62,6 +62,7 @@ touch log/shutdown.json
 | `--batch` | 关 | 计时矩阵改用每方向一次 `copy_data_batch`（整批一次提交 + 一次等待），默认为逐块 `copy_data` 循环 |
 | `--sync-start` | 关 | worker 在文件屏障处等齐（整轮 ready + 每 size、每方向各一次）再同时开跑对应计时段；结束时打印聚合总带宽表（Σ 各 worker 单向吞吐）；测多 worker 聚合带宽必开 |
 | `--rpc-port-base` | 11100 | 控制面 rpc 端口基址（端口 = 基址 + rank_id）；整会话保持一致 |
+| `--enable-56bits-gva` | 关 | 56-bit GVA 建池（经环境变量 `MF_ENABLE_56BITS_GVA` 传给 worker 子进程；GVA 窗位于 2^55 以上，槽地址仅作设备端点） |
 | `MF_TEST_NIC_IP` | 自动 | 数据面 NIC IP 覆盖（同 03/04/05） |
 
 ## 必要条件

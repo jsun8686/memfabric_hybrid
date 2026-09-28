@@ -7,15 +7,19 @@ Same topology and skeleton as 10_user_registered_memory, but the local copy endp
 4K-aligned anonymous mmap buffers on the host instead of NPU HBM tensors. The registered
 host-DRAM MR carries a distinct device-dma base (HalHostRegister iova) in the v2 user-MR
 table (regAddress at entry byte offset +24), so the AICore RDMA kernel addresses the SGE
-as regAddress + (localAddr - addr) under the MR's lkey. History: this matrix located the
-regAddress serialization offset bug (host wrote +32, kernel read +24 -> kernel fell back
-to the raw user VA -> NIC zeros on every host-DRAM endpoint; HBM was masked by its
-identity regAddress). Probe matrix A/B/B4/B5/B6/B6b/B7/B8/C2 keeps every factor
-(register-time page state, DMA-time residency, page size, VA height, window placement)
-as a regression split -- all probes must stay OK.
-Flow: register src/dst unfaulted -> fill+evict -> register b6 DRAM-resident ->
-probes -> closed round-trip -> capture/replay the WRITE -> unregister ->
-expect the host precheck to reject further copies.
+as regAddress + (localAddr - addr) under the MR's lkey.
+
+56-bit GVA contract: pool-slot GVA addresses form device-copy endpoints only -- never
+dereference them on the CPU (with --enable-56bits-gva the GVA window lives above 2^55 and
+is not CPU mapped). The user-registered buffers are the CPU-side surface of this example.
+
+History: the probe matrix that once lived here (A/B/B4/B5/B6/B6b/B7/B8/C2) located the
+regAddress serialization offset bug (host wrote +32, kernel read +24 -> fallback to the
+raw user VA -> NIC zeros on every host-DRAM endpoint; HBM was masked by its identity
+regAddress). The matrix was removed after the fix; see README for the record.
+
+Flow: alignment negatives -> register src/dst -> round-trip -> capture/replay the WRITE ->
+unregister -> expect the host precheck to reject further copies.
 """
 
 import argparse
@@ -41,12 +45,6 @@ EXTEND_RETRY_SEC = 5
 EXTEND_TIMEOUT_SEC = 300
 GIB = 1 << 30
 DRAM_ALIGN = 4096
-HUGEPAGE_2M = 2 * 1024 * 1024
-EVICT_BYTES = 512 << 20    # cache-eviction sweep size (>> L3) for probe B4
-LOW_VA_HINT = 0x300000000000  # 3TB: below bit 47, clear of the pool windows (0x288..-0x2a8..)
-VA_BIT47 = 1 << 47
-WINDOW_PROBE_OFFSET = 1 << 40  # B8 probe lives 1TB above the local slot, inside the 2TB
-                               # pool GVA window and far above any slice this example extends
 
 DATA_OP = ralloc.RallocDataOpType.DEVICE_RDMA | ralloc.RallocDataOpType.DEVICE_SCHEDULE
 MEM_TYPE = ralloc.RallocMemType.HOST
@@ -97,76 +95,6 @@ def _map_buffer(size):
     return mm, addr
 
 
-def _bytes_at(addr, nbytes):
-    """read n bytes of host memory at a raw address (pool HOST slots are MAP_FIXED host
-    VMAs: their gva is directly CPU-readable, used by the probes as a trusted landing zone)"""
-    return ctypes.string_at(addr, nbytes)
-
-
-def _evict_caches(np, nbytes=EVICT_BYTES):
-    """capacity-flood the CPU caches with an unrelated buffer so previously written lines
-    (a probe source pattern) get evicted and written back to DRAM"""
-    dummy = np.zeros(nbytes, dtype=np.uint8)
-    dummy.fill(0xAB)
-    del dummy
-
-
-def _map_huge_buffer(size):
-    """hugepage-backed mapping via libc mmap(MAP_HUGETLB); on failure fall back to a plain
-    anonymous mapping advised MADV_HUGEPAGE (transparent huge pages, best-effort)"""
-    libc = ctypes.CDLL("libc.so.6", use_errno=True)
-    libc.mmap.restype = ctypes.c_void_p
-    libc.mmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int,
-                          ctypes.c_int, ctypes.c_long]
-    prot_rw = 0x3
-    map_private_anon = 0x22
-    map_hugetlb = 0x40000
-    addr = libc.mmap(None, size, prot_rw, map_private_anon | map_hugetlb, -1, 0)
-    if addr is not None and addr != ctypes.c_void_p(-1).value:
-        return addr, "MAP_HUGETLB"
-    # fallback: plain anon + MADV_HUGEPAGE (THP may back it with 2M pages on fault)
-    addr = libc.mmap(None, size, prot_rw, map_private_anon, -1, 0)
-    if addr is None or addr == ctypes.c_void_p(-1).value:
-        raise RuntimeError("mmap for the hugepage probe buffer failed")
-    libc.madvise(ctypes.c_void_p(addr), ctypes.c_size_t(size), 14)  # MADV_HUGEPAGE
-    return addr, "MADV_HUGEPAGE (THP fallback)"
-
-
-def _unmap_buffer(addr, size):
-    libc = ctypes.CDLL("libc.so.6", use_errno=True)
-    libc.munmap(ctypes.c_void_p(addr), ctypes.c_size_t(size))
-
-
-def _map_window_buffer(addr, size):
-    """MAP_FIXED hugepage mapping at a given address inside the pool GVA window (probe B8):
-    same page kind and registration path as the pool slices, but mapped and registered as
-    user memory -- isolates the in-window vs out-of-window factor."""
-    libc = ctypes.CDLL("libc.so.6", use_errno=True)
-    libc.mmap.restype = ctypes.c_void_p
-    libc.mmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int,
-                          ctypes.c_int, ctypes.c_long]
-    flags = 0x22 | 0x40000 | 0x10  # MAP_PRIVATE | MAP_ANON | MAP_HUGETLB | MAP_FIXED
-    got = libc.mmap(ctypes.c_void_p(addr), size, 0x3, flags, -1, 0)
-    if got is None or got == ctypes.c_void_p(-1).value or got != addr:
-        raise RuntimeError(f"MAP_FIXED hugepage at 0x{addr:x} failed")
-    return got
-
-
-def _map_low_buffer(size):
-    """plain anonymous mapping placed at a low VA hint (below bit 47): every registration
-    that ever worked (HBM tensors, pool slots) lives below 2^47 while python's default mmap
-    placement sits at ~0xfffd... above it -- this probe isolates the VA height. The hint is
-    non-fixed: if the kernel maps elsewhere the verdict is skipped (see the run log)."""
-    libc = ctypes.CDLL("libc.so.6", use_errno=True)
-    libc.mmap.restype = ctypes.c_void_p
-    libc.mmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int,
-                          ctypes.c_int, ctypes.c_long]
-    addr = libc.mmap(LOW_VA_HINT, size, 0x3, 0x22, -1, 0)  # PROT_READ|WRITE, MAP_PRIVATE|ANON
-    if addr is None or addr == ctypes.c_void_p(-1).value:
-        raise RuntimeError("mmap at the low-VA hint failed")
-    return addr
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--store", required=True,
@@ -188,6 +116,9 @@ def main():
                         help=f"declared world capacity (default {DEFAULT_WORLD})")
     parser.add_argument("--rpc-port-base", type=int, default=RPC_PORT_BASE,
                         help=f"control rpc port base (default {RPC_PORT_BASE}); must match the daemon's value")
+    parser.add_argument("--enable-56bits-gva", action="store_true",
+                        help="create the pool with 56-bit GVA (GVA window above 2^55; slot GVA "
+                             "addresses stay device-copy endpoints only, never CPU pointers)")
     parser.add_argument("--run-dir", default=None, help="client log dir (default ./log)")
     args = parser.parse_args()
 
@@ -198,7 +129,8 @@ def main():
     _term_fd = os.dup(1)
     os.dup2(log.fileno(), 1)
     os.dup2(log.fileno(), 2)
-    _log(f"[client] run dir: {run_dir}, store: {args.store}, world: {args.world}, dev: {args.dev}")
+    _log(f"[client] run dir: {run_dir}, store: {args.store}, world: {args.world}, dev: {args.dev}, "
+         f"56bits_gva: {args.enable_56bits_gva}")
 
     size = _parse_size(args.size)
     block = _parse_size(args.block_size)
@@ -209,8 +141,6 @@ def main():
         raise RuntimeError(f"--size ({size}) must be 4-byte aligned (int32 verify pattern)")
     if size > block:
         raise RuntimeError(f"--size ({size}) exceeds --block-size ({block})")
-    if 10 * size > block:
-        raise RuntimeError(f"--block-size ({block}) must hold 10 probe windows of --size ({size})")
     if block > max_pool:
         raise RuntimeError(f"--block-size ({block}) exceeds --max-pool-size ({max_pool})")
     if max_pool % GIB != 0:
@@ -222,10 +152,7 @@ def main():
     mf.set_log_level(1)
     assert mf.initialize() == 0, "mf.initialize failed"
     ralloc_inited = False
-    src_mm = dst_mm = b6_mm = None
-    hp_addr = 0
-    low_addr = 0
-    b8_addr = 0
+    src_mm = dst_mm = None
     try:
         import numpy as np
         import torch
@@ -245,8 +172,10 @@ def main():
         # device-scheduled pool on a DRAM window: the FAR side commits the landing slot.
         # max_hbm_size is GB aligned and hosts ONLY the fixed device meta window
         # (rank/QP/MR context); the user buffers below live in anonymous host mappings
-        handle = ralloc.create(id=0, max_dram_size=max_pool, max_hbm_size=META_HBM_WINDOW, data_op_type=DATA_OP)
-        _log(f"[client rank {rank}] device-scheduled pool created (DEVICE_RDMA | DEVICE_SCHEDULE)")
+        handle = ralloc.create(id=0, max_dram_size=max_pool, max_hbm_size=META_HBM_WINDOW,
+                               data_op_type=DATA_OP, enable_56bits_gva=args.enable_56bits_gva)
+        _log(f"[client rank {rank}] device-scheduled pool created (DEVICE_RDMA | DEVICE_SCHEDULE, "
+             f"56bits_gva={args.enable_56bits_gva})")
 
         ret, info = handle.extend_local_mem(MEM_TYPE, block)
         assert ret == 0 and info.get("gva"), f"extend_local_mem failed: {ret} {info}"
@@ -282,169 +211,31 @@ def main():
         # ---- host buffers as copy endpoints ----
         src_mm, src_addr = _map_buffer(size)
         dst_mm, dst_addr = _map_buffer(size)
-        b6_mm, b6_addr = _map_buffer(size)
-        assert src_addr != dst_addr and src_addr != b6_addr, "buffer mapping failed"
+        assert src_addr != dst_addr, "buffer mapping failed"
         words = size // 4
         seed = rank + 1
         expect = np.arange(words, dtype=np.int32) * 7 + seed
-        expect6 = np.arange(words, dtype=np.int32) * 11 + 0x61
-        expect6b = np.arange(words, dtype=np.int32) * 13 + 0x62
-        _log(f"[client] host buffers: src=0x{src_addr:x} dst=0x{dst_addr:x} b6=0x{b6_addr:x} "
-             f"({size} bytes each, page-aligned anonymous mmap)")
-
-        # B premise: src/dst registered UNFAULTED (mapped but never touched)
-        assert handle.register(src_addr, size) == 0, "register(src buffer) failed"
-        assert handle.register(dst_addr, size) == 0, "register(dst buffer) failed"
-        _log("[client] src/dst registered unfaulted (user MR table v2: regAddress = HalHostRegister iova)")
-
-        # fill everything, evict to DRAM, THEN register b6 (B6 premise: faulted +
-        # DRAM-resident data at registration); finally re-dirty src (B premise: its
-        # pattern is cache-dirty at DMA time) and leave dst clean-zeroed for the C2 sink
         np.frombuffer(src_mm, dtype=np.int32)[:] = expect
         np.frombuffer(dst_mm, dtype=np.int32)[:] = 0
-        np.frombuffer(b6_mm, dtype=np.int32)[:] = expect6
-        _evict_caches(np)  # sweep 0: all three patterns DRAM-resident, caches clean
-        assert handle.register(b6_addr, size) == 0, "register(b6 buffer) failed"
-        np.frombuffer(src_mm, dtype=np.int32)[:] = expect  # re-dirty src for probe B
-        _log("[client] b6 registered DRAM-resident; src re-dirtied (per-probe premises set)")
+        _log(f"[client] host buffers: src=0x{src_addr:x} dst=0x{dst_addr:x} "
+             f"({size} bytes each, page-aligned anonymous mmap)")
+        assert handle.register(src_addr, size) == 0, "register(src buffer) failed"
+        assert handle.register(dst_addr, size) == 0, "register(dst buffer) failed"
+        _log("[client] src/dst registered (user MR table v2: regAddress = HalHostRegister iova)")
 
-        # ---- probe matrix (the first device_copy also dlopens and loads the kernel
-        # library, which is illegal inside capture). Three device phases on one side
-        # stream with CPU sweeps in between; per-probe factors under test = page state
-        # at register (unfaulted vs faulted+DRAM-resident), data residency at DMA
-        # (cache-dirty vs DRAM), page size:
-        # A:   pool slot source, 1M cache-dirty write -> DMA (baseline: pool iova reads
-        #      are coherent with CPU-dirty lines);
-        # B:   user 4K-anon, registered unfaulted, cache-dirty post-register fill;
-        # B4:  same buffer after a 512MB eviction sweep (pattern forced to DRAM): FAIL =>
-        #      registration diverged from the pages (zero-page pin + COW), OK => non-coherent;
-        # B5:  hugepage-backed user buffer (MAP_HUGETLB / THP fallback), post-register fill;
-        # B6:  user 4K-anon, faulted + pattern + evicted BEFORE register (DRAM-resident,
-        #      clean cache at registration): OK => translation aliases prepared pages;
-        # B6b: SAME buffer, cache-dirty post-register REWRITE (distinct pattern): OK =>
-        #      reads are coherent once pages are connected => the hazards are registration-
-        #      time invalidation + unfaulted registration => library fix = touch pages
-        #      before HalHostRegister (LvaShmReservePhysicalMemory equivalent);
-        # B8:  user hugepage MAP_FIXED INSIDE the pool GVA window: OK => the constraint is
-        #      in-window placement (fix = carve user DRAM from the window), FAIL => vendor;
-        # C2:  user sink, far seeded via a pool->pool write, dst pre-evicted clean.
+        # round-trip user -> FAR -> user2 (device_copy submits on the side stream; the first
+        # call also dlopens the kernel library, which is illegal inside graph capture)
         side = torch.npu.Stream()
         side.wait_stream(torch.npu.current_stream())
-        probeA = np.arange(words, dtype=np.int32) * 3 + 0x41410
-        ctypes.memmove(local_gva, probeA.tobytes(), size)              # A source
-        ctypes.memmove(local_gva + 4 * size, expect.tobytes(), size)   # C2 seed source
-        hp_addr, hp_kind = _map_huge_buffer(HUGEPAGE_2M)
-        assert handle.register(hp_addr, HUGEPAGE_2M) == 0, "register(hugepage buffer) failed"
-        ctypes.memmove(hp_addr, expect.tobytes(), size)                # B5 source, post-register fill
-        _log(f"[client] B5 buffer: 0x{hp_addr:x} ({HUGEPAGE_2M} bytes, {hp_kind}, "
-             f"2M-aligned={hp_addr % HUGEPAGE_2M == 0})")
-        low_addr = _map_low_buffer(size)
-        low_hint_ok = low_addr < VA_BIT47
-        assert handle.register(low_addr, size) == 0, "register(low-VA buffer) failed"
-        ctypes.memmove(low_addr, expect.tobytes(), size)               # B7 source, post-register fill
-        _log(f"[client] B7 buffer: 0x{low_addr:x} ({size} bytes, low-VA hint honored={low_hint_ok})")
-        b8_addr = _map_window_buffer(local_gva + WINDOW_PROBE_OFFSET, HUGEPAGE_2M)
-        assert handle.register(b8_addr, HUGEPAGE_2M) == 0, "register(in-window buffer) failed"
-        ctypes.memmove(b8_addr, expect.tobytes(), size)                # B8 source, post-register fill
-        _log(f"[client] B8 buffer: 0x{b8_addr:x} ({HUGEPAGE_2M} bytes MAP_FIXED hugepage inside the "
-             f"pool GVA window, local slot at 0x{local_gva:x})")
         with torch.npu.stream(side):
             stream_ptr = torch.npu.current_stream().npu_stream
-            assert handle.device_copy(local_gva, far_gva, size, stream_ptr) == 0, "probe A write failed"
-            assert handle.device_copy(far_gva, local_gva + size, size, stream_ptr) == 0, "probe A readback failed"
-            assert handle.device_copy(src_addr, far_gva, size, stream_ptr) == 0, "probe B write failed"
-            assert handle.device_copy(far_gva, local_gva + 2 * size, size, stream_ptr) == 0, \
-                "probe B readback failed"
-        torch.npu.synchronize()
-        _evict_caches(np)  # sweep 1: force the src pattern out to DRAM
-        with torch.npu.stream(side):
-            stream_ptr = torch.npu.current_stream().npu_stream
-            assert handle.device_copy(src_addr, far_gva, size, stream_ptr) == 0, "probe B4 write failed"
-            assert handle.device_copy(far_gva, local_gva + 3 * size, size, stream_ptr) == 0, \
-                "probe B4 readback failed"
-            assert handle.device_copy(hp_addr, far_gva, size, stream_ptr) == 0, "probe B5 write failed"
-            assert handle.device_copy(far_gva, local_gva + 5 * size, size, stream_ptr) == 0, \
-                "probe B5 readback failed"
-            assert handle.device_copy(low_addr, far_gva, size, stream_ptr) == 0, "probe B7 write failed"
-            assert handle.device_copy(far_gva, local_gva + 8 * size, size, stream_ptr) == 0, \
-                "probe B7 readback failed"
-            assert handle.device_copy(b8_addr, far_gva, size, stream_ptr) == 0, "probe B8 write failed"
-            assert handle.device_copy(far_gva, local_gva + 9 * size, size, stream_ptr) == 0, \
-                "probe B8 readback failed"
-            assert handle.device_copy(b6_addr, far_gva, size, stream_ptr) == 0, "probe B6 write failed"
-            assert handle.device_copy(far_gva, local_gva + 6 * size, size, stream_ptr) == 0, \
-                "probe B6 readback failed"
-        torch.npu.synchronize()
-        ctypes.memmove(b6_addr, expect6b.tobytes(), size)  # dirty post-register rewrite
-        with torch.npu.stream(side):
-            stream_ptr = torch.npu.current_stream().npu_stream
-            assert handle.device_copy(b6_addr, far_gva, size, stream_ptr) == 0, "probe B6b write failed"
-            assert handle.device_copy(far_gva, local_gva + 7 * size, size, stream_ptr) == 0, \
-                "probe B6b readback failed"
-            assert handle.device_copy(local_gva + 4 * size, far_gva, size, stream_ptr) == 0, \
-                "probe C2 seed write failed"
-            assert handle.device_copy(far_gva, dst_addr, size, stream_ptr) == 0, "probe C2 read failed"
-        torch.npu.synchronize()
-
-        aGot = np.frombuffer(_bytes_at(local_gva + size, size), dtype=np.int32)
-        bFar = np.frombuffer(_bytes_at(local_gva + 2 * size, size), dtype=np.int32)
-        b4Far = np.frombuffer(_bytes_at(local_gva + 3 * size, size), dtype=np.int32)
-        b5Far = np.frombuffer(_bytes_at(local_gva + 5 * size, size), dtype=np.int32)
-        b6Far = np.frombuffer(_bytes_at(local_gva + 6 * size, size), dtype=np.int32)
-        b6bFar = np.frombuffer(_bytes_at(local_gva + 7 * size, size), dtype=np.int32)
-        b7Far = np.frombuffer(_bytes_at(local_gva + 8 * size, size), dtype=np.int32)
-        b8Far = np.frombuffer(_bytes_at(local_gva + 9 * size, size), dtype=np.int32)
-        c2Dst = np.frombuffer(bytes(dst_mm[:]), dtype=np.int32)
-        okA = np.array_equal(aGot, probeA)
-        okB = np.array_equal(bFar, expect)
-        okB4 = np.array_equal(b4Far, expect)
-        okB5 = np.array_equal(b5Far, expect)
-        okB6 = np.array_equal(b6Far, expect6)
-        okB6b = np.array_equal(b6bFar, expect6b)
-        okC2 = np.array_equal(c2Dst, expect)
-        if not low_hint_ok:
-            okB7 = True
-            _log(f"[probe B7] SKIP: low-VA hint not honored, mapped at 0x{low_addr:x}")
-        else:
-            okB7 = np.array_equal(b7Far, expect)
-            _log("[probe B7] user buffer at low VA (<2^47) as WRITE source: " + ("OK" if okB7 else "FAIL")
-                 + ("" if okB7 else f", far={b7Far[:8].tolist()} want={expect[:8].tolist()}"))
-        _log("[probe A] pool slot source, cache-dirty (baseline): " + ("OK" if okA else "FAIL")
-             + ("" if okA else f", got={aGot[:8].tolist()} want={probeA[:8].tolist()}"))
-        _log("[probe B] user 4K-anon, registered unfaulted, dirty fill: " + ("OK" if okB else "FAIL")
-             + ("" if okB else f", far={bFar[:8].tolist()} want={expect[:8].tolist()}"))
-        _log("[probe B4] same source after 512MB eviction (DRAM-resident): "
-             + ("OK" if okB4 else "FAIL")
-             + ("" if okB4 else f", far={b4Far[:8].tolist()} want={expect[:8].tolist()}"))
-        _log("[probe B5] hugepage-backed user buffer as source: " + ("OK" if okB5 else "FAIL")
-             + ("" if okB5 else f", far={b5Far[:8].tolist()} want={expect[:8].tolist()}"))
-        _log("[probe B6] user 4K-anon, DRAM-resident at register: " + ("OK" if okB6 else "FAIL")
-             + ("" if okB6 else f", far={b6Far[:8].tolist()} want={expect6[:8].tolist()}"))
-        _log("[probe B6b] same buffer, dirty post-register rewrite: " + ("OK" if okB6b else "FAIL")
-             + ("" if okB6b else f", far={b6bFar[:8].tolist()} want={expect6b[:8].tolist()}"))
-        okB8 = np.array_equal(b8Far, expect)
-        _log("[probe B8] user hugepage inside the pool GVA window as source: " + ("OK" if okB8 else "FAIL")
-             + ("" if okB8 else f", far={b8Far[:8].tolist()} want={expect[:8].tolist()}"))
-        _log("[probe C2] user sink, far seeded via pool (dst pre-evicted): "
-             + ("OK" if okC2 else "FAIL")
-             + ("" if okC2 else f", dst={c2Dst[:8].tolist()} want={expect[:8].tolist()}"))
-        assert okA and okB and okB4 and okB5 and okB6 and okB6b and okB7 and okB8 and okC2, \
-            f"probes failed: A={okA} B={okB} B4={okB4} B5={okB5} B6={okB6} B6b={okB6b} B7={okB7} " \
-            f"B8={okB8} C2={okC2} (B8 OK => constraint = inside the pool GVA window, fix = carve " \
-            f"user DRAM from the window; B8 FAIL => vendor escalation; see README)"
-        _log("[client] probes A/B/B4/B5/B6/B6b/B7/B8/C2 OK (kernel library loaded)")
-
-        # closed round-trip user -> FAR -> user2 (the original warmup, now with a value dump)
-        np.frombuffer(dst_mm, dtype=np.int32)[:] = 0
-        with torch.npu.stream(side):
-            stream_ptr = torch.npu.current_stream().npu_stream
-            assert handle.device_copy(src_addr, far_gva, size, stream_ptr) == 0, "warmup write failed"
-            assert handle.device_copy(far_gva, dst_addr, size, stream_ptr) == 0, "warmup read failed"
+            assert handle.device_copy(src_addr, far_gva, size, stream_ptr) == 0, "write failed"
+            assert handle.device_copy(far_gva, dst_addr, size, stream_ptr) == 0, "read failed"
         torch.npu.synchronize()
         got = np.frombuffer(bytes(dst_mm[:]), dtype=np.int32)
         assert np.array_equal(got, expect), \
-            f"warmup round-trip mismatch: got={got[:8].tolist()} want={expect[:8].tolist()}"
-        _log("[client] warmup round-trip OK (host buffer -> FAR slot -> host buffer2)")
+            f"round-trip mismatch: got={got[:8].tolist()} want={expect[:8].tolist()}"
+        _log("[client] round-trip OK (host buffer -> FAR slot -> host buffer2)")
 
         # capture the WRITE into an NPU graph: host buffer -> FAR pool slot + quiet
         graph = torch.npu.NPUGraph()
@@ -485,18 +276,6 @@ def main():
         _log("[client] post-unregister copy rejected as expected (host precheck)")
 
         assert handle.unregister(src_addr) == 0, "unregister(src buffer) failed"
-        assert handle.unregister(b6_addr) == 0, "unregister(b6 buffer) failed"
-        assert handle.unregister(low_addr) == 0, "unregister(low-VA buffer) failed"
-        assert handle.unregister(b8_addr) == 0, "unregister(in-window buffer) failed"
-        assert handle.unregister(hp_addr) == 0, "unregister(hugepage buffer) failed"
-        _unmap_buffer(hp_addr, HUGEPAGE_2M)
-        hp_addr = 0
-        _unmap_buffer(b8_addr, HUGEPAGE_2M)
-        b8_addr = 0
-        _unmap_buffer(low_addr, size)
-        low_addr = 0
-        b6_mm.close()
-        b6_mm = None
         dst_mm.close()
         src_mm.close()
         dst_mm = src_mm = None
@@ -505,14 +284,6 @@ def main():
         assert mf.get_last_err_msg() == "", mf.get_last_err_msg()
         _log(f"[client rank {rank}] buffers unregistered, remote block released, exiting")
     finally:
-        if hp_addr != 0:
-            _unmap_buffer(hp_addr, HUGEPAGE_2M)
-        if b8_addr != 0:
-            _unmap_buffer(b8_addr, HUGEPAGE_2M)
-        if low_addr != 0:
-            _unmap_buffer(low_addr, size)
-        if b6_mm is not None:
-            b6_mm.close()
         if dst_mm is not None:
             dst_mm.close()
         if src_mm is not None:

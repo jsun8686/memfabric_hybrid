@@ -33,4 +33,7 @@ get_mem_size_by_rank / get_mem_ptr_by_rank / copy_data / wait(仅 device) / dest
 ```bash
 python3 03_single_node_multi_process_ralloc.py           # host 介质（默认）
 python3 03_single_node_multi_process_ralloc.py device    # HBM 介质（需 NPU+CANN，异步 SDMA 拷贝经 wait 收敛）
+python3 03_single_node_multi_process_ralloc.py host --enable-56bits-gva   # 56-bit GVA 建池
 ```
+
+`--enable-56bits-gva`：GVA 窗位于 2^55 以上，槽地址仅作拷贝端点（本例本就只用端点拷贝，天然满足契约）。

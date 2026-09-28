@@ -35,8 +35,9 @@ FAR 节点（常驻守护，复用 08）                NEAR 节点（客户端�
 - `handle.device_copy` / `handle.device_copy_batch` / `handle.get_entity_id`
   （对齐 `copy_data` / `copy_data_batch` 家族：地址直传 + 方向按地址自动判定 + 批量一次
   提交；安装期编译的随包内核，`dlopen` 惰性加载；纯入队不同步）
-- 本地端还支持用户注册内存（`handle.register` 后 NPU 张量地址可直接作端点，设备侧查
-  用户 MR 表取 lkey，本用例不演示）
+- 用户注册内存（`handle.register`）作本地端点：本用例的 pattern 经**注册 NPU 张量**注入
+  本地槽、并从 FAR 槽读回第二张量校验——池槽 GVA 仅作 device_copy 端点，**禁止 CPU 解引用**
+  （`--enable-56bits-gva` 下 GVA 窗位于 2^55 以上、无 CPU 映射）
 - NPUGraph 捕获与重放（`torch.npu.NPUGraph`），warmup 必须在捕获外完成（首次
   device_copy 会 `dlopen` + 加载内核，捕获中非法）
 
@@ -69,12 +70,13 @@ kill -TERM <daemon_pid>
 |---|---|---|
 | `--store` | 必填 | 守护进程的 store url |
 | `--dev` | 必填 | 客户端使用的 NPU id |
-| `--size` | 1M | 每次单边 RDMA 拷贝的字节数（K/M/G 后缀） |
+| `--size` | 1M | 每次单边 RDMA 拷贝的字节数（K/M/G 后缀，须 4 字节对齐） |
 | `--replays` | 8 | 捕获后重放次数（计时段，放大由重放承担） |
-| `--block-size` | 64M | 两侧各提交的 DRAM slot 字节数（须 ≥ 2×size：slot 布局 `[pattern \| verify]`） |
+| `--block-size` | 64M | 两侧各提交的 DRAM slot 字节数（须 ≥ size） |
 | `--max-pool-size` | 4G | 池 DRAM 窗口（`ralloc.create` 的 `max_dram_size`，**必须 GB 对齐**） |
 | `--world` | 512 | 同守护 |
 | `--rpc-port-base` | 11100 | 同守护 |
+| `--enable-56bits-gva` | 关 | 56-bit GVA 建池（GVA 窗位于 2^55 以上，槽地址仅作设备端点） |
 | `--run-dir` | ./log | 客户端日志目录（`near_dev{dev}.log`） |
 
 ## 必要条件
@@ -91,11 +93,12 @@ kill -TERM <daemon_pid>
 ## 验收标准
 - 客户端关键行依次出现：
   1. `device-scheduled pool created (DEVICE_RDMA | DEVICE_SCHEDULE)`
-  2. `warmup round-trip OK (kernel library loaded, meta window reachable)`
-  3. `graph captured: 1 x <size> byte device-scheduled WRITE + quiet, no host interaction inside`
-  4. `<replays> replays done: ... GB/s device-scheduled`
-  5. `verify OK: far rank <R> slot matches the pattern`
-  6. `[client] device-scheduled RDMA under NPU graph finished cleanly`，exit 0
+  2. `pattern tensors registered`
+  3. `warmup round-trip OK (kernel library loaded, both pool slots reachable)`
+  4. `graph captured: 1 x <size> byte device-scheduled WRITE + quiet, no host interaction inside`
+  5. `<replays> replays done: ... GB/s device-scheduled`
+  6. `verify OK: far rank <R> slot matches the pattern`
+  7. `[client] device-scheduled RDMA under NPU graph finished cleanly`，exit 0
 - 守护侧正常常驻、停机 `all contributors stopped cleanly`
 - 可连跑多轮客户端（守护复用范式）
 

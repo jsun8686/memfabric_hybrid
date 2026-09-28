@@ -11,8 +11,7 @@ rank 的 `ConnectRankInfo.memoryMap` 持有两条 MR 记录——设备可见的
 - 端点为注册张量（P1 user MR，同 10 例）：**device-scheduled 池按设计不持有 host
   copy 算子**（`copy_data` 会被 host 以 `no host copy operator` 拒绝），所有搬运均
   为 `device_copy`；
-- 双 pattern 交叉校验是核心断言：远端槽（verify A）与本地槽（verify B）任一处
-  pattern 交叉 = kernel 槽匹配错位。
+- 双 pattern 交叉校验是核心断言：两远端槽 pattern 交叉 = kernel 槽匹配错位。
 
 ## 拓扑与角色
 
@@ -53,11 +52,10 @@ kill -TERM <daemon_pid>
 ```
 
 ## 生命周期
-- 客户端 create → extend ×2（本地）+ extend ×2（远端，断言两段 gva 不重叠且同
-  FAR rank）→ 注册三张量（双 pattern 源 + 读回落点）→ warmup W1（张量→FAR 双写，
-  远端槽匹配）+ W2（FAR→本地双下载，本地槽匹配）→ 捕获双写 → 重放 → verify A
-  （FAR 双槽读回比对）→ verify B（本地槽经 FAR 中转往返比对）→ unregister →
-  destroy 全链路自清理，退出无需通知守护
+- 客户端 create（可选 56-bit GVA）→ extend ×2（本地）+ extend ×2（远端，断言两段 gva 不
+  重叠且同 FAR rank）→ 注册三张量（双 pattern 源 + 读回落点）→ warmup W1（张量→FAR 双写，
+  远端槽匹配）+ W2（FAR→本地双下载，本地槽匹配）→ 捕获双写 → 重放 → verify（FAR 双槽
+  读回比对）→ unregister → destroy 全链路自清理，退出无需通知守护
 - 守护生命周期与 09/10 完全一致
 - 客户端每次运行以 `"w"` 截断重写 `log/near_dev{N}.log`
 
@@ -77,6 +75,7 @@ kill -TERM <daemon_pid>
 | `--max-pool-size` | 4G | 池 DRAM 窗口（**必须 GB 对齐**，须容纳 2 × block-size） |
 | `--world` | 512 | 同守护 |
 | `--rpc-port-base` | 11105 | 同守护 |
+| `--enable-56bits-gva` | 关 | 56-bit GVA 建池（GVA 窗位于 2^55 以上，槽地址仅作设备端点） |
 | `--run-dir` | ./log | 客户端日志目录（`near_dev{dev}.log`） |
 
 ## 必要条件
@@ -95,19 +94,16 @@ kill -TERM <daemon_pid>
   4. `warmup OK: W1 tensor->FAR slots, W2 FAR slots->local slots ...`
   5. `graph captured: 2 x <size> byte device-scheduled WRITEs, one per slice`
   6. `<replays> replays done: ... GB/s device-scheduled`
-  7. `verify A OK: both FAR slices carry their own pattern`
-  8. `verify B OK: local slots round-tripped their own patterns`
-  9. `[client] pool multi-slice device-scheduled copies under NPU graph finished cleanly`，exit 0
+  7. `verify OK: both FAR slices carry their own pattern`
+  8. `[client] pool multi-slice device-scheduled copies under NPU graph finished cleanly`，exit 0
 - 守护侧正常常驻、停机 `all contributors stopped cleanly`；FAR log **无**
   `only the first 8 are visible` 截断 WARN（2 slice 远小于 8 槽）
 
 ## 判读
 - replay 吞吐语义与 09/10 相同（验证可捕获性与正确性，非极限带宽；每次 replay 搬
   2 × size 字节）
-- verify A 失败：远端槽匹配错位或 replay 期间链路异常，`log/far_dev{N}.log` 找
+- verify 失败：远端槽匹配错位或 replay 期间链路异常，`log/far_dev{N}.log` 找
   CQE 状态打印
-- verify B 失败但 verify A 通过：本地槽（W2 下载/verify B 上传）路径错位，重点回看
-  `FillQpInfo` 日志与本 rank 槽位
 - extend 第二次失败：ralloc 层对同池多次扩容的限制（看 `extend_*` 返回与 C 层日志）
 
 ## 排障（精简）

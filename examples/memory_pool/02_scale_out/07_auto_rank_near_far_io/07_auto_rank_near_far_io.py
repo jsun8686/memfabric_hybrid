@@ -308,7 +308,8 @@ def _nearworker_main(dev, idx, run_dir, store_url, world, sizes_str, mb_per_size
         ralloc_inited = True
         rank = ralloc.get_rank_id()
 
-        handle = ralloc.create(id=0, max_dram_size=POOL_WINDOW, max_hbm_size=0, data_op_type=DATA_OP)
+        handle = ralloc.create(id=0, max_dram_size=POOL_WINDOW, max_hbm_size=0, data_op_type=DATA_OP,
+                               enable_56bits_gva=os.environ.get("MF_ENABLE_56BITS_GVA") == "1")
 
         # FAR contributors may still be registering; placement fails until then
         deadline = time.time() + 300
@@ -560,6 +561,10 @@ def main():
                         help=f"control rpc port base (port = base + rank_id, default {RPC_PORT_BASE}); "
                              f"use to dodge stale same-rank processes on shared nodes — keep one "
                              f"value for the whole session")
+    parser.add_argument("--enable-56bits-gva", action="store_true",
+                        help="create the pool with 56-bit GVA (exported to worker children via "
+                             "MF_ENABLE_56BITS_GVA; slot GVA addresses stay device-copy "
+                             "endpoints only, never CPU pointers)")
     parser.add_argument("--run-dir", default=None, help="marker/log dir (default ./log)")
     args = parser.parse_args()
 
@@ -571,6 +576,8 @@ def main():
     if args.role == "far":
         _far_parent(args, run_dir)
         return 0
+    if args.enable_56bits_gva:
+        os.environ["MF_ENABLE_56BITS_GVA"] = "1"  # inherited by the worker subprocesses
     try:
         _near_parent(args, run_dir)
     except Exception:

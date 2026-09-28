@@ -1253,6 +1253,9 @@ Returns:
         .def("get_mem_ptr_by_rank", &RallocPool::GetMemPtrByRank, py::call_guard<py::gil_scoped_release>(),
              py::arg("rank"), py::arg("mem_type") = SMEM_RALLOC_MEM_TYPE_HOST, R"(
 Get slot base address of one rank, paired with get_mem_size_by_rank.
+The returned GVA forms device-copy endpoints only (src/dst of device_copy/copy_data);
+never dereference it on the CPU -- with 56-bit GVA enabled the address lives above
+2^55 and is not CPU mapped (CPU-side data goes through registered user memory).
 
 Arguments:
     rank(int):                rank id of the slot

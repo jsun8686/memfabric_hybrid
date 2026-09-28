@@ -70,6 +70,7 @@ kill -TERM <daemon_pid>
 | `--max-pool-size` | 4G | 池 DRAM 窗口（**必须 GB 对齐**） |
 | `--world` | 512 | 同守护 |
 | `--rpc-port-base` | 11100 | 同守护 |
+| `--enable-56bits-gva` | 关 | 56-bit GVA 建池（GVA 窗位于 2^55 以上，槽地址仅作设备端点） |
 | `--run-dir` | ./log | 客户端日志目录（`near_dev{dev}.log`） |
 
 ## 必要条件

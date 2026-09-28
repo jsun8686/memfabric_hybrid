@@ -181,7 +181,8 @@ def _near_main(store_url, run_dir):
         assert ralloc.initialize(store_url, WORLD_SIZE, 0, cfg) == 0, "ralloc.initialize failed"
         ralloc_inited = True
 
-        handle = ralloc.create(id=0, max_dram_size=ONE_GIB, max_hbm_size=0, data_op_type=DATA_OP)
+        handle = ralloc.create(id=0, max_dram_size=ONE_GIB, max_hbm_size=0, data_op_type=DATA_OP,
+                               enable_56bits_gva=os.environ.get("MF_ENABLE_56BITS_GVA") == "1")
         ret, info = handle.extend_local_mem(MEM_TYPE, LOCAL_BYTES)
         assert ret == 0 and info["gva"] != 0, f"extend_local_mem: {ret} {info}"
 
@@ -333,6 +334,10 @@ def main():
         else:
             _far_main(RANK_FAR_A if role == "far0" else RANK_FAR_B, store_url, run_dir)
         return
+
+    if "--enable-56bits-gva" in args:  # export to the spawned children (env inheritance)
+        os.environ["MF_ENABLE_56BITS_GVA"] = "1"
+        args.remove("--enable-56bits-gva")
 
     store_url = args[0] if args else ETCD_STORE_URL
     import os

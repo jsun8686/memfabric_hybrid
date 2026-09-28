@@ -75,6 +75,7 @@ kill -TERM <daemon_pid>        # pgrep -f memfabric_daemon 找 pid
 | `--batch-mode` | 关 | 计时段改用每方向一次 `copy_data_batch`（整批一次提交 + 一次等待） |
 | `--world` | 512 | 同守护 |
 | `--rpc-port-base` | 11100 | 同守护 |
+| `--enable-56bits-gva` | 关 | 56-bit GVA 建池（GVA 窗位于 2^55 以上，槽地址仅作设备端点） |
 | `--run-dir` | ./log | 客户端日志目录（`near_dev{dev}.log`，每次运行重写） |
 
 ## 必要条件

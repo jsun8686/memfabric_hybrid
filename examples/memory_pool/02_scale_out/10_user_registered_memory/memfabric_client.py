@@ -94,6 +94,9 @@ def main():
                         help=f"declared world capacity (default {DEFAULT_WORLD})")
     parser.add_argument("--rpc-port-base", type=int, default=RPC_PORT_BASE,
                         help=f"control rpc port base (default {RPC_PORT_BASE}); must match the daemon's value")
+    parser.add_argument("--enable-56bits-gva", action="store_true",
+                        help="create the pool with 56-bit GVA (GVA window above 2^55; slot GVA "
+                             "addresses stay device-copy endpoints only, never CPU pointers)")
     parser.add_argument("--run-dir", default=None, help="client log dir (default ./log)")
     args = parser.parse_args()
 
@@ -142,8 +145,10 @@ def main():
         # device-scheduled pool on a DRAM window: the FAR side commits the landing slot.
         # max_hbm_size is GB aligned and hosts ONLY the fixed device meta window
         # (rank/QP/MR context); the user tensors below live in torch's own HBM allocator
-        handle = ralloc.create(id=0, max_dram_size=max_pool, max_hbm_size=META_HBM_WINDOW, data_op_type=DATA_OP)
-        _log(f"[client rank {rank}] device-scheduled pool created (DEVICE_RDMA | DEVICE_SCHEDULE)")
+        handle = ralloc.create(id=0, max_dram_size=max_pool, max_hbm_size=META_HBM_WINDOW,
+                               data_op_type=DATA_OP, enable_56bits_gva=args.enable_56bits_gva)
+        _log(f"[client rank {rank}] device-scheduled pool created (DEVICE_RDMA | DEVICE_SCHEDULE, "
+             f"56bits_gva={args.enable_56bits_gva})")
 
         ret, info = handle.extend_local_mem(MEM_TYPE, block)
         assert ret == 0 and info.get("gva"), f"extend_local_mem failed: {ret} {info}"

@@ -10,10 +10,15 @@ kernel (libmf_smem_ralloc_device_rdma.so, built at install time) drives the RDMA
 plane by itself. The host-side device_copy only enqueues the kernel, which makes the
 copy job (one-sided WRITE/READ + quiet) NPU-graph capturable: capture once, replay K
 times, zero host interaction per replay.
+
+The copy job is pool slot -> pool slot (local DRAM slot as WRITE source). The pattern is
+seeded into the local slot from a registered NPU tensor and verified by reading the FAR
+slot back into a second registered tensor: pool-slot GVA addresses are used as
+device-copy endpoints ONLY -- never dereferenced on the CPU (with --enable-56bits-gva
+the GVA window lives above 2^55 and is not CPU mapped).
 """
 
 import argparse
-import ctypes
 import os
 import socket
 import sys
@@ -73,25 +78,6 @@ def _parse_size(tok):
     return n * mult
 
 
-def _pattern(i, seed):
-    return (seed * 1103515245 + i * 7) & 0xFFFFFFFF
-
-
-def _write_u32_pattern(gva, words, seed):
-    view = (ctypes.c_uint32 * words).from_address(gva)
-    for i in range(words):
-        view[i] = _pattern(i, seed)
-
-
-def _check_u32_pattern(gva, words, seed):
-    view = (ctypes.c_uint32 * words).from_address(gva)
-    bad = 0
-    for i in range(words):
-        if view[i] != _pattern(i, seed):
-            bad += 1
-    return bad
-
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--store", required=True,
@@ -99,12 +85,12 @@ def main():
     parser.add_argument("--dev", type=int, required=True,
                         help="NPU id this client runs on")
     parser.add_argument("--size", default=DEFAULT_SIZE,
-                        help=f"bytes per one-sided copy (K/M/G suffix, default {DEFAULT_SIZE})")
+                        help=f"bytes per one-sided copy, 4-byte aligned (K/M/G suffix, "
+                             f"default {DEFAULT_SIZE})")
     parser.add_argument("--replays", type=int, default=DEFAULT_REPLAYS,
                         help=f"graph replays after capture (default {DEFAULT_REPLAYS})")
     parser.add_argument("--block-size", default=DEFAULT_BLOCK_SIZE,
-                        help=f"DRAM slot bytes committed on each side, must be >= 2 * size: "
-                             f"slot layout is [pattern | verify] "
+                        help=f"DRAM slot bytes committed on each side, must be >= size "
                              f"(K/M/G suffix, default {DEFAULT_BLOCK_SIZE})")
     parser.add_argument("--max-pool-size", default=DEFAULT_MAX_POOL_SIZE,
                         help=f"pool DRAM window declared to the FAR placement master, must be GB "
@@ -113,6 +99,9 @@ def main():
                         help=f"declared world capacity (default {DEFAULT_WORLD})")
     parser.add_argument("--rpc-port-base", type=int, default=RPC_PORT_BASE,
                         help=f"control rpc port base (default {RPC_PORT_BASE}); must match the daemon's value")
+    parser.add_argument("--enable-56bits-gva", action="store_true",
+                        help="create the pool with 56-bit GVA (GVA window above 2^55; slot GVA "
+                             "addresses stay device-copy endpoints only, never CPU pointers)")
     parser.add_argument("--run-dir", default=None, help="client log dir (default ./log)")
     args = parser.parse_args()
 
@@ -123,14 +112,16 @@ def main():
     _term_fd = os.dup(1)
     os.dup2(log.fileno(), 1)
     os.dup2(log.fileno(), 2)
-    _log(f"[client] run dir: {run_dir}, store: {args.store}, world: {args.world}, dev: {args.dev}")
+    _log(f"[client] run dir: {run_dir}, store: {args.store}, world: {args.world}, dev: {args.dev}, "
+         f"56bits_gva: {args.enable_56bits_gva}")
 
     size = _parse_size(args.size)
     block = _parse_size(args.block_size)
     max_pool = _parse_size(args.max_pool_size)
-    if 2 * size > block:
-        raise RuntimeError(f"--block-size ({block}) must be >= 2 * size ({2 * size}): "
-                           f"slot layout is [pattern | verify]")
+    if size % 4 != 0:
+        raise RuntimeError(f"--size ({size}) must be 4-byte aligned (int32 verify pattern)")
+    if size > block:
+        raise RuntimeError(f"--size ({size}) exceeds --block-size ({block})")
     if block > max_pool:
         raise RuntimeError(f"--block-size ({block}) exceeds --max-pool-size ({max_pool})")
     if max_pool % GIB != 0:
@@ -160,8 +151,10 @@ def main():
         # device-scheduled pool on a DRAM window: both sides commit their slot below.
         # max_hbm_size is GB aligned and hosts ONLY the fixed device meta window
         # (rank/QP/MR context); the copy slots live in the DRAM window
-        handle = ralloc.create(id=0, max_dram_size=max_pool, max_hbm_size=META_HBM_WINDOW, data_op_type=DATA_OP)
-        _log(f"[client rank {rank}] device-scheduled pool created (DEVICE_RDMA | DEVICE_SCHEDULE)")
+        handle = ralloc.create(id=0, max_dram_size=max_pool, max_hbm_size=META_HBM_WINDOW,
+                               data_op_type=DATA_OP, enable_56bits_gva=args.enable_56bits_gva)
+        _log(f"[client rank {rank}] device-scheduled pool created (DEVICE_RDMA | DEVICE_SCHEDULE, "
+             f"56bits_gva={args.enable_56bits_gva})")
 
         ret, info = handle.extend_local_mem(MEM_TYPE, block)
         assert ret == 0 and info.get("gva"), f"extend_local_mem failed: {ret} {info}"
@@ -183,25 +176,32 @@ def main():
         _log(f"[client rank {rank}] remote block from FAR rank {far_rank} (gva=0x{far_gva:x}, npu {dev}), "
              f"local gva=0x{local_gva:x}")
 
-        # slot layout: [0, size) pattern | [size, 2*size) verify
+        # registered tensors carry the pattern in and the verification out: the pool-slot
+        # GVA addresses below are device-copy endpoints only, never CPU pointers
         words = size // 4
         seed = rank + 1
-        _write_u32_pattern(local_gva, words, seed)
-        ctypes.memset(local_gva + size, 0, size)
+        src = torch.arange(words, dtype=torch.int32, device="npu") * 7 + seed
+        dst = torch.zeros(words, dtype=torch.int32, device="npu")
+        src_addr, dst_addr = src.data_ptr(), dst.data_ptr()
+        assert src_addr != 0 and dst_addr != 0, "tensor allocation failed"
+        torch.npu.synchronize()
+        assert handle.register(src_addr, size) == 0, "register(src tensor) failed"
+        assert handle.register(dst_addr, size) == 0, "register(dst tensor) failed"
+        _log(f"[client] pattern tensors registered: {size} bytes each (seed {seed})")
 
-        # warmup round-trip on a side stream, OUTSIDE any graph: the first device_copy
-        # dlopens and loads the kernel library, which is illegal inside capture
+        # warmup on a side stream, OUTSIDE any graph: the first device_copy dlopens and
+        # loads the kernel library, which is illegal inside capture. Seed the local slot
+        # from the tensor, push it to the FAR slot, read it back and compare on device.
         side = torch.npu.Stream()
         side.wait_stream(torch.npu.current_stream())
         with torch.npu.stream(side):
             stream_ptr = torch.npu.current_stream().npu_stream
+            assert handle.device_copy(src_addr, local_gva, size, stream_ptr) == 0, "seed write failed"
             assert handle.device_copy(local_gva, far_gva, size, stream_ptr) == 0, "warmup write failed"
-            assert handle.device_copy(far_gva, local_gva + size, size, stream_ptr) == 0, \
-                "warmup read failed"
+            assert handle.device_copy(far_gva, dst_addr, size, stream_ptr) == 0, "warmup read failed"
         torch.npu.synchronize()
-        bad = _check_u32_pattern(local_gva + size, words, seed)
-        assert bad == 0, f"warmup round-trip mismatch: {bad}/{words} words"
-        _log("[client] warmup round-trip OK (kernel library loaded, meta window reachable)")
+        assert torch.equal(dst, src), "warmup round-trip mismatch (tensor -> local -> FAR -> tensor2)"
+        _log("[client] warmup round-trip OK (kernel library loaded, both pool slots reachable)")
 
         # capture the whole copy job into an NPU graph: one-sided WRITE + quiet
         graph = torch.npu.NPUGraph()
@@ -224,18 +224,20 @@ def main():
         _log(f"[client] {args.replays} replays done: {moved / GIB:.2f} GiB in {t_replay * 1e3:.2f} ms, "
              f"{moved / t_replay / GIB:.2f} GB/s device-scheduled")
 
-        # verify on the default stream: READ the far slot back into the verify area
-        assert handle.device_copy(far_gva, local_gva + size, size, 0) == 0, "verify read failed"
+        # verify on the default stream: READ the far slot back into the second tensor
+        dst.zero_()
+        assert handle.device_copy(far_gva, dst_addr, size, 0) == 0, "verify read failed"
         torch.npu.synchronize()
-        bad = _check_u32_pattern(local_gva + size, words, seed)
-        assert bad == 0, f"verify failed: {bad}/{words} words mismatch after {args.replays} replays"
-        _log(f"[client] verify OK: far rank {far_rank} slot matches the pattern "
-             f"({words} words, seed {seed})")
+        assert torch.equal(dst, src), f"verify failed: tensor2 != pattern after {args.replays} replays"
+        _log(f"[client] verify OK: FAR rank {far_rank} slot matches the pattern ({words} words, seed {seed})")
 
+        assert handle.unregister(src_addr) == 0, "unregister(src tensor) failed"
+        assert handle.unregister(dst_addr) == 0, "unregister(dst tensor) failed"
+        del src, dst
         handle.destroy()
         mf.get_and_clear_last_err_msg()
         assert mf.get_last_err_msg() == "", mf.get_last_err_msg()
-        _log(f"[client rank {rank}] remote block released, exiting")
+        _log(f"[client rank {rank}] tensors unregistered, remote block released, exiting")
     finally:
         if ralloc_inited:
             ralloc.uninitialize(0)

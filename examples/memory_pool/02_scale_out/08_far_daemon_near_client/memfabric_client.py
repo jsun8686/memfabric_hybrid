@@ -95,6 +95,9 @@ def main():
                         help=f"declared world capacity (default {DEFAULT_WORLD})")
     parser.add_argument("--rpc-port-base", type=int, default=RPC_PORT_BASE,
                         help=f"control rpc port base (default {RPC_PORT_BASE}); must match the daemon's value")
+    parser.add_argument("--enable-56bits-gva", action="store_true",
+                        help="create the pool with 56-bit GVA (GVA window above 2^55; slot GVA "
+                             "addresses stay device-copy endpoints only, never CPU pointers)")
     parser.add_argument("--run-dir", default=None, help="client log dir (default ./log)")
     args = parser.parse_args()
 
@@ -137,7 +140,8 @@ def main():
         ralloc_inited = True
         rank = ralloc.get_rank_id()
 
-        handle = ralloc.create(id=0, max_dram_size=max_pool_bytes, max_hbm_size=0, data_op_type=DATA_OP)
+        handle = ralloc.create(id=0, max_dram_size=max_pool_bytes, max_hbm_size=0, data_op_type=DATA_OP,
+                               enable_56bits_gva=args.enable_56bits_gva)
 
         deadline = time.time() + EXTEND_TIMEOUT_SEC
         while True:

@@ -51,6 +51,15 @@ NEAR 节点 A 调用 ralloc_create（纯对齐：建窗+join，零本地提交�
 mem_type 枚举镜像 bm 取值（HOST/DEVICE，见 §11）；双介质池两窗任选其一大于 0 即建对应窗，两窗全 0 拒绝；
 **SDMA 位 + DRAM 窗的组合受 GVA_V4 门槛约束**（见 §11.7），device 形态池用 HBM-only 窗。
 
+**56-bit GVA 契约**（`enable_56bits_gva`，`(maxDram+maxHbm)*world > 32TB` 时强制开启，smem_ralloc.cpp:227-239）：
+
+- **布局不变式**：GVA 窗口恒为"统一连续基址 + rank×maxSize 偏移"的 span=world×maxSize 整窗；56-bit 仅改变两件事——GVA 基址由 FindFreeSpace 在 [64P,128P) 内选取（va_manager.cpp:261-282），且 **GVA 与 HVA/DVA 解耦**（conn:476/:493-497、vmm:269-272）：非 56-bit 下 GVA==HVA（mmap 窗口 VA，CPU 可直访），56-bit 下 GVA 为纯设备侧句柄，本 rank CPU 映射是独立的 LVA 窗。`GetRankIdByGva`/`GetMemPtrByRank` 的窗口算术在两种模式下均成立。
+- **端点契约**：`get_mem_ptr_by_rank` 返回的 GVA **仅用于构造 device_copy/copy_data 端点，禁止 CPU 解引用**（56-bit 下必然段错误；非 56-bit 下可用是 GVA==HVA 的巧合，不作 API 承诺）。CPU 侧数据进出走注册用户内存端点（`register` + user buffer，例 10/11/13 范式）。
+- **设备面无关性**：内核查表以 GVA 为匹配键、SGE/远端地址走 regAddress(IOVA)，DRAM 池 NIC 永不见 56-bit GVA（HBM 56-bit 池 regAddress==addr==GVA ≥2^56 会被填入 SGE，hns RoCE VA 位宽未证——留 910C 实测裁决）。
+- **基址确定性约定**：56-bit 基址为各进程独立 FindFreeSpace 首中——"每进程 GVA 预留序列一致"（当前单池/进程成立）前提下全集群基址一致；多池/多实体且创建顺序不一致的场景需引入跨进程基址协商（远期，当前多池搁置）。
+- **决策记录**：不暴露本地 LVA 访问器（`get_local_mem_lva` 曾提案后否决）——池槽定位为纯设备端点，CPU 消费走注册用户内存中转；若未来出现"零拷贝 CPU 消费本地槽"的真实负载再立项。
+- **验证现状**：910B（conn 段）= ralloc 层逻辑验证 + conn 56-bit 分支首验（该分支零执行历史，巨页不足时会走 halMemAlloc 回退——V3 下符号必败，宿主需保障大页）；910C（vmm 段）= 目标形态，待环境验证。
+
 rankId：**三角色统一由 init 分配**（`autoRanking` 从 store 原子取号 / config 显式，
 参考 smem_bm_entry_manager.cpp:64-67 / :115-133），组位图去重兜底（smem_net_group_engine.cpp:1291-1295）。
 

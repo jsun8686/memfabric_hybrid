@@ -44,4 +44,5 @@ etcd lease 5s 过期 → 幸存者健康检查发现 → 重选举（`Firing lea
 ```bash
 python3 06_ha_master_switchover.py                       # etcd://127.0.0.1:2379
 python3 06_ha_master_switchover.py etcd://<ip>:2379
+python3 06_ha_master_switchover.py etcd://<ip>:2379 --enable-56bits-gva   # 56-bit GVA 建池（near 子进程）
 ```
