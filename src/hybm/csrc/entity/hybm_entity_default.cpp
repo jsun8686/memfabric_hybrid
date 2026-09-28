@@ -335,6 +335,21 @@ void *MemEntityDefault::GetSliceVa(hybm_mem_slice_t slice)
     return nullptr;
 }
 
+void *MemEntityDefault::GetSliceGva(hybm_mem_slice_t slice)
+{
+    /* the global (device-endpoint) address of the slice: with 56-bit GVA enabled this differs
+     * from GetSliceVa's local-access address (vAddress_), which trans still relies on */
+    std::shared_ptr<MemSlice> memSlice;
+    if (hbmSegment_ != nullptr && (memSlice = hbmSegment_->GetMemSlice(slice, true)) != nullptr) {
+        return reinterpret_cast<void *>(memSlice->gva_);
+    } else if (dramSegment_ != nullptr && (memSlice = dramSegment_->GetMemSlice(slice)) != nullptr) {
+        return reinterpret_cast<void *>(memSlice->gva_);
+    }
+
+    BM_LOG_ERROR("failed to get slice gva, invalid slice:" << slice);
+    return nullptr;
+}
+
 // entityExchangeInfo = entityInfo + segmentInfo
 int32_t MemEntityDefault::ExportEntityExchangeInfo(ExchangeInfoWriter &desc, uint32_t flags) noexcept
 {

@@ -96,6 +96,16 @@ int32_t hybm_free_local_memory(hybm_entity_t e, hybm_mem_slice_t slice, uint32_t
 void* hybm_get_slice_va(hybm_entity_t e, hybm_mem_slice_t slice);
 
 /**
+ * @brief get the global (device-endpoint) virtual address from slice. With 56-bit GVA
+ *        enabled this differs from hybm_get_slice_va's local-access address.
+ *
+ * @param e                [in] entity created by hybm_create_entity
+ * @param slice             [in] mf slice ptr
+ * @return non-null pointer to the global virtual address of the slice or fail
+ */
+void* hybm_get_slice_gva(hybm_entity_t e, hybm_mem_slice_t slice);
+
+/**
  * @brief Query allocated va ranges within [gvaBegin, gvaEnd), ranges of all entities of this
  * process are visible, sorted by gva ascending. Ranges contributed by remote ranks are visible
  * after the local side has imported them.

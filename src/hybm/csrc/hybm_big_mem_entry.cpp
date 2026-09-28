@@ -81,6 +81,14 @@ HYBM_API void *hybm_get_slice_va(hybm_entity_t e, hybm_mem_slice_t slice)
     return entity->GetSliceVa(slice);
 }
 
+HYBM_API void *hybm_get_slice_gva(hybm_entity_t e, hybm_mem_slice_t slice)
+{
+    BM_ASSERT_RETURN(e != nullptr, nullptr);
+    auto entity = MemEntityFactory::Instance().FindEngineByPtr(e);
+    BM_ASSERT_RETURN(entity != nullptr, nullptr);
+    return entity->GetSliceGva(slice);
+}
+
 HYBM_API int32_t hybm_query_alloc_ranges(hybm_entity_t e, uint64_t gvaBegin, uint64_t gvaEnd,
                                          hybm_va_range ranges[], uint32_t *inOutCount)
 {
