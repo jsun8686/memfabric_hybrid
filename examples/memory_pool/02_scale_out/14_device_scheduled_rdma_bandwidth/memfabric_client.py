@@ -16,16 +16,16 @@ dlopens the kernel library, which is illegal inside capture), then time one WRIT
 and one READ phase over the SAME slot-rotated copy sequence (blocks = batch-size / size
 copies at offsets (i % slots) * size):
 
-  default (--graph):     capture ONE full NPUGraph per direction holding the whole rotated
+  default (direct):      enqueue device_copy directly x blocks, one synchronize at the
+                         end; the same-sequence baseline
+  --graph:               capture ONE full NPUGraph per direction holding the whole rotated
                          sequence (single-copy kernels), replay it --replays times — the
                          real-world shape of a complete graph embedding the communication
-  --batch (graph on):    capture the single device_copy_batch submit instead (the whole
-                         matrix, internally chunked into 16-segment kernel launches with
-                         one quiet per peer) and replay it --replays times — zero host
-                         work per replay AND amortized completion
-  --no-graph:            enqueue device_copy directly x blocks, one synchronize at the
-                         end; the same-sequence baseline
-  --batch --no-graph:    one direct device_copy_batch submit, one synchronize at the end
+  --batch:               one direct device_copy_batch submit (the whole matrix, internally
+                         chunked into 16-segment kernel launches with one quiet per peer)
+  --graph --batch:       capture the single device_copy_batch submit and replay it
+                         --replays times — zero host work per replay AND amortized
+                         completion
 
 Output lines match 08's format so runs are directly comparable.
 """
@@ -121,17 +121,18 @@ def main():
     parser.add_argument("--max-pool-size", default=DEFAULT_MAX_POOL_SIZE,
                         help=f"pool DRAM window declared to the FAR placement master, must be GB "
                              f"aligned (K/M/G suffix, default {DEFAULT_MAX_POOL_SIZE})")
-    parser.add_argument("--no-graph", action="store_true",
-                        help="time direct device_copy enqueues (rotating far offsets, one "
-                             "synchronize at the end) instead of NPUGraph capture + replay")
+    parser.add_argument("--graph", action="store_true",
+                        help="capture the timed phase into an NPUGraph and replay it --replays "
+                             "times instead of direct enqueues; combine with --batch to capture "
+                             "the batch submit (graph-batch)")
     parser.add_argument("--replays", type=int, default=DEFAULT_REPLAYS,
                         help=f"full-graph replays per timed phase in graph mode; timed volume "
                              f"= replays x batch-size per direction (default {DEFAULT_REPLAYS})")
     parser.add_argument("--batch", action="store_true",
                         help="time device_copy_batch submits (whole rotated matrix in one call; "
-                             "16-segment kernel launches, one quiet per distinct peer); with the "
-                             "default graph mode the submit is captured and replayed (graph-batch), "
-                             "with --no-graph it is one direct submit")
+                             "16-segment kernel launches, one quiet per distinct peer); alone it is "
+                             "one direct submit, combined with --graph the submit is captured and "
+                             "replayed (graph-batch)")
     parser.add_argument("--world", type=int, default=DEFAULT_WORLD,
                         help=f"declared world capacity (default {DEFAULT_WORLD})")
     parser.add_argument("--rpc-port-base", type=int, default=RPC_PORT_BASE,
@@ -149,10 +150,14 @@ def main():
     _term_fd = os.dup(1)
     os.dup2(log.fileno(), 1)
     os.dup2(log.fileno(), 2)
-    if args.batch:
-        mode = "batch" if args.no_graph else "graph-batch"
+    if args.graph and args.batch:
+        mode = "graph-batch"
+    elif args.graph:
+        mode = "graph"
+    elif args.batch:
+        mode = "batch"
     else:
-        mode = "direct" if args.no_graph else "graph"
+        mode = "direct"
     _log(f"[client] run dir: {run_dir}, store: {args.store}, world: {args.world}, dev: {args.dev}, "
          f"56bits_gva: {args.enable_56bits_gva}, timed mode: {mode}")
 
@@ -249,7 +254,7 @@ def main():
             one_way = blocks * size
             dst_offs = [gva + (i % slots) * size for i in range(blocks)]
 
-            if args.no_graph and not args.batch:
+            if mode == "direct":
                 dst.zero_()
                 torch.npu.synchronize()
                 t0 = time.perf_counter()
@@ -265,7 +270,7 @@ def main():
                 phase = f"{blocks} blocks (direct)"
                 moved = one_way
                 timed_blocks = blocks
-            elif args.no_graph and args.batch:
+            elif mode == "batch":
                 dst.zero_()
                 torch.npu.synchronize()
                 t0 = time.perf_counter()
@@ -281,7 +286,7 @@ def main():
                 phase = f"{blocks} blocks/1 batch (batch)"
                 moved = one_way
                 timed_blocks = blocks
-            elif args.batch:
+            elif mode == "graph-batch":
                 torch.npu.synchronize()
                 wgraph = torch.npu.NPUGraph()
                 with torch.npu.stream(side):

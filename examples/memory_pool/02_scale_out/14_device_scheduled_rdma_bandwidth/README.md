@@ -12,16 +12,17 @@
   WRITE 计时 → READ 计时 → 回读校验，输出行与 08 同格式，结果可直接对照；
 - 计时模式可开关，四种模式跑**同一槽轮转拷贝序列**（同地址、同字节数），两两对照分别量化
   图捕获、批量接口及组合的收益：
-  - 默认 **graph**：每方向捕获**一张完整图**——图内含整个轮转序列（blocks 份单拷贝内核，默认
-    `batch-size = real-pool-size` 时恰好全槽每个地址各写一遍），重放 `--replays` 次；
+  - 默认 **direct**：同序列循环直发 `device_copy`（纯入队不同步），末次
+    synchronize 计入——基线；
+  - `--graph` **graph**：每方向捕获**一张完整图**——图内含整个轮转序列（blocks 份单拷贝内核，
+    默认 `batch-size = real-pool-size` 时恰好全槽每个地址各写一遍），重放 `--replays` 次；
     即真实场景形态（完整图中内嵌整段槽轮转通信），重放期间 host 零参与；
-  - `--batch` **graph-batch**：捕获目标改为**一次 `device_copy_batch` 提交**（一个矩阵，C 层
-    按 16 段/launch 分块、每 distinct peer 仅 1 次 quiet）——重放零 host 参与**且收敛摊薄**；
-    与 graph 同量对照即 quiet 摊薄收益；
-  - `--no-graph` **direct**：同序列循环直发 `device_copy`（纯入队不同步），末次
-    synchronize 计入——同语义基线；
-  - `--batch --no-graph` **batch**：同序列**一次 `device_copy_batch` 直发提交**——批量直发
-    基线，与 direct 对照即批量接口对小消息固定开销（launch + quiet）的摊薄收益。
+  - `--batch` **batch**：同序列**一次 `device_copy_batch` 直发提交**（C 层按 16 段/launch
+    分块、每 distinct peer 仅 1 次 quiet）——与 direct 对照即批量接口对小消息固定开销
+    （launch + quiet）的摊薄收益；
+  - `--graph --batch` **graph-batch**：捕获**一次 `device_copy_batch` 提交**入图并重放——
+    重放零 host 参与**且收敛摊薄**；与 graph 同量对照即 quiet 摊薄收益，与 batch 对照即
+    直发提交开销。
 
 ## 拓扑与角色
 
@@ -55,11 +56,13 @@ FAR 节点（常驻守护，复用 08）                NEAR 节点（客户端�
 # 1) FAR 节点启动守护（与 08 相同），等到 "... memory contributors serving (...)"
 python3 memfabric_daemon.py --store tcp://<far_ip>:8588 --devs 0,1
 
-# 2) NEAR 节点跑客户端（graph 模式，默认）
+# 2) NEAR 节点跑客户端（默认 direct 直发计时）
 python3 memfabric_client.py --store tcp://<far_ip>:8588 --dev 1
 
-#    或 direct 模式（直发计时，量化图捕获收益）
-python3 memfabric_client.py --store tcp://<far_ip>:8588 --dev 1 --no-graph
+#    图模式（捕获重放）/ 批量模式 / 组合模式
+python3 memfabric_client.py --store tcp://<far_ip>:8588 --dev 1 --graph
+python3 memfabric_client.py --store tcp://<far_ip>:8588 --dev 1 --batch
+python3 memfabric_client.py --store tcp://<far_ip>:8588 --dev 1 --graph --batch
 
 # 3) 停止守护
 kill -TERM <daemon_pid>
@@ -89,9 +92,9 @@ kill -TERM <daemon_pid>
 | `--batch-size` | 64M | 每粒度每方向单向拷贝总量，blocks = batch-size / 粒度（K/M/G 后缀） |
 | `--real-pool-size` | 64M | 从 FAR 池取的远端槽字节数（须覆盖最大粒度且 ≤ `--max-pool-size`） |
 | `--max-pool-size` | 4G | 池 DRAM 窗口（`ralloc.create` 的 `max_dram_size`，**必须 GB 对齐**） |
-| `--no-graph` | 关 | 计时用直发 `device_copy`（轮转偏移 + 末次同步），不捕获 NPUGraph |
-| `--replays` | 4 | graph 模式每计时段的完整图重放次数（计时总量 = replays × batch-size 每方向） |
-| `--batch` | 关 | 计时用 `device_copy_batch`（C 层 16 段/launch 分块、每 peer 一次 quiet）：配默认 graph＝捕获提交并重放（graph-batch），配 `--no-graph`＝一次直发（batch） |
+| `--graph` | 关 | 计时段捕获为 NPUGraph 并重放 `--replays` 次（默认直发不捕获） |
+| `--replays` | 4 | graph/graph-batch 模式每计时段的完整图重放次数（计时总量 = replays × batch-size 每方向） |
+| `--batch` | 关 | 计时用 `device_copy_batch`（C 层 16 段/launch 分块、每 peer 一次 quiet）：单用＝一次直发（batch），配 `--graph`＝捕获提交并重放（graph-batch） |
 | `--world` | 512 | 同守护 |
 | `--rpc-port-base` | 11100 | 同守护 |
 | `--enable-56bits-gva` | 关 | 56-bit GVA 建池（GVA 窗位于 2^55 以上，槽地址仅作设备端点） |
