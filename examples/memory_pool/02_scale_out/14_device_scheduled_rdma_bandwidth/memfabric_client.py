@@ -13,11 +13,15 @@ the legs 09's warmup proved.
 
 Per io-size: register src/dst tensors, warm up OUTSIDE any graph (the first device_copy
 dlopens the kernel library, which is illegal inside capture), then time one WRITE phase
-and one READ phase of blocks = batch-size / size one-sided copies each:
+and one READ phase over the SAME slot-rotated copy sequence (blocks = batch-size / size
+copies at offsets (i % slots) * size):
 
-  default (--graph):  capture a 1-copy NPUGraph per direction, replay x blocks
-  --no-graph:         enqueue device_copy directly x blocks (rotating far offsets),
-                      one synchronize at the end
+  default (--graph):  capture ONE full NPUGraph per direction holding the whole rotated
+                      sequence, replay it --replays times — the real-world shape of a
+                      complete graph embedding the slot-rotated communication pattern
+  --no-graph:         enqueue device_copy directly x blocks, one synchronize at the end;
+                      the same-sequence baseline, so the graph-vs-direct delta is exactly
+                      the per-enqueue host overhead
 
 Output lines match 08's format so runs are directly comparable.
 """
@@ -36,6 +40,7 @@ NIC_PORT_BASE = 10005        # data-plane nic port base (set_nic); NOT the contr
 RPC_PORT_BASE = 11100        # control rpc port = base + rankId (smem_ralloc_def.h default)
 DEFAULT_SIZES = "1M,2M,4M,8M"
 DEFAULT_BATCH_SIZE = "64M"       # one-way copy volume per granularity per direction
+DEFAULT_REPLAYS = 4              # graph replays per timed phase (graph mode only)
 DEFAULT_REAL_POOL_SIZE = "64M"   # FAR slot bytes (must cover the largest granularity)
 DEFAULT_MAX_POOL_SIZE = "4G"     # pool DRAM window declared to the FAR placement master
 META_HBM_WINDOW = 1 << 30    # minimal GB-aligned hbm window: hosts the fixed device meta window only
@@ -115,6 +120,9 @@ def main():
     parser.add_argument("--no-graph", action="store_true",
                         help="time direct device_copy enqueues (rotating far offsets, one "
                              "synchronize at the end) instead of NPUGraph capture + replay")
+    parser.add_argument("--replays", type=int, default=DEFAULT_REPLAYS,
+                        help=f"full-graph replays per timed phase in graph mode; timed volume "
+                             f"= replays x batch-size per direction (default {DEFAULT_REPLAYS})")
     parser.add_argument("--world", type=int, default=DEFAULT_WORLD,
                         help=f"declared world capacity (default {DEFAULT_WORLD})")
     parser.add_argument("--rpc-port-base", type=int, default=RPC_PORT_BASE,
@@ -151,6 +159,8 @@ def main():
         raise RuntimeError(f"--real-pool-size ({remote_bytes}) exceeds --max-pool-size ({max_pool_bytes})")
     if max_pool_bytes % GIB != 0:
         raise RuntimeError(f"--max-pool-size ({max_pool_bytes}) must be GB aligned (VMM segment rule)")
+    if args.replays < 1:
+        raise RuntimeError(f"--replays ({args.replays}) must be >= 1")
 
     _wait_tcp(args.store, 30)
     dev = args.dev
@@ -240,41 +250,49 @@ def main():
                     assert handle.device_copy(off, dst_addr, size, 0) == 0, "direct G2L failed"
                 torch.npu.synchronize()
                 tr = time.perf_counter() - t0
+                phase = f"{blocks} blocks (direct)"
+                moved = one_way
+                timed_blocks = blocks
             else:
                 torch.npu.synchronize()
                 wgraph = torch.npu.NPUGraph()
                 with torch.npu.stream(side):
+                    stream_ptr = torch.npu.current_stream().npu_stream
                     wgraph.capture_begin()
-                    assert handle.device_copy(src_addr, gva, size,
-                                              torch.npu.current_stream().npu_stream) == 0, \
-                        "captured write submit failed"
+                    for off in dst_offs:
+                        assert handle.device_copy(src_addr, off, size, stream_ptr) == 0, \
+                            "captured write submit failed"
                     wgraph.capture_end()
                 dst.zero_()
                 torch.npu.synchronize()
                 rgraph = torch.npu.NPUGraph()
                 with torch.npu.stream(side):
+                    stream_ptr = torch.npu.current_stream().npu_stream
                     rgraph.capture_begin()
-                    assert handle.device_copy(gva, dst_addr, size,
-                                              torch.npu.current_stream().npu_stream) == 0, \
-                        "captured read submit failed"
+                    for off in dst_offs:
+                        assert handle.device_copy(off, dst_addr, size, stream_ptr) == 0, \
+                            "captured read submit failed"
                     rgraph.capture_end()
                 torch.npu.synchronize()
                 t0 = time.perf_counter()
-                for _ in range(blocks):
+                for _ in range(args.replays):
                     wgraph.replay()
                 torch.npu.synchronize()
                 tw = time.perf_counter() - t0
                 t0 = time.perf_counter()
-                for _ in range(blocks):
+                for _ in range(args.replays):
                     rgraph.replay()
                 torch.npu.synchronize()
                 tr = time.perf_counter() - t0
                 del wgraph, rgraph
+                phase = f"{blocks} blocks/graph x {args.replays} replays (graph)"
+                moved = args.replays * one_way
+                timed_blocks = args.replays * blocks
 
             assert torch.equal(dst, src), f"round-trip mismatch at size {size}"
-            _log(f"[client] size {size}: {blocks} blocks ({mode}), "
-                 f"write {one_way / tw / GIB:.2f} GB/s ({tw / blocks * 1e6:.2f} us/block), "
-                 f"read {one_way / tr / GIB:.2f} GB/s ({tr / blocks * 1e6:.2f} us/block) [round-trip OK]")
+            _log(f"[client] size {size}: {phase}, "
+                 f"write {moved / tw / GIB:.2f} GB/s ({tw / timed_blocks * 1e6:.2f} us/block), "
+                 f"read {moved / tr / GIB:.2f} GB/s ({tr / timed_blocks * 1e6:.2f} us/block) [round-trip OK]")
 
             assert handle.unregister(src_addr) == 0, "unregister src failed"
             assert handle.unregister(dst_addr) == 0, "unregister dst failed"

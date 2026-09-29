@@ -10,10 +10,12 @@
   即 09 warmup 已验证的 `USER ↔ PEER` 组合；
 - 每个粒度：图外 warmup（首次 `device_copy` 会 `dlopen` 内核库，捕获中非法）→
   WRITE 计时 → READ 计时 → 回读校验，输出行与 08 同格式，结果可直接对照；
-- 计时模式可开关，差值即图捕获收益：
-  - 默认 **graph**：每个方向捕获 1 拷贝 NPUGraph，重放 ×blocks，重放期间 host 零参与；
-  - `--no-graph` **direct**：循环直发 `device_copy`（FAR 槽内轮转偏移，纯入队不同步），
-    末次 synchronize 计入。
+- 计时模式可开关，两模式跑**同一槽轮转拷贝序列**（同地址、同字节数），差值即图捕获收益：
+  - 默认 **graph**：每方向捕获**一张完整图**——图内含整个轮转序列（blocks 份拷贝，默认
+    `batch-size = real-pool-size` 时恰好全槽每个地址各写一遍），重放 `--replays` 次；
+    即真实场景形态（完整图中内嵌整段槽轮转通信），重放期间 host 零参与；
+  - `--no-graph` **direct**：同序列循环直发 `device_copy`（纯入队不同步），末次
+    synchronize 计入——同语义基线。
 
 ## 拓扑与角色
 
@@ -22,7 +24,7 @@ FAR 节点（常驻守护，复用 08）                NEAR 节点（客户端�
 ┌────────────────────────────┐           ┌─────────────────────────────────────┐
 │ contributor 贡献 DRAM slot │           │ 注册 HBM 张量 src/dst（本地端点）    │
 │ （executor 自动以          │◄──────────│ device_copy：直发或 NPUGraph 重放    │
-│  AI_CORE_INITIATE 加入池） │ RDMA WRITE │   ├─ graph: 捕获 1 次 → 重放 K 次   │
+│  AI_CORE_INITIATE 加入池） │ RDMA WRITE │   ├─ graph: 整段轮转序列入图→重放K│
 │                            │  (AICore   │   └─ direct: 直发 K 次 + 末次同步  │
 │                            │   自发)    │ 每粒度 write/read 计时 + 回读校验   │
 └────────────────────────────┘           └─────────────────────────────────────┘
@@ -82,6 +84,7 @@ kill -TERM <daemon_pid>
 | `--real-pool-size` | 64M | 从 FAR 池取的远端槽字节数（须覆盖最大粒度且 ≤ `--max-pool-size`） |
 | `--max-pool-size` | 4G | 池 DRAM 窗口（`ralloc.create` 的 `max_dram_size`，**必须 GB 对齐**） |
 | `--no-graph` | 关 | 计时用直发 `device_copy`（轮转偏移 + 末次同步），不捕获 NPUGraph |
+| `--replays` | 4 | graph 模式每计时段的完整图重放次数（计时总量 = replays × batch-size 每方向） |
 | `--world` | 512 | 同守护 |
 | `--rpc-port-base` | 11100 | 同守护 |
 | `--enable-56bits-gva` | 关 | 56-bit GVA 建池（GVA 窗位于 2^55 以上，槽地址仅作设备端点） |
@@ -104,16 +107,18 @@ kill -TERM <daemon_pid>
   1. `device-scheduled pool created (DEVICE_RDMA | DEVICE_SCHEDULE, 56bits_gva=...)`
   2. `remote block from FAR rank <R> (gva=0x...)`
   3. 每个粒度：`size <S>: warmup round-trip OK (registered HBM <-> FAR slot, seed <n>)`
-  4. 每个粒度：`size <S>: <B> blocks (graph|direct), write X GB/s (Y us/block),
-     read Z GB/s (W us/block) [round-trip OK]`
+  4. 每个粒度：`size <S>: <B> blocks (direct)` 或 `<B> blocks/graph x <R> replays (graph)`，
+     后随 `write X GB/s (Y us/block), read Z GB/s (W us/block) [round-trip OK]`
   5. `[client] all sizes OK, client finished cleanly`，exit 0
 - 守护侧正常常驻、停机 `all contributors stopped cleanly`
 
 ## 判读
-- graph 模式吞吐 = `blocks × size / 计时`（计时含末次 synchronize；图内固定槽偏移重放）；
-  direct 模式同公式，但偏移在 FAR 槽内轮转、host 逐次入队
-- 两模式差值 ≈ host 逐次入队开销，即图捕获收益；消息粒度越小收益越明显
-- 单边串行提交 + 卡内 quiet，吞吐参考受消息粒度与 QP 深度约束，本用例验证的是
+- 两模式跑**同一轮转地址序列、同字节总量**：graph 吞吐 = `replays × blocks × size / 计时`，
+  direct 吞吐 = `blocks × size / 计时`（计时均含末次 synchronize）
+- 两模式差值 = host 逐次入队开销的消除量（图捕获收益）；消息粒度越小收益应越明显
+- **若 graph 仍不优于 direct**：瓶颈不在 host 入队，而在随包设备内核的作业形态
+  （若每拷贝自带 quiet，图内仍逐拷贝串行收敛）——那是设备内核层面的下一个优化靶
+- 单边提交 + 卡内 quiet，吞吐参考受消息粒度与 QP 深度约束，本用例验证的是
   **可捕获性、正确性与开销结构**，不是极限带宽
 - verify 失败但 warmup 成功：优先怀疑计时期间链路/对端异常，`log/far_dev{N}.log`
   找 CQE 状态打印
