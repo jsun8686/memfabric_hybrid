@@ -30,7 +30,13 @@
 extern "C" {
 #endif
 
-#define SMEM_RALLOC_DEVICE_COPY_BATCH_SEG_MAX 16
+/* 64 segments x 32B = 2KB, comfortably inside the kernel launch parameter area
+ * (~4KB) — the table still travels by value, so no GM staging buffer is needed
+ * (a pointer-based table would race the host runahead: the ring would have to be
+ * reused before in-flight kernels finished reading it). Measured effect of the
+ * chunk size: each chunk kernel costs one launch + one quiet (per peer), so 64
+ * vs 16 cuts that amortized overhead 4x on large batches. */
+#define SMEM_RALLOC_DEVICE_COPY_BATCH_SEG_MAX 64
 
 struct smem_ralloc_device_batch_seg {
     uint64_t src;     /* device window GVA, local slot when write, peer slot when read */

@@ -17,7 +17,7 @@
   - `--graph` **graph**：每方向捕获**一张完整图**——图内含整个轮转序列（blocks 份单拷贝内核，
     默认 `batch-size = real-pool-size` 时恰好全槽每个地址各写一遍），重放 `--replays` 次；
     即真实场景形态（完整图中内嵌整段槽轮转通信），重放期间 host 零参与；
-  - `--batch` **batch**：同序列**一次 `device_copy_batch` 直发提交**（C 层按 16 段/launch
+  - `--batch` **batch**：同序列**一次 `device_copy_batch` 直发提交**（C 层按 64 段/launch
     分块、每 distinct peer 仅 1 次 quiet）——与 direct 对照即批量接口对小消息固定开销
     （launch + quiet）的摊薄收益；
   - `--graph --batch` **graph-batch**：捕获**一次 `device_copy_batch` 提交**入图并重放——
@@ -94,7 +94,7 @@ kill -TERM <daemon_pid>
 | `--max-pool-size` | 4G | 池 DRAM 窗口（`ralloc.create` 的 `max_dram_size`，**必须 GB 对齐**） |
 | `--graph` | 关 | 计时段捕获为 NPUGraph 并重放 `--replays` 次（默认直发不捕获） |
 | `--replays` | 4 | graph/graph-batch 模式每计时段的完整图重放次数（计时总量 = replays × batch-size 每方向） |
-| `--batch` | 关 | 计时用 `device_copy_batch`（C 层 16 段/launch 分块、每 peer 一次 quiet）：单用＝一次直发（batch），配 `--graph`＝捕获提交并重放（graph-batch） |
+| `--batch` | 关 | 计时用 `device_copy_batch`（C 层 64 段/launch 分块、每 peer 一次 quiet）：单用＝一次直发（batch），配 `--graph`＝捕获提交并重放（graph-batch） |
 | `--world` | 512 | 同守护 |
 | `--rpc-port-base` | 11100 | 同守护 |
 | `--enable-56bits-gva` | 关 | 56-bit GVA 建池（GVA 窗位于 2^55 以上，槽地址仅作设备端点） |
@@ -124,18 +124,28 @@ kill -TERM <daemon_pid>
 - 守护侧正常常驻、停机 `all contributors stopped cleanly`
 
 ## 判读
-- 两模式跑**同一轮转地址序列、同字节总量**：graph 吞吐 = `replays × blocks × size / 计时`，
-  direct 吞吐 = `blocks × size / 计时`（计时均含末次 synchronize）
-- **batch vs direct（同总量同序列）**：差值 = 批量接口摊薄 launch + quiet 的收益；小消息
-  （≤512K）预期最明显，大消息线速饱和后趋同。WQE 仍逐段构造（非 multi-SGE 单 WQE），
-  更高层级的批量优化在设备内核层
-- **graph-batch vs graph**：差值 = quiet 摊薄收益（单拷贝内核每拷贝自带 quiet，图内仍逐拷贝
-  串行收敛；batch 每 peer 仅 1 次）；**graph-batch vs batch**：差值 = 重放替代直发提交的
-  host 开销（本就很小，预期两者接近）。实测参考（2026-09-29）：batch 较 direct 每块恒省
-  ~6.5-7us；128K 处 batch 较 direct +81%、较 host 发起（ex08）+230%
-- 两模式差值 = host 逐次入队开销的消除量（图捕获收益）；消息粒度越小收益应越明显
-- **若 graph 仍不优于 direct**：瓶颈不在 host 入队，而在随包设备内核的作业形态
-  （若每拷贝自带 quiet，图内仍逐拷贝串行收敛）——那是设备内核层面的下一个优化靶
+- 四模式跑**同一轮转地址序列**：graph/graph-batch 吞吐 = `replays × blocks × size / 计时`，
+  direct/batch = `blocks × size / 计时`（计时均含末次 synchronize）
+- **实测矩阵（2026-09-29，write GB/s，SEG_MAX=16 时的数据）**：
+
+  | size | graph-batch | batch | graph | direct | ex08 host |
+  |---|---|---|---|---|---|
+  | 128K | **18.88** | 15.18 | 7.95 | 8.37 | 4.60 |
+  | 256K | **20.69** | 17.65 | 11.80 | 12.26 | 7.66 |
+  | 512K | **21.32** | 20.17 | 15.35 | 15.70 | 10.34 |
+  | 1M | **21.71** | 21.23 | 17.59 | 18.49 | 14.17 |
+  | 8M | 21.99 | **22.24** | 21.47 | 21.88 | 21.07 |
+
+- **128K 每块固定开销阶梯**（三层优化的量化因果链）：
+  `direct ~8.8us`（launch+quiet+WQE）→ `batch ~2.1us`（launch/quiet 摊薄 16 段）→
+  `graph-batch ~0.6us`（重放替代直发提交）——小消息累计 **4.1×**（host 4.60 → 18.88 GB/s）
+- **graph-batch vs graph** = quiet 摊薄（单拷贝内核自带 quiet，图内逐拷贝串行收敛；batch
+  每 distinct peer 仅 1 次），128K **+137%**；**graph-batch vs batch** = 重放替代直发提交
+  的 host launch 路径，128K **+24%**；**batch vs direct** = 每块恒省 ~6.5-7us（与消息
+  大小无关，即 launch+quiet 固定成本）
+- 大消息（≥4M）各模式均 ~88-89% 线速（200G），无优化空间；剩余小消息靶点 = 内核 WQE
+  逐段构造（~0.6us/块）：本版本已将 `SEG_MAX` 16→64（launch/quiet 再摊薄 4×），更深层
+  为单 WQE 多 SGE
 - 单边提交 + 卡内 quiet，吞吐参考受消息粒度与 QP 深度约束，本用例验证的是
   **可捕获性、正确性与开销结构**，不是极限带宽
 - verify 失败但 warmup 成功：优先怀疑计时期间链路/对端异常，`log/far_dev{N}.log`

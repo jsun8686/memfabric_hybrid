@@ -22,7 +22,7 @@ copies at offsets (i % slots) * size):
                          sequence (single-copy kernels), replay it --replays times — the
                          real-world shape of a complete graph embedding the communication
   --batch:               one direct device_copy_batch submit (the whole matrix, internally
-                         chunked into 16-segment kernel launches with one quiet per peer)
+                         chunked into 64-segment kernel launches with one quiet per peer)
   --graph --batch:       capture the single device_copy_batch submit and replay it
                          --replays times — zero host work per replay AND amortized
                          completion
@@ -130,7 +130,7 @@ def main():
                              f"= replays x batch-size per direction (default {DEFAULT_REPLAYS})")
     parser.add_argument("--batch", action="store_true",
                         help="time device_copy_batch submits (whole rotated matrix in one call; "
-                             "16-segment kernel launches, one quiet per distinct peer); alone it is "
+                             "64-segment kernel launches, one quiet per distinct peer); alone it is "
                              "one direct submit, combined with --graph the submit is captured and "
                              "replayed (graph-batch)")
     parser.add_argument("--world", type=int, default=DEFAULT_WORLD,
