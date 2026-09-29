@@ -403,230 +403,9 @@ SMEM_RALLOC_INLINE_AICORE uint32_t smem_ralloc_roce_poll_cq(uint32_t entityId, u
     return 0;
 }
 
-/* producer context for batched posting: the QP state resolved once by begin(), the head
- * index carried across fill() calls, and last-hit MR memos so a run of segments against the
- * same slot skips the table scans. At most one uncommitted ctx per QP at a time (single
- * producer); commit() publishes every fill() done since begin() in one doorbell. */
-struct SmemRallocPostCtx {
-    /* QP state, resolved once per begin() */
-    uint64_t memInfoTable;          /* MR slot array base (rdmaInfo->memPtr) */
-    __gm__ uint8_t *sqBaseAddr;     /* send queue ring base */
-    uint32_t wqeSize;
-    uint32_t depth;
-    uint32_t shift; /* owner bit period = depth (8192 today, keep in sync with trans layer) */
-    uint32_t qpIdx;
-    uint64_t headAddr; /* work queue head (producer index) address */
-    uint64_t tailAddr; /* work queue tail (consumer index) address */
-    uint64_t dbAddr;   /* doorbell address */
-    uint32_t wqn;
-    uint32_t sl;
-    uint32_t head; /* producer index, advanced by fill(), written back by commit() */
-    /* last-hit remote pool MR memo: slot rkey/regAddress under the owning rank */
-    uint32_t memoRemoteRank;
-    uint64_t memoRemoteAddr;
-    uint64_t memoRemoteSize; /* 0 = cold */
-    uint32_t memoRemoteRkey;
-    uint64_t memoRemoteRegAddr;
-    /* last-hit local MR memo: pool slot or user MR entry, both resolve to lkey/regAddress */
-    uint64_t memoLocalAddr;
-    uint64_t memoLocalSize; /* 0 = cold */
-    uint32_t memoLocalLkey;
-    uint64_t memoLocalRegAddr;
-};
-
-/**
- * @brief Resolve the destination QP and snapshot its producer index. Must be followed by one
- *        or more fill() and exactly one commit() before the WQEs become visible to the NIC.
- */
-SMEM_RALLOC_INLINE_AICORE void smem_ralloc_rdma_post_begin(uint32_t entityId, uint32_t destRankId,
-                                                           uint32_t qpIdx, struct SmemRallocPostCtx &ctx)
-{
-    __gm__ void *qpInfoVa = smem_ralloc_get_qp_info_address(entityId);
-    __gm__ SmemRallocRdmaInfo *rdmaInfo = (__gm__ SmemRallocRdmaInfo *)qpInfoVa;
-    uint32_t qpNum = rdmaInfo->qpNum;
-    __gm__ SmemRallocWQCtx *qpCtxEntry =
-        (__gm__ SmemRallocWQCtx *)(rdmaInfo->sqPtr + (destRankId * qpNum + qpIdx) * sizeof(SmemRallocWQCtx));
-    ctx.memInfoTable = rdmaInfo->memPtr;
-    ctx.sqBaseAddr = (__gm__ uint8_t *)qpCtxEntry->bufAddr;
-    ctx.wqeSize = qpCtxEntry->wqeSize;
-    ctx.depth = qpCtxEntry->depth;
-    ctx.shift = 13; /* owner bit period = depth (8192 today, keep in sync with trans layer) */
-    ctx.qpIdx = qpIdx;
-    ctx.headAddr = qpCtxEntry->headAddr;
-    ctx.tailAddr = qpCtxEntry->tailAddr;
-    ctx.dbAddr = qpCtxEntry->dbAddr;
-    ctx.wqn = qpCtxEntry->wqn;
-    ctx.sl = qpCtxEntry->sl;
-    smem_ralloc_cache_write_through((__gm__ uint8_t *)ctx.headAddr, 8);
-    ctx.head = *(__gm__ uint32_t *)ctx.headAddr;
-    AscendC::PipeBarrier<PIPE_ALL>();
-    ctx.memoRemoteRank = 0xFFFFFFFFU;
-    ctx.memoRemoteSize = 0;
-    ctx.memoLocalSize = 0;
-}
-
-/**
- * @brief Build one WQE+SGE at the current head slot and advance the in-context head. The WQE
- *        stays invisible to the NIC until commit() advances the announced PI. Polls the CQ
- *        first when the send queue is nearly full. MR memos skip the slot scans when the
- *        endpoint falls inside the last-hit region.
- */
-SMEM_RALLOC_INLINE_AICORE void smem_ralloc_rdma_post_fill(uint32_t entityId, struct SmemRallocPostCtx &ctx,
-                                                          __gm__ uint8_t *remoteAddr, __gm__ uint8_t *localAddr,
-                                                          uint32_t destRankId, SmemRallocOpcode opcode,
-                                                          uint64_t messageLen,
-                                                          AscendC::LocalTensor<uint64_t> ubLocal64,
-                                                          AscendC::LocalTensor<uint32_t> ubLocal32)
-{
-    /* poll CQ if the send queue is nearly full */
-    smem_ralloc_cache_write_through((__gm__ uint8_t *)ctx.tailAddr, 8);
-    if ((ctx.head + 10) % ctx.depth == (*(__gm__ uint32_t *)ctx.tailAddr) % ctx.depth) {
-        (void)smem_ralloc_roce_poll_cq(entityId, destRankId, ctx.qpIdx,
-                                       *(__gm__ uint32_t *)ctx.tailAddr + SMEM_RALLOC_NUM_CQE_PER_POLL_CQ,
-                                       ubLocal64, ubLocal32);
-    }
-
-    /* write WQE to HBM */
-    __gm__ uint8_t *wqeAddr = (__gm__ uint8_t *)(ctx.sqBaseAddr + ctx.wqeSize * (ctx.head % ctx.depth));
-    uint64_t ownBit = (ctx.head >> ctx.shift) & 0x1;
-    uint32_t byte4 = (uint32_t)opcode & 0x1F; /* [0:4] opcode */
-    byte4 |= ((~ownBit) << 7) & (1 << 7);     /* [7] owner bit */
-    byte4 |= 1 << 8;                          /* [8] IBV_SEND_SIGNALED */
-    *(__gm__ uint32_t *)(wqeAddr) = byte4;
-    *(__gm__ uint32_t *)(wqeAddr + 4) = messageLen;
-    *(__gm__ uint32_t *)(wqeAddr + 8) = 0;         /* immediate data, 0 */
-    *(__gm__ uint32_t *)(wqeAddr + 12) = 1 << 24;  /* [120:127] num_sge = 1 */
-    *(__gm__ uint32_t *)(wqeAddr + 16) = 0;        /* [128:151] start_sge_index = 0 */
-    uint32_t remoteRkey;
-    uint64_t remoteSlotAddr; /* GVA base of the covering MR slot */
-    uint64_t remoteSlotReg;  /* device-dma base of the covering MR slot */
-    if (ctx.memoRemoteRank == destRankId && ctx.memoRemoteSize != 0 &&
-        (uint64_t)remoteAddr >= ctx.memoRemoteAddr && (uint64_t)remoteAddr < ctx.memoRemoteAddr + ctx.memoRemoteSize) {
-        remoteRkey = ctx.memoRemoteRkey;
-        remoteSlotAddr = ctx.memoRemoteAddr;
-        remoteSlotReg = ctx.memoRemoteRegAddr;
-    } else {
-        __gm__ SmemRallocMemInfo *remoteMemInfo =
-            smem_ralloc_lookup_pool_mr(ctx.memInfoTable, destRankId, (uint64_t)remoteAddr);
-        if (remoteMemInfo == nullptr) {
-            /* remote endpoint outside every pool MR slot of that rank: report the miss for host-side
-             * diagnostics and skip the WQE */
-            smem_ralloc_report_user_mr_lookup_miss(entityId);
-            return;
-        }
-        ctx.memoRemoteRank = destRankId;
-        ctx.memoRemoteAddr = remoteMemInfo->addr;
-        ctx.memoRemoteSize = remoteMemInfo->size;
-        ctx.memoRemoteRkey = remoteMemInfo->rkey;
-        ctx.memoRemoteRegAddr = remoteMemInfo->regAddress;
-        remoteRkey = remoteMemInfo->rkey;
-        remoteSlotAddr = remoteMemInfo->addr;
-        remoteSlotReg = remoteMemInfo->regAddress;
-    }
-    *(__gm__ uint32_t *)(wqeAddr + 20) = remoteRkey; /* remote key */
-    /* the rkey covers the device-dma range the remote MR was registered under: translate the
-     * pool GVA into that range (identity for hbm pools where regAddress == addr) */
-    uint64_t remoteRegAddr =
-        (remoteSlotReg != 0) ? remoteSlotReg + ((uint64_t)remoteAddr - remoteSlotAddr) : (uint64_t)remoteAddr;
-    *(__gm__ uint64_t *)(wqeAddr + 24) = remoteRegAddr; /* remote VA */
-
-    /* write SGE to HBM */
-    __gm__ uint8_t *sgeAddr = wqeAddr + sizeof(SmemRallocWqeCtx);
-    *(__gm__ uint32_t *)(sgeAddr) = messageLen;
-    uint32_t localLkey;
-    uint64_t localRegAddr;
-    if (ctx.memoLocalSize != 0 && (uint64_t)localAddr >= ctx.memoLocalAddr &&
-        (uint64_t)localAddr < ctx.memoLocalAddr + ctx.memoLocalSize) {
-        /* memo hit (pool slot or user MR, both stored the same way): same translation under
-         * the memoized lkey and dma base */
-        localLkey = ctx.memoLocalLkey;
-        localRegAddr = (ctx.memoLocalRegAddr != 0)
-                           ? ctx.memoLocalRegAddr + ((uint64_t)localAddr - ctx.memoLocalAddr)
-                           : (uint64_t)localAddr;
-    } else {
-        __gm__ SmemRallocMemInfo *localMemInfo = smem_ralloc_lookup_pool_mr(
-            ctx.memInfoTable, smem_ralloc_get_global_rank(entityId), (uint64_t)localAddr);
-        if (localMemInfo != nullptr) {
-            /* endpoint inside one of this rank's pool MR slots */
-            localLkey = localMemInfo->lkey;
-            /* the lkey covers the device-dma range this block was registered under, not the GVA
-             * range: translate the pool GVA into that range (identity for hbm pools) */
-            localRegAddr = (localMemInfo->regAddress != 0)
-                               ? localMemInfo->regAddress + ((uint64_t)localAddr - localMemInfo->addr)
-                               : (uint64_t)localAddr;
-            ctx.memoLocalAddr = localMemInfo->addr;
-            ctx.memoLocalSize = localMemInfo->size;
-            ctx.memoLocalLkey = localMemInfo->lkey;
-            ctx.memoLocalRegAddr = localMemInfo->regAddress;
-        } else {
-            /* endpoint in a user-registered region (P1, NPU HBM only): same translation under the
-             * user MR's own lkey and dma base */
-            __gm__ SmemRallocUserMrEntry *userMr = smem_ralloc_lookup_local_mr(entityId, (uint64_t)localAddr);
-            if (userMr == nullptr) {
-                smem_ralloc_report_user_mr_lookup_miss(entityId);
-                return;
-            }
-            localLkey = userMr->lkey;
-            localRegAddr = (userMr->regAddress != 0)
-                               ? userMr->regAddress + ((uint64_t)localAddr - userMr->addr)
-                               : (uint64_t)localAddr;
-            ctx.memoLocalAddr = userMr->addr;
-            ctx.memoLocalSize = userMr->size;
-            ctx.memoLocalLkey = userMr->lkey;
-            ctx.memoLocalRegAddr = userMr->regAddress;
-        }
-    }
-    *(__gm__ uint32_t *)(sgeAddr + 4) = localLkey; /* local key */
-    *(__gm__ uint64_t *)(sgeAddr + 8) = localRegAddr;
-
-    /* WQE & SGE cache flush */
-    smem_ralloc_cache_write_through(wqeAddr, sizeof(SmemRallocWqeCtx) + sizeof(SmemRallocSegCtx));
-    AscendC::PipeBarrier<PIPE_ALL>();
-    ctx.head++;
-}
-
-/**
- * @brief Ring the SQ doorbell once with the final producer index and write the head back to
- *        GM. One commit publishes every fill() done since begin(): the NIC processes all
- *        WQEs below the announced PI (standard SQ doorbell semantics), WQ order keeps
- *        segment order.
- */
-SMEM_RALLOC_INLINE_AICORE void smem_ralloc_rdma_post_commit(struct SmemRallocPostCtx &ctx,
-                                                            AscendC::LocalTensor<uint64_t> ubLocal64,
-                                                            AscendC::LocalTensor<uint32_t> ubLocal32)
-{
-    /* ring SQ doorbell (HW mode today, set by the transport layer) */
-    uint64_t doorBellInfo = 0;
-    doorBellInfo |= ctx.wqn;                             /* [0:23] DB_TAG = qp num */
-    doorBellInfo |= 0 << 24;                             /* [24:27] DB_CMD = HNS_ROCE_V2_SQ_DB */
-    doorBellInfo |= ((uint64_t)ctx.head % 65536) << 32;  /* [32:47] DB_PI = sq head */
-    doorBellInfo |= (uint64_t)ctx.sl << 48;              /* [48:50] DB_SL */
-
-    __gm__ uint64_t *doorBellAddr = (__gm__ uint64_t *)ctx.dbAddr;
-    AscendC::PipeBarrier<PIPE_ALL>();
-
-    ubLocal64.SetValue(0, doorBellInfo);
-    AscendC::GlobalTensor<uint64_t> dbGlobalTensor;
-    dbGlobalTensor.SetGlobalBuffer(doorBellAddr);
-    AscendC::DataCopyExtParams copyParams{1, 1 * sizeof(uint64_t), 0, 0, 0};
-    AscendC::PipeBarrier<PIPE_ALL>();
-    AscendC::DataCopyPad(dbGlobalTensor, ubLocal64, copyParams);
-    AscendC::PipeBarrier<PIPE_ALL>();
-
-    /* update SQ head */
-    ubLocal32.SetValue(0, ctx.head);
-    AscendC::GlobalTensor<uint32_t> headGlobalTensor;
-    headGlobalTensor.SetGlobalBuffer((__gm__ uint32_t *)ctx.headAddr);
-    AscendC::DataCopyExtParams copyParamsHead{1, 1 * sizeof(uint32_t), 0, 0, 0};
-    AscendC::PipeBarrier<PIPE_ALL>();
-    AscendC::DataCopyPad(headGlobalTensor, ubLocal32, copyParamsHead);
-    AscendC::PipeBarrier<PIPE_ALL>();
-}
-
 /**
  * @brief Post one RDMA work request: build the WQE+SGE in the send queue, flush cache and
  *        ring the HW doorbell. Polls the CQ first when the send queue is nearly full.
- *        Single-WQE convenience path: begin + one fill + commit.
  *
  * @param entityId               [in] ralloc pool entity id
  * @param remoteAddr             [in] address in the remote rank pool block (GVA)
@@ -644,11 +423,119 @@ SMEM_RALLOC_INLINE_AICORE void smem_ralloc_rdma_post_send(uint32_t entityId, __g
                                                           uint64_t messageLen, AscendC::LocalTensor<uint64_t> ubLocal64,
                                                           AscendC::LocalTensor<uint32_t> ubLocal32)
 {
-    struct SmemRallocPostCtx ctx;
-    smem_ralloc_rdma_post_begin(entityId, destRankId, qpIdx, ctx);
-    smem_ralloc_rdma_post_fill(entityId, ctx, remoteAddr, localAddr, destRankId, opcode, messageLen, ubLocal64,
-                               ubLocal32);
-    smem_ralloc_rdma_post_commit(ctx, ubLocal64, ubLocal32);
+    __gm__ void *qpInfoVa = smem_ralloc_get_qp_info_address(entityId);
+    __gm__ SmemRallocRdmaInfo *rdmaInfo = (__gm__ SmemRallocRdmaInfo *)qpInfoVa;
+    uint32_t qpNum = rdmaInfo->qpNum;
+    __gm__ SmemRallocWQCtx *qpCtxEntry =
+        (__gm__ SmemRallocWQCtx *)(rdmaInfo->sqPtr + (destRankId * qpNum + qpIdx) * sizeof(SmemRallocWQCtx));
+    auto memInfoTable = rdmaInfo->memPtr;
+    auto sqBaseAddr = qpCtxEntry->bufAddr;
+    auto wqeSize = qpCtxEntry->wqeSize;
+    auto curHardwareHeadAddr = qpCtxEntry->headAddr;
+    smem_ralloc_cache_write_through((__gm__ uint8_t *)curHardwareHeadAddr, 8);
+    uint32_t curHead = *(__gm__ uint32_t *)(curHardwareHeadAddr);
+    auto curHardwareTailAddr = qpCtxEntry->tailAddr;
+    auto depth = qpCtxEntry->depth;
+    auto shift = 13; /* owner bit period = depth (8192 today, keep in sync with trans layer) */
+    AscendC::PipeBarrier<PIPE_ALL>();
+
+    /* poll CQ if the send queue is nearly full */
+    smem_ralloc_cache_write_through((__gm__ uint8_t *)curHardwareTailAddr, 8);
+    if ((curHead + 10) % depth == (*(__gm__ uint32_t *)(curHardwareTailAddr)) % depth) {
+        (void)smem_ralloc_roce_poll_cq(entityId, destRankId, qpIdx,
+                                       *(__gm__ uint32_t *)(curHardwareTailAddr) + SMEM_RALLOC_NUM_CQE_PER_POLL_CQ,
+                                       ubLocal64, ubLocal32);
+    }
+
+    /* write WQE to HBM */
+    __gm__ uint8_t *wqeAddr = (__gm__ uint8_t *)(sqBaseAddr + wqeSize * (curHead % depth));
+    uint64_t ownBit = (curHead >> shift) & 0x1;
+    uint32_t byte4 = (uint32_t)opcode & 0x1F; /* [0:4] opcode */
+    byte4 |= ((~ownBit) << 7) & (1 << 7);     /* [7] owner bit */
+    byte4 |= 1 << 8;                          /* [8] IBV_SEND_SIGNALED */
+    *(__gm__ uint32_t *)(wqeAddr) = byte4;
+    *(__gm__ uint32_t *)(wqeAddr + 4) = messageLen;
+    *(__gm__ uint32_t *)(wqeAddr + 8) = 0;         /* immediate data, 0 */
+    *(__gm__ uint32_t *)(wqeAddr + 12) = 1 << 24;  /* [120:127] num_sge = 1 */
+    *(__gm__ uint32_t *)(wqeAddr + 16) = 0;        /* [128:151] start_sge_index = 0 */
+    __gm__ SmemRallocMemInfo *remoteMemInfo =
+        smem_ralloc_lookup_pool_mr(memInfoTable, destRankId, (uint64_t)remoteAddr);
+    if (remoteMemInfo == nullptr) {
+        /* remote endpoint outside every pool MR slot of that rank: report the miss for host-side
+         * diagnostics and skip the WQE */
+        smem_ralloc_report_user_mr_lookup_miss(entityId);
+        return;
+    }
+    *(__gm__ uint32_t *)(wqeAddr + 20) = remoteMemInfo->rkey;  /* remote key */
+    /* the rkey covers the device-dma range the remote MR was registered under: translate the
+     * pool GVA into that range (identity for hbm pools where regAddress == addr) */
+    uint64_t remoteRegAddr = (remoteMemInfo->regAddress != 0)
+                                 ? remoteMemInfo->regAddress + ((uint64_t)remoteAddr - remoteMemInfo->addr)
+                                 : (uint64_t)remoteAddr;
+    *(__gm__ uint64_t *)(wqeAddr + 24) = remoteRegAddr; /* remote VA */
+
+    /* write SGE to HBM */
+    __gm__ uint8_t *sgeAddr = wqeAddr + sizeof(SmemRallocWqeCtx);
+    *(__gm__ uint32_t *)(sgeAddr) = messageLen;
+    __gm__ SmemRallocMemInfo *localMemInfo = smem_ralloc_lookup_pool_mr(
+        memInfoTable, smem_ralloc_get_global_rank(entityId), (uint64_t)localAddr);
+    uint32_t localLkey;
+    uint64_t localRegAddr;
+    if (localMemInfo != nullptr) {
+        /* endpoint inside one of this rank's pool MR slots */
+        localLkey = localMemInfo->lkey;
+        /* the lkey covers the device-dma range this block was registered under, not the GVA
+         * range: translate the pool GVA into that range (identity for hbm pools) */
+        localRegAddr = (localMemInfo->regAddress != 0)
+                           ? localMemInfo->regAddress + ((uint64_t)localAddr - localMemInfo->addr)
+                           : (uint64_t)localAddr;
+    } else {
+        /* endpoint in a user-registered region (P1, NPU HBM only): same translation under the
+         * user MR's own lkey and dma base */
+        __gm__ SmemRallocUserMrEntry *userMr = smem_ralloc_lookup_local_mr(entityId, (uint64_t)localAddr);
+        if (userMr == nullptr) {
+            smem_ralloc_report_user_mr_lookup_miss(entityId);
+            return;
+        }
+        localLkey = userMr->lkey;
+        localRegAddr = (userMr->regAddress != 0)
+                           ? userMr->regAddress + ((uint64_t)localAddr - userMr->addr)
+                           : (uint64_t)localAddr;
+    }
+    *(__gm__ uint32_t *)(sgeAddr + 4) = localLkey; /* local key */
+    *(__gm__ uint64_t *)(sgeAddr + 8) = localRegAddr;
+
+    /* WQE & SGE cache flush */
+    smem_ralloc_cache_write_through(wqeAddr, sizeof(SmemRallocWqeCtx) + sizeof(SmemRallocSegCtx));
+    AscendC::PipeBarrier<PIPE_ALL>();
+    curHead++;
+
+    /* ring SQ doorbell (HW mode today, set by the transport layer) */
+    uint64_t doorBellInfo = 0;
+    doorBellInfo |= qpCtxEntry->wqn;                   /* [0:23] DB_TAG = qp num */
+    doorBellInfo |= 0 << 24;                           /* [24:27] DB_CMD = HNS_ROCE_V2_SQ_DB */
+    doorBellInfo |= ((uint64_t)curHead % 65536) << 32; /* [32:47] DB_PI = sq head */
+    doorBellInfo |= (uint64_t)(qpCtxEntry->sl) << 48;  /* [48:50] DB_SL */
+
+    __gm__ uint64_t *doorBellAddr = (__gm__ uint64_t *)(qpCtxEntry->dbAddr);
+    AscendC::PipeBarrier<PIPE_ALL>();
+
+    ubLocal64.SetValue(0, doorBellInfo);
+    AscendC::GlobalTensor<uint64_t> dbGlobalTensor;
+    dbGlobalTensor.SetGlobalBuffer(doorBellAddr);
+    AscendC::DataCopyExtParams copyParams{1, 1 * sizeof(uint64_t), 0, 0, 0};
+    AscendC::PipeBarrier<PIPE_ALL>();
+    AscendC::DataCopyPad(dbGlobalTensor, ubLocal64, copyParams);
+    AscendC::PipeBarrier<PIPE_ALL>();
+
+    /* update SQ head */
+    ubLocal32.SetValue(0, (uint32_t)curHead);
+    AscendC::GlobalTensor<uint32_t> headGlobalTensor;
+    headGlobalTensor.SetGlobalBuffer((__gm__ uint32_t *)curHardwareHeadAddr);
+    AscendC::DataCopyExtParams copyParamsHead{1, 1 * sizeof(uint32_t), 0, 0, 0};
+    AscendC::PipeBarrier<PIPE_ALL>();
+    AscendC::DataCopyPad(headGlobalTensor, ubLocal32, copyParamsHead);
+    AscendC::PipeBarrier<PIPE_ALL>();
 }
 
 /**

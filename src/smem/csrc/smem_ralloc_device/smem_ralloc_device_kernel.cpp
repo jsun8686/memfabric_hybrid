@@ -113,48 +113,31 @@ extern "C" __global__ __aicore__ void smem_ralloc_device_batch_run_kernel(struct
     AscendC::LocalTensor<uint32_t> ubLocal32;
     smem_ralloc_device_ub_alloc(pipe, que64, que32, ubLocal64, ubLocal32);
 
-    /* one doorbell per peer run: consecutive segments to the same peer share one SQ, the
-     * commit PI covers every WQE filled since begin (WQ order keeps segment order) */
-    struct SmemRallocPostCtx postCtx;
-    bool postActive = false;
-    uint32_t activePeer = 0;
-    uint32_t peers[SMEM_RALLOC_DEVICE_COPY_BATCH_SEG_MAX];
-    uint32_t peerCount = 0;
     for (uint32_t i = 0; i < args.count; i++) {
         const struct smem_ralloc_device_batch_seg *seg = &args.segs[i];
-        if (!postActive || seg->peerRank != activePeer) {
-            if (postActive) {
-                smem_ralloc_rdma_post_commit(postCtx, ubLocal64, ubLocal32);
-            }
-            smem_ralloc_rdma_post_begin(args.entityId, seg->peerRank, 0, postCtx);
-            activePeer = seg->peerRank;
-            postActive = true;
+        if (seg->isWrite != 0U) {
+            smem_ralloc_roce_write(args.entityId, (__gm__ uint8_t *)seg->src, (__gm__ uint8_t *)seg->dst,
+                                   seg->peerRank, 0, seg->size, ubLocal64, ubLocal32);
+        } else {
+            smem_ralloc_roce_read(args.entityId, (__gm__ uint8_t *)seg->src, (__gm__ uint8_t *)seg->dst,
+                                  seg->peerRank, 0, seg->size, ubLocal64, ubLocal32);
         }
-        bool known = false;
-        for (uint32_t j = 0; j < peerCount; j++) {
-            if (peers[j] == seg->peerRank) {
-                known = true;
-                break;
-            }
-        }
-        if (!known) {
-            peers[peerCount++] = seg->peerRank;
-        }
-        __gm__ uint8_t *remote = (seg->isWrite != 0U) ? (__gm__ uint8_t *)seg->dst : (__gm__ uint8_t *)seg->src;
-        __gm__ uint8_t *local = (seg->isWrite != 0U) ? (__gm__ uint8_t *)seg->src : (__gm__ uint8_t *)seg->dst;
-        SmemRallocOpcode op =
-            (seg->isWrite != 0U) ? SmemRallocOpcode::OP_RDMA_WRITE : SmemRallocOpcode::OP_RDMA_READ;
-        smem_ralloc_rdma_post_fill(args.entityId, postCtx, remote, local, seg->peerRank, op, seg->size, ubLocal64,
-                                   ubLocal32);
-    }
-    if (postActive) {
-        smem_ralloc_rdma_post_commit(postCtx, ubLocal64, ubLocal32);
     }
 
     /* one quiet per distinct peer: the CQE consumer index is per connection, a single
      * quiet waits for every segment already posted on that connection */
-    for (uint32_t p = 0; p < peerCount; p++) {
-        (void)smem_ralloc_roce_quiet(args.entityId, peers[p], 0, ubLocal64, ubLocal32);
+    for (uint32_t i = 0; i < args.count; i++) {
+        uint32_t peer = args.segs[i].peerRank;
+        bool first = true;
+        for (uint32_t j = 0; j < i; j++) {
+            if (args.segs[j].peerRank == peer) {
+                first = false;
+                break;
+            }
+        }
+        if (first) {
+            (void)smem_ralloc_roce_quiet(args.entityId, peer, 0, ubLocal64, ubLocal32);
+        }
     }
 
     que32.FreeTensor(ubLocal32);
