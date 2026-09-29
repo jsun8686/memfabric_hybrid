@@ -177,9 +177,12 @@ def main():
         _log(f"[client rank {rank}] device-scheduled pool created (DEVICE_RDMA | DEVICE_SCHEDULE, "
              f"56bits_gva={args.enable_56bits_gva})")
 
+        # slot addresses come from the extend returns (the committed truth): the arithmetic
+        # get_mem_ptr_by_rank (base + rank * maxSize) assumes every member's slot sits at
+        # the same window base, which only holds while the FAR daemon's LVA layout is fresh
         ret, info = handle.extend_local_mem(MEM_TYPE, block)
         assert ret == 0 and info.get("gva"), f"extend_local_mem failed: {ret} {info}"
-        local_gva = handle.get_mem_ptr_by_rank(rank, MEM_TYPE)
+        local_gva = info["gva"]
         assert local_gva != 0, "local DRAM slot not visible"
 
         deadline = time.time() + EXTEND_TIMEOUT_SEC
@@ -191,7 +194,7 @@ def main():
                 raise RuntimeError(f"no FAR candidate within {EXTEND_TIMEOUT_SEC}s: {ret} {info}")
             time.sleep(EXTEND_RETRY_SEC)
         far_rank = info["rank_id"]
-        far_gva = handle.get_mem_ptr_by_rank(far_rank, MEM_TYPE)
+        far_gva = info["gva"]
         assert far_gva != 0, "far DRAM slot not visible"
         mf.get_and_clear_last_err_msg()
         _log(f"[client rank {rank}] remote landing slot from FAR rank {far_rank} (gva=0x{far_gva:x}, npu {dev})")

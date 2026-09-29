@@ -737,57 +737,88 @@ Result SmemRallocEntry::GetLocalMemInfo(smem_ralloc_mem_info_t *info)
     return SM_OK;
 }
 
-uint64_t SmemRallocEntry::GetMemSizeByRank(uint32_t rank, smem_ralloc_mem_type_t memType)
+bool SmemRallocEntry::QueryWindowRanges(smem_ralloc_mem_type_t memType, std::vector<hybm_va_range> &ranges)
 {
-    SM_ASSERT_RETURN(inited_, 0);
+    ranges.clear();
     const bool deviceMedia = memType == SMEM_RALLOC_MEM_TYPE_DEVICE;
     auto base = reinterpret_cast<uint64_t>(deviceMedia ? deviceGva_ : hostGva_);
     auto slotSize = deviceMedia ? coreOptions_.maxHBMSize : coreOptions_.maxDRAMSize;
-    if (rank >= coreOptions_.rankCount || base == 0 || slotSize == 0) {
-        return 0;
+    if (!inited_ || entity_ == nullptr || base == 0 || slotSize == 0 || coreOptions_.rankCount == 0) {
+        return false;
     }
-    /* the window base is the rank0 slot base, identical in every process view, slot of rank r
-     * spans [base + r * slotSize, +slotSize), same as GetMemPtrByRank */
-    auto slotBase = base + static_cast<uint64_t>(rank) * slotSize;
-    auto slotEnd = slotBase + slotSize;
-
     uint32_t count = 0;
-    std::vector<hybm_va_range> ranges;
+    bool filled = false;
     for (uint32_t attempt = 0; attempt < 3U; attempt++) {
-        auto queryRet = hybm_query_alloc_ranges(entity_, slotBase, slotEnd, ranges.data(), &count);
+        auto queryRet = hybm_query_alloc_ranges(entity_, base, base + slotSize * coreOptions_.rankCount,
+                                                ranges.data(), &count);
         if (queryRet == BM_OK) {
+            filled = true;
             break;
         }
         if (queryRet != BM_BUFFER_TOO_SMALL) {
             SM_LOG_ERROR("query alloc ranges failed, ret: " << queryRet);
-            return 0;
+            return false;
         }
         /* count may grow again during concurrent extend, retry with the new capacity */
         ranges.assign(count, hybm_va_range{});
     }
-    if (ranges.size() < count) {
-        SM_LOG_ERROR("query alloc ranges keeps growing, give up this snapshot");
-        return 0;
+    if (!filled || ranges.size() < count) {
+        SM_LOG_ERROR("query alloc ranges not filled, count: " << count);
+        return false;
     }
+    return true;
+}
 
-    uint64_t extent = 0;
-    for (uint32_t i = 0; i < count; i++) {
-        if (ranges[i].ownerRank == rank && ranges[i].gva >= slotBase) {
-            extent = std::max(extent, ranges[i].gva + ranges[i].size - slotBase);
+bool SmemRallocEntry::QueryRankSlot(uint32_t rank, smem_ralloc_mem_type_t memType, uint64_t &baseOut,
+                                    uint64_t &extentOut)
+{
+    if (rank >= coreOptions_.rankCount) {
+        return false;
+    }
+    std::vector<hybm_va_range> ranges;
+    if (!QueryWindowRanges(memType, ranges)) {
+        return false;
+    }
+    baseOut = 0;
+    uint64_t end = 0;
+    for (const auto &r : ranges) {
+        if (r.ownerRank != rank) {
+            continue;
+        }
+        if (baseOut == 0 || r.gva < baseOut) {
+            baseOut = r.gva;
+        }
+        if (r.gva + r.size > end) {
+            end = r.gva + r.size;
         }
     }
+    if (baseOut == 0) {
+        return false; /* nothing committed for this rank (yet) */
+    }
+    extentOut = end - baseOut;
+    return true;
+}
+
+uint64_t SmemRallocEntry::GetMemSizeByRank(uint32_t rank, smem_ralloc_mem_type_t memType)
+{
+    SM_ASSERT_RETURN(inited_, 0);
+    /* truth from the committed ranges: the arithmetic slot window [base + r * maxSize)
+     * only holds while every member's window layout is unperturbed, which a peer-side
+     * LVA drift breaks (observed after a 56-bit entity lifetime leaked its reserves) */
+    uint64_t base = 0;
+    uint64_t extent = 0;
+    (void)QueryRankSlot(rank, memType, base, extent);
     return extent;
 }
 
 void *SmemRallocEntry::GetMemPtrByRank(uint32_t rank, smem_ralloc_mem_type_t memType)
 {
-    const bool deviceMedia = memType == SMEM_RALLOC_MEM_TYPE_DEVICE;
-    auto base = deviceMedia ? deviceGva_ : hostGva_;
-    auto slotSize = deviceMedia ? coreOptions_.maxHBMSize : coreOptions_.maxDRAMSize;
-    if (!inited_ || base == nullptr || slotSize == 0 || rank >= coreOptions_.rankCount) {
-        return nullptr;
+    uint64_t base = 0;
+    uint64_t extent = 0;
+    if (!QueryRankSlot(rank, memType, base, extent)) {
+        return nullptr; /* slot not committed: no address to hand out */
     }
-    return static_cast<char *>(base) + static_cast<uint64_t>(rank) * slotSize;
+    return reinterpret_cast<void *>(base);
 }
 
 std::vector<uint32_t> SmemRallocEntry::GetGroupRanks()
@@ -991,6 +1022,24 @@ Result SmemRallocEntry::SetGroupEventHandler(smem_ralloc_group_event_cb cb, void
 
 uint32_t SmemRallocEntry::GetRankIdByGva(void *gva)
 {
+    /* committed-range lookup first: a peer slice may sit off its arithmetic position when
+     * the peer's window layout drifted, and the arithmetic answer would then blame a wrong
+     * rank (e.g. classify a peer slot as local and reject a legal copy) */
+    auto addr = reinterpret_cast<uint64_t>(gva);
+    for (auto memType : {SMEM_RALLOC_MEM_TYPE_HOST, SMEM_RALLOC_MEM_TYPE_DEVICE}) {
+        std::vector<hybm_va_range> ranges;
+        if (!QueryWindowRanges(memType, ranges)) {
+            continue;
+        }
+        for (const auto &r : ranges) {
+            if (addr >= r.gva && addr < r.gva + r.size) {
+                return r.ownerRank;
+            }
+        }
+    }
+    /* uncommitted hole inside a window: keep the legacy arithmetic answer so callers
+     * still get a rank to reject with (slot-not-ready / out-of-range), never UINT32_MAX
+     * for an address that does live inside one of our windows */
     if (AddrInHostGva(gva, 1UL)) {
         return ((uint64_t)gva - (uint64_t)hostGva_) / coreOptions_.maxDRAMSize;
     }

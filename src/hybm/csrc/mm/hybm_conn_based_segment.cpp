@@ -711,6 +711,14 @@ void HybmConnBasedSegment::FreeMemory() noexcept
     }
 
     if (options_.enable56BitsGva) {
+        if (globalVirtualAddress_ != nullptr) {
+            /* 56-bit keeps GVA != LVA and no whole-window mmap exists (slices were freed
+             * above), but the reserve books must still be released: FreeReserveGva drops
+             * the GVA-window record AND the local-size LVA record in one call. Skipping it
+             * leaked both entries, so the process LVA first-fit permanently skipped the
+             * local-size range and every later entity's window base drifted upward. */
+            HybmVaManager::GetInstance().FreeReserveGva(reinterpret_cast<uintptr_t>(globalVirtualAddress_));
+        }
         globalVirtualAddress_ = localVirtualBase_ = nullptr;
     } else if (globalVirtualAddress_ != nullptr) {
         if (munmap(globalVirtualAddress_, totalVirtualSize_) != 0) {

@@ -85,7 +85,10 @@ public:
     /* current committed size of one rank's slot, snapshot of local imported state, 0 if empty */
     uint64_t GetMemSizeByRank(uint32_t rank, smem_ralloc_mem_type_t memType = SMEM_RALLOC_MEM_TYPE_HOST);
 
-    /* slot base address of one rank on the requested media window, null if invalid */
+    /* slot base address of one rank on the requested media window: resolved from the entity's
+     * committed ranges (truth), NOT from window arithmetic -- a peer's slot may sit off its
+     * arithmetic position when the peer process' LVA layout drifted inside the unified window;
+     * null when the slot has nothing committed */
     void *GetMemPtrByRank(uint32_t rank, smem_ralloc_mem_type_t memType = SMEM_RALLOC_MEM_TYPE_HOST);
 
     /* snapshot of the ranks currently in the dynamic group, includes self, empty if not joined */
@@ -161,6 +164,14 @@ private:
     smem_ralloc_role_t ReadRoleKey(uint32_t rank);
     void UpdateMemberRole(uint32_t rk);
     void EvaluatePoolEmpty();
+
+    /* committed ranges of the whole unified window [base, base + slotSize * rankCount):
+     * the envelope peers may actually sit anywhere inside once their own LVA layout
+     * drifted, so the per-rank arithmetic slice is not a valid query bound */
+    bool QueryWindowRanges(smem_ralloc_mem_type_t memType, std::vector<hybm_va_range> &ranges);
+    /* aggregate the committed extent of one rank inside the window: baseOut = lowest
+     * range gva (the slot base), extentOut = max end - baseOut; false when uncommitted */
+    bool QueryRankSlot(uint32_t rank, smem_ralloc_mem_type_t memType, uint64_t &baseOut, uint64_t &extentOut);
 
 private:
     /* hot used variables */
