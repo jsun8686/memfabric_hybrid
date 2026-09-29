@@ -126,26 +126,31 @@ kill -TERM <daemon_pid>
 ## 判读
 - 四模式跑**同一轮转地址序列**：graph/graph-batch 吞吐 = `replays × blocks × size / 计时`，
   direct/batch = `blocks × size / 计时`（计时均含末次 synchronize）
-- **实测矩阵（2026-09-29，write GB/s，SEG_MAX=16 时的数据）**：
+- **实测矩阵（2026-09-29，write GB/s，SEG_MAX=64）**：
 
-  | size | graph-batch | batch | graph | direct | ex08 host |
+  | size | graph-batch | batch | graph* | direct | ex08 host |
   |---|---|---|---|---|---|
-  | 128K | **18.88** | 15.18 | 7.95 | 8.37 | 4.60 |
-  | 256K | **20.69** | 17.65 | 11.80 | 12.26 | 7.66 |
-  | 512K | **21.32** | 20.17 | 15.35 | 15.70 | 10.34 |
-  | 1M | **21.71** | 21.23 | 17.59 | 18.49 | 14.17 |
+  | 128K | **19.57** | 16.32 | 7.95 | 8.33 | 4.60 |
+  | 256K | **21.73** | 18.99 | 11.80 | 12.17 | 7.66 |
+  | 512K | **21.76** | 20.58 | 15.35 | 15.74 | 10.34 |
+  | 1M | **21.93** | 21.45 | 17.59 | 18.47 | 14.17 |
   | 8M | 21.99 | **22.24** | 21.47 | 21.88 | 21.07 |
 
-- **128K 每块固定开销阶梯**（三层优化的量化因果链）：
-  `direct ~8.8us`（launch+quiet+WQE）→ `batch ~2.1us`（launch/quiet 摊薄 16 段）→
-  `graph-batch ~0.6us`（重放替代直发提交）——小消息累计 **4.1×**（host 4.60 → 18.88 GB/s）
+  \* graph 列沿用上一轮数据：该模式单拷贝直发、不经分块路径，SEG_MAX 不影响。
+  SEG_MAX 16→64 增量（batch/graph-batch 128K +7.5%/+3.7%，256K +7.6%/+5.0%）
+  = 每 chunk 内核（launch+quiet ≈5us）的摊薄倍数 4×，与机制吻合。
+
+- **128K 每块固定开销阶梯**（wire ≈5.8us 之上加价，三层优化的量化因果链）：
+  `direct ~8.8us`（launch+quiet+WQE）→ `batch ~1.7us`（launch/quiet 摊薄 64 段）→
+  `graph-batch ~0.4us`（重放替代直发提交；read 已达线速 21.15 GB/s）——小消息累计
+  **4.26×**（host 4.60 → 19.57 GB/s）
 - **graph-batch vs graph** = quiet 摊薄（单拷贝内核自带 quiet，图内逐拷贝串行收敛；batch
-  每 distinct peer 仅 1 次），128K **+137%**；**graph-batch vs batch** = 重放替代直发提交
-  的 host launch 路径，128K **+24%**；**batch vs direct** = 每块恒省 ~6.5-7us（与消息
+  每 distinct peer 仅 1 次），128K **+146%**；**graph-batch vs batch** = 重放替代直发提交
+  的 host launch 路径，128K **+20%**；**batch vs direct** = 每块恒省 ~7.2us（与消息
   大小无关，即 launch+quiet 固定成本）
-- 大消息（≥4M）各模式均 ~88-89% 线速（200G），无优化空间；剩余小消息靶点 = 内核 WQE
-  逐段构造（~0.6us/块）：本版本已将 `SEG_MAX` 16→64（launch/quiet 再摊薄 4×），更深层
-  为单 WQE 多 SGE
+- 大消息（≥4M）各模式均 ~88-89% 线速（200G），无优化空间；剩余小消息靶点 = 批量内核
+  每段 WQE 之后的 doorbell/head 更新 barrier 串（~0.4us/块）：后续版本已实施 doorbell
+  按 peer 连续段批量化（一次 commit 覆盖整段 fill）+ MR 槽表查找记忆化，待复测归因
 - 单边提交 + 卡内 quiet，吞吐参考受消息粒度与 QP 深度约束，本用例验证的是
   **可捕获性、正确性与开销结构**，不是极限带宽
 - verify 失败但 warmup 成功：优先怀疑计时期间链路/对端异常，`log/far_dev{N}.log`
