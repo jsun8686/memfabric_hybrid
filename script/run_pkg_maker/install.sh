@@ -353,8 +353,10 @@ function try_install_ralloc_device_rdma()
     fi
 
     cd ${script_dir}/../smem_ralloc_device
+    # batch kernel args travel by value: SEG_MAX(64) x 32B + 8B = 2056B exceeds the bisheng
+    # default input parameter size (1536B), widen it or the kernel lib fails to build
     bisheng -x asc smem_ralloc_device_kernel.cpp -shared -fPIC -g -I../include/smem/device \
-        -o libmf_smem_ralloc_device_rdma.so ${cce_param}
+        -o libmf_smem_ralloc_device_rdma.so ${cce_param} --cce-aicore-input-parameter-size=4096
     exit_code=$?
 
     if [ $exit_code -eq 0 ]; then
