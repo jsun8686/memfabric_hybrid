@@ -95,6 +95,7 @@ kill -TERM <daemon_pid>
 | `--graph` | 关 | 计时段捕获为 NPUGraph 并重放 `--replays` 次（默认直发不捕获） |
 | `--replays` | 4 | graph/graph-batch 模式每计时段的完整图重放次数（计时总量 = replays × batch-size 每方向） |
 | `--batch` | 关 | 计时用 `device_copy_batch`（C 层 64 段/launch 分块、每 peer 一次 quiet）：单用＝一次直发（batch），配 `--graph`＝捕获提交并重放（graph-batch） |
+| `--fast` | 关 | 计时段走**显式路由快速路径**（`device_copy(_batch)` 传 `peer_rank`/`is_write`（batch 传平行数组），C 层跳过每段地址预检，只留常数项检查）；warmup 保持检查路径作正确性门。**契约**：路由由调用者自负——错误路由安全退化为 WQE 跳过（内核 MR 查找 miss），仅能靠回读校验发现，不报同步错误；收益看 `submit W/R` 打印（提交墙钟） |
 | `--world` | 512 | 同守护 |
 | `--rpc-port-base` | 11100 | 同守护 |
 | `--enable-56bits-gva` | 关 | 56-bit GVA 建池（GVA 窗位于 2^55 以上，槽地址仅作设备端点） |
@@ -148,9 +149,14 @@ kill -TERM <daemon_pid>
   每 distinct peer 仅 1 次），128K **+146%**；**graph-batch vs batch** = 重放替代直发提交
   的 host launch 路径，128K **+20%**；**batch vs direct** = 每块恒省 ~7.2us（与消息
   大小无关，即 launch+quiet 固定成本）
-- 大消息（≥4M）各模式均 ~88-89% 线速（200G），无优化空间；剩余小消息靶点 = 批量内核
-  每段 WQE 之后的 doorbell/head 更新 barrier 串（~0.4us/块）：后续版本已实施 doorbell
-  按 peer 连续段批量化（一次 commit 覆盖整段 fill）+ MR 槽表查找记忆化，待复测归因
+- 大消息（≥4M）各模式均 ~88-89% 线速（200G），无优化空间。设备侧 doorbell 批量化
+  （一次 commit 覆盖整段 fill）**已试并回退**：实测 batch/graph-batch 各粒度劣化 ~6-9%
+  （128K 6.24→6.69us/块）——每段即时 ring 维持内核↔NIC 流水重叠，WQE 构造本就藏在
+  wire（~5.8us/块）之下，批量化反而把 fill 串行前置于传输
+- **宿主侧剩余靶点 = `SmemRallocDeviceSegCheck`**：检查路径每段多次全量 alloc-range 查询
+  （batch 512 段提交 ~数 ms）；`--fast` 走显式路由（用户自报 `peer_rank`/`is_write`，
+  C 层只留常数项检查）。收益看结果行的 `submit W/R` 打印（提交墙钟），**稳态吞吐
+  不受影响**（host 超前、设备 wire-bound、graph-batch 重放零 host）
 - 单边提交 + 卡内 quiet，吞吐参考受消息粒度与 QP 深度约束，本用例验证的是
   **可捕获性、正确性与开销结构**，不是极限带宽
 - verify 失败但 warmup 成功：优先怀疑计时期间链路/对端异常，`log/far_dev{N}.log`

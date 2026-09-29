@@ -746,11 +746,15 @@ bool SmemRallocEntry::QueryWindowRanges(smem_ralloc_mem_type_t memType, std::vec
     if (!inited_ || entity_ == nullptr || base == 0 || slotSize == 0 || coreOptions_.rankCount == 0) {
         return false;
     }
-    uint32_t count = 0;
+    /* persistent per-thread scratch: its capacity survives across calls, so the query fills in
+     * one round trip in steady state instead of re-probing with an empty buffer (guaranteed
+     * BUFFER_TOO_SMALL) on every call; thread_local keeps it race-free without a lock */
+    static thread_local std::vector<hybm_va_range> scratch;
+    uint32_t count = static_cast<uint32_t>(scratch.size());
     bool filled = false;
     for (uint32_t attempt = 0; attempt < 3U; attempt++) {
         auto queryRet = hybm_query_alloc_ranges(entity_, base, base + slotSize * coreOptions_.rankCount,
-                                                ranges.data(), &count);
+                                                scratch.data(), &count);
         if (queryRet == BM_OK) {
             filled = true;
             break;
@@ -760,12 +764,13 @@ bool SmemRallocEntry::QueryWindowRanges(smem_ralloc_mem_type_t memType, std::vec
             return false;
         }
         /* count may grow again during concurrent extend, retry with the new capacity */
-        ranges.assign(count, hybm_va_range{});
+        scratch.resize(count);
     }
-    if (!filled || ranges.size() < count) {
+    if (!filled || scratch.size() < count) {
         SM_LOG_ERROR("query alloc ranges not filled, count: " << count);
         return false;
     }
+    ranges.assign(scratch.begin(), scratch.begin() + count);
     return true;
 }
 

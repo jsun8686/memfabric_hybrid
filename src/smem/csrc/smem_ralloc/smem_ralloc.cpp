@@ -801,3 +801,111 @@ SMEM_API int32_t smem_ralloc_device_copy_batch(smem_ralloc_t handle, smem_ralloc
     }
     return SM_OK;
 }
+
+/* routed (ex) entries share this prologue: the cheap constant-time checks only, none of the
+ * window/range queries SmemRallocDeviceSegCheck runs per call */
+static int32_t SmemRallocDeviceFastEntry(smem_ralloc_t handle, uint64_t size, uint32_t peerRank,
+                                         SmemRallocEntryPtr &outEntry)
+{
+    SM_VALIDATE_RETURN(handle != nullptr, "invalid param, handle is NULL", SM_INVALID_PARAM);
+    SM_VALIDATE_RETURN(g_smemRallocInited, "smem ralloc not initialized yet", SM_NOT_INITIALIZED);
+    SM_VALIDATE_RETURN(size > 0UL, "invalid param, size is 0", SM_INVALID_PARAM);
+    SM_VALIDATE_RETURN(size <= 0xFFFFFFFFUL, "invalid param, size exceeds the 4G WQE length limit",
+                       SM_INVALID_PARAM);
+
+    SmemRallocEntryPtr entry = nullptr;
+    auto ret = SmemRallocEntryManager::Instance().GetEntryByPtr(reinterpret_cast<uintptr_t>(handle), entry);
+    if (ret != SM_OK || entry == nullptr) {
+        SM_LOG_AND_SET_LAST_ERROR("input handle is invalid, result: " << ret);
+        return SM_INVALID_PARAM;
+    }
+
+    if (entry->GetCoreOptions().bmType != HYBM_TYPE_AI_CORE_INITIATE) {
+        SM_LOG_AND_SET_LAST_ERROR_CODE(SM_NOT_SUPPORTED,
+            "pool is not device-scheduled, create it with DEVICE_SCHEDULE | DEVICE_RDMA");
+        return SM_NOT_SUPPORTED;
+    }
+
+    if (peerRank >= entry->GetCoreOptions().rankCount) {
+        SM_LOG_AND_SET_LAST_ERROR_CODE(SM_INVALID_PARAM,
+            "peer rank " << peerRank << " out of range, rank count: " << entry->GetCoreOptions().rankCount);
+        return SM_INVALID_PARAM;
+    }
+
+    if (!DlSmemRallocDeviceApi::TryLoadLibrary()) {
+        SM_LOG_AND_SET_LAST_ERROR_CODE(SM_ERROR,
+            "device rdma kernel library (libmf_smem_ralloc_device_rdma.so) is not available");
+        return SM_ERROR;
+    }
+    outEntry = entry;
+    return SM_OK;
+}
+
+SMEM_API int32_t smem_ralloc_device_copy_ex(smem_ralloc_t handle, const void *src, void *dest, uint64_t size,
+                                            uint32_t peerRank, uint32_t isWrite, void *stream)
+{
+    SmemRallocEntryPtr entry = nullptr;
+    auto ret = SmemRallocDeviceFastEntry(handle, size, peerRank, entry);
+    if (ret != SM_OK) {
+        return ret;
+    }
+
+    if (isWrite != 0U) {
+        auto submit = DlSmemRallocDeviceApi::GetWriteRunSubmit();
+        submit(entry->GetEntityId(), peerRank, dest, const_cast<void *>(src), size, stream);
+    } else {
+        auto submit = DlSmemRallocDeviceApi::GetReadRunSubmit();
+        submit(entry->GetEntityId(), peerRank, dest, const_cast<void *>(src), size, stream);
+    }
+    return SM_OK;
+}
+
+SMEM_API int32_t smem_ralloc_device_copy_batch_ex(smem_ralloc_t handle, smem_ralloc_batch_copy_ex_params_t *params,
+                                                  void *stream)
+{
+    SM_VALIDATE_RETURN(params != nullptr, "invalid param, params is NULL", SM_INVALID_PARAM);
+    SM_VALIDATE_RETURN(params->sources != nullptr && params->destinations != nullptr &&
+                           params->dataSizes != nullptr && params->peerRanks != nullptr &&
+                           params->isWrites != nullptr,
+                       "invalid param, batch arrays are NULL", SM_INVALID_PARAM);
+    SM_VALIDATE_RETURN(params->batchSize > 0U, "invalid param, batchSize is 0", SM_INVALID_PARAM);
+
+    SmemRallocEntryPtr entry = nullptr;
+    auto ret = SmemRallocDeviceFastEntry(handle, params->dataSizes[0], params->peerRanks[0], entry);
+    if (ret != SM_OK) {
+        return ret;
+    }
+    auto rankCount = entry->GetCoreOptions().rankCount;
+    for (uint32_t i = 0; i < params->batchSize; i++) {
+        /* integer compares only: this is the whole per-segment cost of the routed path */
+        if (params->dataSizes[i] == 0UL || params->dataSizes[i] > 0xFFFFFFFFUL) {
+            SM_LOG_AND_SET_LAST_ERROR_CODE(SM_INVALID_PARAM,
+                "batch seg " << i << " size out of range (0, 4G]");
+            return SM_INVALID_PARAM;
+        }
+        if (params->peerRanks[i] >= rankCount) {
+            SM_LOG_AND_SET_LAST_ERROR_CODE(SM_INVALID_PARAM,
+                "batch seg " << i << " peer rank " << params->peerRanks[i] << " out of range");
+            return SM_INVALID_PARAM;
+        }
+    }
+    auto entityId = entry->GetEntityId();
+
+    struct smem_ralloc_device_batch_args args{};
+    auto submit = DlSmemRallocDeviceApi::GetBatchRunSubmit();
+    for (uint32_t base = 0; base < params->batchSize; base += SMEM_RALLOC_DEVICE_COPY_BATCH_SEG_MAX) {
+        auto n = std::min(static_cast<uint32_t>(SMEM_RALLOC_DEVICE_COPY_BATCH_SEG_MAX),
+                          params->batchSize - base);
+        args.count = n;
+        args.entityId = entityId;
+        for (uint32_t i = 0; i < n; i++) {
+            args.segs[i].src = reinterpret_cast<uint64_t>(params->sources[base + i]);
+            args.segs[i].dst = reinterpret_cast<uint64_t>(params->destinations[base + i]);
+            args.segs[i].size = params->dataSizes[base + i];
+            args.segs[i].peerRank = params->peerRanks[base + i];
+            args.segs[i].isWrite = params->isWrites[base + i] != 0U ? 1U : 0U;
+        }
+        submit(&args, stream);
+    }
+    return SM_OK;
+}

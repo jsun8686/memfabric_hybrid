@@ -133,6 +133,12 @@ def main():
                              "64-segment kernel launches, one quiet per distinct peer); alone it is "
                              "one direct submit, combined with --graph the submit is captured and "
                              "replayed (graph-batch)")
+    parser.add_argument("--fast", action="store_true",
+                        help="routed fast path: timed copies pass peer_rank/is_write (batch: "
+                             "peer_ranks/is_writes) so the C layer skips the per-call address "
+                             "precheck; warmup stays on the checked path as the correctness gate; "
+                             "wrong routing degrades to a skipped WQE caught by the round-trip "
+                             "check, not corruption")
     parser.add_argument("--world", type=int, default=DEFAULT_WORLD,
                         help=f"declared world capacity (default {DEFAULT_WORLD})")
     parser.add_argument("--rpc-port-base", type=int, default=RPC_PORT_BASE,
@@ -159,7 +165,7 @@ def main():
     else:
         mode = "direct"
     _log(f"[client] run dir: {run_dir}, store: {args.store}, world: {args.world}, dev: {args.dev}, "
-         f"56bits_gva: {args.enable_56bits_gva}, timed mode: {mode}")
+         f"56bits_gva: {args.enable_56bits_gva}, timed mode: {mode}{' +fast' if args.fast else ''}")
 
     sizes = [_parse_size(t) for t in args.io_sizes.split(",") if t.strip() != ""]
     if not sizes:
@@ -259,31 +265,53 @@ def main():
                 torch.npu.synchronize()
                 t0 = time.perf_counter()
                 for off in dst_offs:
-                    assert handle.device_copy(src_addr, off, size, 0) == 0, "direct L2G failed"
+                    if args.fast:
+                        assert handle.device_copy(src_addr, off, size, 0,
+                                                  peer_rank=far_rank, is_write=1) == 0, "direct L2G failed"
+                    else:
+                        assert handle.device_copy(src_addr, off, size, 0) == 0, "direct L2G failed"
+                t_submit_w = time.perf_counter() - t0
                 torch.npu.synchronize()
                 tw = time.perf_counter() - t0
                 t0 = time.perf_counter()
                 for off in dst_offs:
-                    assert handle.device_copy(off, dst_addr, size, 0) == 0, "direct G2L failed"
+                    if args.fast:
+                        assert handle.device_copy(off, dst_addr, size, 0,
+                                                  peer_rank=far_rank, is_write=0) == 0, "direct G2L failed"
+                    else:
+                        assert handle.device_copy(off, dst_addr, size, 0) == 0, "direct G2L failed"
+                t_submit_r = time.perf_counter() - t0
                 torch.npu.synchronize()
                 tr = time.perf_counter() - t0
-                phase = f"{blocks} blocks (direct)"
+                phase = f"{blocks} blocks (direct{' fast' if args.fast else ''})"
                 moved = one_way
                 timed_blocks = blocks
             elif mode == "batch":
                 dst.zero_()
                 torch.npu.synchronize()
                 t0 = time.perf_counter()
-                assert handle.device_copy_batch([src_addr] * blocks, dst_offs, [size] * blocks, 0) == 0, \
-                    "batch L2G failed"
+                if args.fast:
+                    assert handle.device_copy_batch([src_addr] * blocks, dst_offs, [size] * blocks, 0,
+                                                    peer_ranks=[far_rank] * blocks,
+                                                    is_writes=[1] * blocks) == 0, "batch L2G failed"
+                else:
+                    assert handle.device_copy_batch([src_addr] * blocks, dst_offs, [size] * blocks, 0) == 0, \
+                        "batch L2G failed"
+                t_submit_w = time.perf_counter() - t0
                 torch.npu.synchronize()
                 tw = time.perf_counter() - t0
                 t0 = time.perf_counter()
-                assert handle.device_copy_batch(dst_offs, [dst_addr] * blocks, [size] * blocks, 0) == 0, \
-                    "batch G2L failed"
+                if args.fast:
+                    assert handle.device_copy_batch(dst_offs, [dst_addr] * blocks, [size] * blocks, 0,
+                                                    peer_ranks=[far_rank] * blocks,
+                                                    is_writes=[0] * blocks) == 0, "batch G2L failed"
+                else:
+                    assert handle.device_copy_batch(dst_offs, [dst_addr] * blocks, [size] * blocks, 0) == 0, \
+                        "batch G2L failed"
+                t_submit_r = time.perf_counter() - t0
                 torch.npu.synchronize()
                 tr = time.perf_counter() - t0
-                phase = f"{blocks} blocks/1 batch (batch)"
+                phase = f"{blocks} blocks/1 batch (batch{' fast' if args.fast else ''})"
                 moved = one_way
                 timed_blocks = blocks
             elif mode == "graph-batch":
@@ -292,9 +320,15 @@ def main():
                 with torch.npu.stream(side):
                     stream_ptr = torch.npu.current_stream().npu_stream
                     wgraph.capture_begin()
-                    assert handle.device_copy_batch([src_addr] * blocks, dst_offs, [size] * blocks,
-                                                    stream_ptr) == 0, \
-                        "captured batch write submit failed"
+                    if args.fast:
+                        assert handle.device_copy_batch([src_addr] * blocks, dst_offs, [size] * blocks,
+                                                        stream_ptr, peer_ranks=[far_rank] * blocks,
+                                                        is_writes=[1] * blocks) == 0, \
+                            "captured batch write submit failed"
+                    else:
+                        assert handle.device_copy_batch([src_addr] * blocks, dst_offs, [size] * blocks,
+                                                        stream_ptr) == 0, \
+                            "captured batch write submit failed"
                     wgraph.capture_end()
                 dst.zero_()
                 torch.npu.synchronize()
@@ -302,9 +336,15 @@ def main():
                 with torch.npu.stream(side):
                     stream_ptr = torch.npu.current_stream().npu_stream
                     rgraph.capture_begin()
-                    assert handle.device_copy_batch(dst_offs, [dst_addr] * blocks, [size] * blocks,
-                                                    stream_ptr) == 0, \
-                        "captured batch read submit failed"
+                    if args.fast:
+                        assert handle.device_copy_batch(dst_offs, [dst_addr] * blocks, [size] * blocks,
+                                                        stream_ptr, peer_ranks=[far_rank] * blocks,
+                                                        is_writes=[0] * blocks) == 0, \
+                            "captured batch read submit failed"
+                    else:
+                        assert handle.device_copy_batch(dst_offs, [dst_addr] * blocks, [size] * blocks,
+                                                        stream_ptr) == 0, \
+                            "captured batch read submit failed"
                     rgraph.capture_end()
                 torch.npu.synchronize()
                 t0 = time.perf_counter()
@@ -318,7 +358,7 @@ def main():
                 torch.npu.synchronize()
                 tr = time.perf_counter() - t0
                 del wgraph, rgraph
-                phase = f"{blocks} blocks/graph x {args.replays} replays (graph-batch)"
+                phase = f"{blocks} blocks/graph x {args.replays} replays (graph-batch{' fast' if args.fast else ''})"
                 moved = args.replays * one_way
                 timed_blocks = args.replays * blocks
             else:
@@ -358,9 +398,14 @@ def main():
                 timed_blocks = args.replays * blocks
 
             assert torch.equal(dst, src), f"round-trip mismatch at size {size}"
+            submit_note = ""
+            if mode in ("direct", "batch"):
+                submit_note = (f", submit W {t_submit_w * 1e3:.2f} ms / R {t_submit_r * 1e3:.2f} ms "
+                               f"({t_submit_w / blocks * 1e6:.2f} / {t_submit_r / blocks * 1e6:.2f} us/seg)")
             _log(f"[client] size {size}: {phase}, "
                  f"write {moved / tw / GIB:.2f} GB/s ({tw / timed_blocks * 1e6:.2f} us/block), "
-                 f"read {moved / tr / GIB:.2f} GB/s ({tr / timed_blocks * 1e6:.2f} us/block) [round-trip OK]")
+                 f"read {moved / tr / GIB:.2f} GB/s ({tr / timed_blocks * 1e6:.2f} us/block){submit_note} "
+                 f"[round-trip OK]")
 
             assert handle.unregister(src_addr) == 0, "unregister src failed"
             assert handle.unregister(dst_addr) == 0, "unregister dst failed"

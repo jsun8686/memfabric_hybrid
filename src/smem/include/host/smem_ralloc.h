@@ -279,6 +279,44 @@ int32_t smem_ralloc_device_copy(smem_ralloc_t handle, const void *src, void *des
  */
 int32_t smem_ralloc_device_copy_batch(smem_ralloc_t handle, smem_ralloc_batch_copy_params_t *params, void *stream);
 
+/**
+ * @brief Routed variant of <i>smem_ralloc_device_copy</i>: the caller asserts the routing
+ *        (peer rank and direction) instead of the library deriving it from the addresses,
+ *        skipping the whole per-call window/range precheck (multiple full alloc-range
+ *        queries per call on the checked path). Address semantics and graph-capture
+ *        properties are unchanged. Wrong routing degrades safely: the kernel-side MR
+ *        lookup misses and the WQE is skipped (no data corruption), the error is only
+ *        visible through data verification.
+ *
+ * @param handle           [in] ralloc object handle created by <i>smem_ralloc_create</i> with
+ *                            SMEMRA_DATA_OP_DEVICE_SCHEDULE | SMEMRA_DATA_OP_DEVICE_RDMA
+ * @param src              [in] source address, write: local (slot or registered user memory),
+ *                            read: peer pool slot
+ * @param dest             [in] destination address, write: peer pool slot, read: local
+ * @param size             [in] bytes to copy, (0, 4G]
+ * @param peerRank         [in] caller-asserted owner rank of the peer endpoint
+ * @param isWrite          [in] 1 = WRITE (local -> peer), 0 = READ (peer -> local)
+ * @param stream           [in] aclrt stream, null uses the default stream
+ * @return 0 if successful
+ */
+int32_t smem_ralloc_device_copy_ex(smem_ralloc_t handle, const void *src, void *dest, uint64_t size,
+                                   uint32_t peerRank, uint32_t isWrite, void *stream);
+
+/**
+ * @brief Routed variant of <i>smem_ralloc_device_copy_batch</i>: per-segment routing
+ *        (peer rank, direction) is caller-asserted via <i>smem_ralloc_batch_copy_ex_params</i>,
+ *        skipping the per-segment precheck of the checked path. Chunking (SEG_MAX segments
+ *        per kernel launch, one quiet per touched peer) is identical to the checked path.
+ *        Wrong routing degrades safely, see <i>smem_ralloc_device_copy_ex</i>.
+ *
+ * @param handle           [in] ralloc object handle
+ * @param params           [in] routed batch description
+ * @param stream           [in] aclrt stream, null uses the default stream
+ * @return 0 if successful
+ */
+int32_t smem_ralloc_device_copy_batch_ex(smem_ralloc_t handle, smem_ralloc_batch_copy_ex_params_t *params,
+                                         void *stream);
+
 #ifdef __cplusplus
 }
 #endif
