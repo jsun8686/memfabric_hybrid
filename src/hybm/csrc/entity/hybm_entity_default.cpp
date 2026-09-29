@@ -1063,6 +1063,16 @@ int32_t MemEntityDefault::ImportForTransportPrecheck(const ExchangeInfoReader de
             transportManager_->UpdateMemoryKey(transportKey.key, addresses[i]);
         }
 
+        if (!options_.enable56BitsGva && options_.scene != HYBM_SCENE_TRANS &&
+            transportKey.address >= HYBM_GVM_START_ADDR && transportKey.address < HYBM_GVM_END_ADDR &&
+            !CheckAddressInEntity(reinterpret_cast<const void *>(transportKey.address), 1)) {
+            BM_LOG_ERROR("pool window base diverged: remote rank(" << transportKey.rankId << ") slice addr:0x"
+                         << std::hex << transportKey.address << " is inside the GVM band but outside local windows"
+                         << " (hbm base:0x" << hbmGva_ << ", dram base:0x" << dramGva_
+                         << "); identity mode requires all ranks of one pool share the same window base");
+            return BM_ERROR;
+        }
+
         std::unique_lock<std::mutex> uniqueLock{importMutex_};
         importedMemories_[transportKey.rankId].insert(transportKey.key);
         BM_LOG_INFO("Success to import slice rankId:" << transportKey.rankId << " addr:" << std::hex
