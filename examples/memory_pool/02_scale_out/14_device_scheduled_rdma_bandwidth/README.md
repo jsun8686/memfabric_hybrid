@@ -10,16 +10,18 @@
   即 09 warmup 已验证的 `USER ↔ PEER` 组合；
 - 每个粒度：图外 warmup（首次 `device_copy` 会 `dlopen` 内核库，捕获中非法）→
   WRITE 计时 → READ 计时 → 回读校验，输出行与 08 同格式，结果可直接对照；
-- 计时模式可开关，三种模式跑**同一槽轮转拷贝序列**（同地址、同字节数），两两对照分别量化
-  图捕获收益与批量接口收益：
-  - 默认 **graph**：每方向捕获**一张完整图**——图内含整个轮转序列（blocks 份拷贝，默认
+- 计时模式可开关，四种模式跑**同一槽轮转拷贝序列**（同地址、同字节数），两两对照分别量化
+  图捕获、批量接口及组合的收益：
+  - 默认 **graph**：每方向捕获**一张完整图**——图内含整个轮转序列（blocks 份单拷贝内核，默认
     `batch-size = real-pool-size` 时恰好全槽每个地址各写一遍），重放 `--replays` 次；
     即真实场景形态（完整图中内嵌整段槽轮转通信），重放期间 host 零参与；
+  - `--batch` **graph-batch**：捕获目标改为**一次 `device_copy_batch` 提交**（一个矩阵，C 层
+    按 16 段/launch 分块、每 distinct peer 仅 1 次 quiet）——重放零 host 参与**且收敛摊薄**；
+    与 graph 同量对照即 quiet 摊薄收益；
   - `--no-graph` **direct**：同序列循环直发 `device_copy`（纯入队不同步），末次
     synchronize 计入——同语义基线；
-  - `--batch` **batch**：同序列**一次 `device_copy_batch` 提交整段矩阵**（宿主校验后
-    C 层按 16 段/launch 分块，每 distinct peer 仅 1 次 quiet）——量化批量接口对小消息
-    固定开销（launch + quiet）的摊薄收益。
+  - `--batch --no-graph` **batch**：同序列**一次 `device_copy_batch` 直发提交**——批量直发
+    基线，与 direct 对照即批量接口对小消息固定开销（launch + quiet）的摊薄收益。
 
 ## 拓扑与角色
 
@@ -89,7 +91,7 @@ kill -TERM <daemon_pid>
 | `--max-pool-size` | 4G | 池 DRAM 窗口（`ralloc.create` 的 `max_dram_size`，**必须 GB 对齐**） |
 | `--no-graph` | 关 | 计时用直发 `device_copy`（轮转偏移 + 末次同步），不捕获 NPUGraph |
 | `--replays` | 4 | graph 模式每计时段的完整图重放次数（计时总量 = replays × batch-size 每方向） |
-| `--batch` | 关 | 计时用一次 `device_copy_batch` 提交整段序列（C 层 16 段/launch 分块、每 peer 一次 quiet）；与 `--no-graph` 互斥 |
+| `--batch` | 关 | 计时用 `device_copy_batch`（C 层 16 段/launch 分块、每 peer 一次 quiet）：配默认 graph＝捕获提交并重放（graph-batch），配 `--no-graph`＝一次直发（batch） |
 | `--world` | 512 | 同守护 |
 | `--rpc-port-base` | 11100 | 同守护 |
 | `--enable-56bits-gva` | 关 | 56-bit GVA 建池（GVA 窗位于 2^55 以上，槽地址仅作设备端点） |
@@ -113,7 +115,7 @@ kill -TERM <daemon_pid>
   2. `remote block from FAR rank <R> (gva=0x...)`
   3. 每个粒度：`size <S>: warmup round-trip OK (registered HBM <-> FAR slot, seed <n>)`
   4. 每个粒度：`size <S>: <B> blocks (direct)` / `<B> blocks/1 batch (batch)` /
-     `<B> blocks/graph x <R> replays (graph)`，后随 `write X GB/s (Y us/block),
+     `<B> blocks/graph x <R> replays (graph|graph-batch)`，后随 `write X GB/s (Y us/block),
      read Z GB/s (W us/block) [round-trip OK]`
   5. `[client] all sizes OK, client finished cleanly`，exit 0
 - 守护侧正常常驻、停机 `all contributors stopped cleanly`
@@ -124,6 +126,10 @@ kill -TERM <daemon_pid>
 - **batch vs direct（同总量同序列）**：差值 = 批量接口摊薄 launch + quiet 的收益；小消息
   （≤512K）预期最明显，大消息线速饱和后趋同。WQE 仍逐段构造（非 multi-SGE 单 WQE），
   更高层级的批量优化在设备内核层
+- **graph-batch vs graph**：差值 = quiet 摊薄收益（单拷贝内核每拷贝自带 quiet，图内仍逐拷贝
+  串行收敛；batch 每 peer 仅 1 次）；**graph-batch vs batch**：差值 = 重放替代直发提交的
+  host 开销（本就很小，预期两者接近）。实测参考（2026-09-29）：batch 较 direct 每块恒省
+  ~6.5-7us；128K 处 batch 较 direct +81%、较 host 发起（ex08）+230%
 - 两模式差值 = host 逐次入队开销的消除量（图捕获收益）；消息粒度越小收益应越明显
 - **若 graph 仍不优于 direct**：瓶颈不在 host 入队，而在随包设备内核的作业形态
   （若每拷贝自带 quiet，图内仍逐拷贝串行收敛）——那是设备内核层面的下一个优化靶

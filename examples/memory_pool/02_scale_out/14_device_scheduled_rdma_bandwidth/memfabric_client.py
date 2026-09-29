@@ -16,12 +16,16 @@ dlopens the kernel library, which is illegal inside capture), then time one WRIT
 and one READ phase over the SAME slot-rotated copy sequence (blocks = batch-size / size
 copies at offsets (i % slots) * size):
 
-  default (--graph):  capture ONE full NPUGraph per direction holding the whole rotated
-                      sequence, replay it --replays times — the real-world shape of a
-                      complete graph embedding the slot-rotated communication pattern
-  --no-graph:         enqueue device_copy directly x blocks, one synchronize at the end;
-                      the same-sequence baseline, so the graph-vs-direct delta is exactly
-                      the per-enqueue host overhead
+  default (--graph):     capture ONE full NPUGraph per direction holding the whole rotated
+                         sequence (single-copy kernels), replay it --replays times — the
+                         real-world shape of a complete graph embedding the communication
+  --batch (graph on):    capture the single device_copy_batch submit instead (the whole
+                         matrix, internally chunked into 16-segment kernel launches with
+                         one quiet per peer) and replay it --replays times — zero host
+                         work per replay AND amortized completion
+  --no-graph:            enqueue device_copy directly x blocks, one synchronize at the
+                         end; the same-sequence baseline
+  --batch --no-graph:    one direct device_copy_batch submit, one synchronize at the end
 
 Output lines match 08's format so runs are directly comparable.
 """
@@ -124,9 +128,10 @@ def main():
                         help=f"full-graph replays per timed phase in graph mode; timed volume "
                              f"= replays x batch-size per direction (default {DEFAULT_REPLAYS})")
     parser.add_argument("--batch", action="store_true",
-                        help="time one device_copy_batch submit per direction (the whole rotated "
-                             "matrix in a single call; the C layer chunks it into 16-segment "
-                             "kernel launches with one quiet per distinct peer)")
+                        help="time device_copy_batch submits (whole rotated matrix in one call; "
+                             "16-segment kernel launches, one quiet per distinct peer); with the "
+                             "default graph mode the submit is captured and replayed (graph-batch), "
+                             "with --no-graph it is one direct submit")
     parser.add_argument("--world", type=int, default=DEFAULT_WORLD,
                         help=f"declared world capacity (default {DEFAULT_WORLD})")
     parser.add_argument("--rpc-port-base", type=int, default=RPC_PORT_BASE,
@@ -144,7 +149,10 @@ def main():
     _term_fd = os.dup(1)
     os.dup2(log.fileno(), 1)
     os.dup2(log.fileno(), 2)
-    mode = "batch" if args.batch else ("direct" if args.no_graph else "graph")
+    if args.batch:
+        mode = "batch" if args.no_graph else "graph-batch"
+    else:
+        mode = "direct" if args.no_graph else "graph"
     _log(f"[client] run dir: {run_dir}, store: {args.store}, world: {args.world}, dev: {args.dev}, "
          f"56bits_gva: {args.enable_56bits_gva}, timed mode: {mode}")
 
@@ -165,8 +173,6 @@ def main():
         raise RuntimeError(f"--max-pool-size ({max_pool_bytes}) must be GB aligned (VMM segment rule)")
     if args.replays < 1:
         raise RuntimeError(f"--replays ({args.replays}) must be >= 1")
-    if args.batch and args.no_graph:
-        raise RuntimeError("--batch and --no-graph are mutually exclusive timed modes")
 
     _wait_tcp(args.store, 30)
     dev = args.dev
@@ -243,7 +249,7 @@ def main():
             one_way = blocks * size
             dst_offs = [gva + (i % slots) * size for i in range(blocks)]
 
-            if args.no_graph:
+            if args.no_graph and not args.batch:
                 dst.zero_()
                 torch.npu.synchronize()
                 t0 = time.perf_counter()
@@ -259,7 +265,7 @@ def main():
                 phase = f"{blocks} blocks (direct)"
                 moved = one_way
                 timed_blocks = blocks
-            elif args.batch:
+            elif args.no_graph and args.batch:
                 dst.zero_()
                 torch.npu.synchronize()
                 t0 = time.perf_counter()
@@ -275,6 +281,41 @@ def main():
                 phase = f"{blocks} blocks/1 batch (batch)"
                 moved = one_way
                 timed_blocks = blocks
+            elif args.batch:
+                torch.npu.synchronize()
+                wgraph = torch.npu.NPUGraph()
+                with torch.npu.stream(side):
+                    stream_ptr = torch.npu.current_stream().npu_stream
+                    wgraph.capture_begin()
+                    assert handle.device_copy_batch([src_addr] * blocks, dst_offs, [size] * blocks,
+                                                    stream_ptr) == 0, \
+                        "captured batch write submit failed"
+                    wgraph.capture_end()
+                dst.zero_()
+                torch.npu.synchronize()
+                rgraph = torch.npu.NPUGraph()
+                with torch.npu.stream(side):
+                    stream_ptr = torch.npu.current_stream().npu_stream
+                    rgraph.capture_begin()
+                    assert handle.device_copy_batch(dst_offs, [dst_addr] * blocks, [size] * blocks,
+                                                    stream_ptr) == 0, \
+                        "captured batch read submit failed"
+                    rgraph.capture_end()
+                torch.npu.synchronize()
+                t0 = time.perf_counter()
+                for _ in range(args.replays):
+                    wgraph.replay()
+                torch.npu.synchronize()
+                tw = time.perf_counter() - t0
+                t0 = time.perf_counter()
+                for _ in range(args.replays):
+                    rgraph.replay()
+                torch.npu.synchronize()
+                tr = time.perf_counter() - t0
+                del wgraph, rgraph
+                phase = f"{blocks} blocks/graph x {args.replays} replays (graph-batch)"
+                moved = args.replays * one_way
+                timed_blocks = args.replays * blocks
             else:
                 torch.npu.synchronize()
                 wgraph = torch.npu.NPUGraph()
