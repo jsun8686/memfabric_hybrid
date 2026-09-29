@@ -123,6 +123,10 @@ def main():
     parser.add_argument("--replays", type=int, default=DEFAULT_REPLAYS,
                         help=f"full-graph replays per timed phase in graph mode; timed volume "
                              f"= replays x batch-size per direction (default {DEFAULT_REPLAYS})")
+    parser.add_argument("--batch", action="store_true",
+                        help="time one device_copy_batch submit per direction (the whole rotated "
+                             "matrix in a single call; the C layer chunks it into 16-segment "
+                             "kernel launches with one quiet per distinct peer)")
     parser.add_argument("--world", type=int, default=DEFAULT_WORLD,
                         help=f"declared world capacity (default {DEFAULT_WORLD})")
     parser.add_argument("--rpc-port-base", type=int, default=RPC_PORT_BASE,
@@ -140,7 +144,7 @@ def main():
     _term_fd = os.dup(1)
     os.dup2(log.fileno(), 1)
     os.dup2(log.fileno(), 2)
-    mode = "direct" if args.no_graph else "graph"
+    mode = "batch" if args.batch else ("direct" if args.no_graph else "graph")
     _log(f"[client] run dir: {run_dir}, store: {args.store}, world: {args.world}, dev: {args.dev}, "
          f"56bits_gva: {args.enable_56bits_gva}, timed mode: {mode}")
 
@@ -161,6 +165,8 @@ def main():
         raise RuntimeError(f"--max-pool-size ({max_pool_bytes}) must be GB aligned (VMM segment rule)")
     if args.replays < 1:
         raise RuntimeError(f"--replays ({args.replays}) must be >= 1")
+    if args.batch and args.no_graph:
+        raise RuntimeError("--batch and --no-graph are mutually exclusive timed modes")
 
     _wait_tcp(args.store, 30)
     dev = args.dev
@@ -251,6 +257,22 @@ def main():
                 torch.npu.synchronize()
                 tr = time.perf_counter() - t0
                 phase = f"{blocks} blocks (direct)"
+                moved = one_way
+                timed_blocks = blocks
+            elif args.batch:
+                dst.zero_()
+                torch.npu.synchronize()
+                t0 = time.perf_counter()
+                assert handle.device_copy_batch([src_addr] * blocks, dst_offs, [size] * blocks, 0) == 0, \
+                    "batch L2G failed"
+                torch.npu.synchronize()
+                tw = time.perf_counter() - t0
+                t0 = time.perf_counter()
+                assert handle.device_copy_batch(dst_offs, [dst_addr] * blocks, [size] * blocks, 0) == 0, \
+                    "batch G2L failed"
+                torch.npu.synchronize()
+                tr = time.perf_counter() - t0
+                phase = f"{blocks} blocks/1 batch (batch)"
                 moved = one_way
                 timed_blocks = blocks
             else:
