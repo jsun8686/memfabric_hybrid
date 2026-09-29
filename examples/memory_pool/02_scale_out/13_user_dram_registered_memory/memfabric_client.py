@@ -34,8 +34,8 @@ import memfabric_hybrid as mf
 from memfabric_hybrid import ralloc
 
 DEFAULT_WORLD = 512          # declared world capacity, actual members join dynamically
-NIC_PORT_BASE = 10010        # data-plane nic port base (set_nic); NOT the control rpc port
-RPC_PORT_BASE = 11105        # control rpc port = base + rankId (smem_ralloc_def.h default)
+NIC_PORT_BASE = 10005        # data-plane nic port base (set_nic); NOT the control rpc port
+RPC_PORT_BASE = 11100        # control rpc port = base + rankId (smem_ralloc_def.h default)
 DEFAULT_SIZE = "1M"          # bytes per buffer / per one-sided copy (must be 4K aligned)
 DEFAULT_REPLAYS = 8          # graph replays after capture
 DEFAULT_BLOCK_SIZE = "64M"   # DRAM slot bytes committed on each side (FAR landing zone)

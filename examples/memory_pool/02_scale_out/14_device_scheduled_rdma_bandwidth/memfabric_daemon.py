@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 # coding=utf-8
 # Copyright: (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
+"""FAR-side resident daemon for 14_device_scheduled_rdma_bandwidth.
+
+Same contributor skeleton as 08/09 (one child process per contributed NPU, graceful
+SIGTERM stop, ready-gate before serving, per-card far_dev<N>.log); only the default
+ports follow THIS example's client (NIC 10020 / RPC 11120), so daemon and client from
+this directory can run side by side with the other examples' daemon/client pairs.
+"""
 
 import argparse
 import multiprocessing as mp
@@ -117,7 +124,7 @@ def main():
         got = _collect_ready(ready_q, procs, devs, READY_TIMEOUT_SEC)
         pairs = ", ".join(f"npu{dev}->rank{got[dev]['rank']}" for dev in devs)
         _log(f"[daemon] {len(devs)} memory contributors serving ({pairs})")
-        _log(f"[daemon] try the client:  python3 memfabric_client.py --store {args.store} --devs 0,1,2,3")
+        _log(f"[daemon] try the client:  python3 memfabric_client.py --store {args.store} --dev <npu_id>")
         _log(f"[daemon] per-contributor logs: {run_dir}/far_dev<N>.log")
         _log(f"[daemon] stop with Ctrl+C or:  kill -TERM {os.getpid()}")
         warned = set()

@@ -16,7 +16,7 @@
 
 - FAR 节点（1 台）：`memfabric_daemon.py` 贡献 NPU 卡内存，内置 store（`tcp://<far_ip>:8588`）。
 - NEAR 节点（1 台）：`memfabric_client.py`，建 DEVICE_RDMA | DEVICE_SCHEDULE 池（DRAM 窗口 4G + 仅元数据的 HBM 窗口 1G），本地注册 host 缓冲，remote extend 取 FAR 落地槽。
-- 数据面端口基值 10010（`set_nic`），控制面 RPC 端口基值 11105（与例 09/10/11 相同，同一时刻只跑一个示例即可复用）。
+- 数据面端口基值 10005（`set_nic`），控制面 RPC 端口基值 11100（07-14 全用例统一，同一时刻只跑一个会话即可复用）。
 
 ## 使用能力
 
@@ -54,7 +54,7 @@ kill -TERM <daemon_pid>
 | `--replays` | 8 | 捕获后的图重放次数 |
 | `--block-size` | 64M | 两侧 DRAM 槽字节数（FAR 落地带） |
 | `--max-pool-size` | 4G | 池 DRAM 窗口，须 GB 对齐（VMM 段规则） |
-| `--world` / `--rpc-port-base` | 512 / 11105 | 与守护一致 |
+| `--world` / `--rpc-port-base` | 512 / 11100 | 与守护一致 |
 | `--enable-56bits-gva` | 关 | 56-bit GVA 建池（GVA 窗位于 2^55 以上，仅设备端点） |
 | `--run-dir` | ./log | 日志目录 |
 

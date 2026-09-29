@@ -74,7 +74,7 @@ kill -TERM <daemon_pid>
 | `--block-size` | 64M | 每次 extend 提交的 DRAM slot 字节数（两侧各两次，须 ≥ size） |
 | `--max-pool-size` | 4G | 池 DRAM 窗口（**必须 GB 对齐**，须容纳 2 × block-size） |
 | `--world` | 512 | 同守护 |
-| `--rpc-port-base` | 11105 | 同守护 |
+| `--rpc-port-base` | 11100 | 同守护 |
 | `--enable-56bits-gva` | 关 | 56-bit GVA 建池（GVA 窗位于 2^55 以上，槽地址仅作设备端点） |
 | `--run-dir` | ./log | 客户端日志目录（`near_dev{dev}.log`） |
 

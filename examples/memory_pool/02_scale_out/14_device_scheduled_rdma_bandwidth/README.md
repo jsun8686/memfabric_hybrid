@@ -68,7 +68,8 @@ kill -TERM <daemon_pid>
 
 ## 参数
 
-**memfabric_daemon.py**：与 08 完全相同（`--store/--devs/--world/--rpc-port-base/--run-dir`）。
+**memfabric_daemon.py**：贡献者骨架与 08 完全相同（`--store/--devs/--world/--rpc-port-base/--run-dir`），
+端口默认与全用例统一（RPC `11100`、NIC `10005`），与客户端一致——各用例的 daemon/client 可互换复用。
 
 **memfabric_client.py**
 
@@ -82,7 +83,7 @@ kill -TERM <daemon_pid>
 | `--max-pool-size` | 4G | 池 DRAM 窗口（`ralloc.create` 的 `max_dram_size`，**必须 GB 对齐**） |
 | `--no-graph` | 关 | 计时用直发 `device_copy`（轮转偏移 + 末次同步），不捕获 NPUGraph |
 | `--world` | 512 | 同守护 |
-| `--rpc-port-base` | 11120 | 同守护 |
+| `--rpc-port-base` | 11100 | 同守护 |
 | `--enable-56bits-gva` | 关 | 56-bit GVA 建池（GVA 窗位于 2^55 以上，槽地址仅作设备端点） |
 | `--run-dir` | ./log | 客户端日志目录（`near_dev{dev}.log`） |
 

@@ -72,7 +72,7 @@ kill -TERM <daemon_pid>
 | `--max-pool-size` | 4G | 池 DRAM 窗口（**必须 GB 对齐**，须 ≥ block-size） |
 | `--pool-base` | 120 | 首个 pool id，worker i 用 `pool-base+i` |
 | `--world` | 512 | 同守护 |
-| `--rpc-port-base` | 11110 | 同守护 |
+| `--rpc-port-base` | 11100 | 同守护 |
 | `--run-dir` | ./log | 客户端日志目录（`near_summary.log` + `near_worker{i}.log`） |
 
 ## 必要条件

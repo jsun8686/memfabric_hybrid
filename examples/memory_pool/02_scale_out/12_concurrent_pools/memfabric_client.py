@@ -36,8 +36,8 @@ import memfabric_hybrid as mf
 from memfabric_hybrid import ralloc
 
 DEFAULT_WORLD = 512          # declared world capacity, actual members join dynamically
-NIC_PORT_BASE = 10015        # data-plane nic port base (set_nic); NOT the control rpc port
-RPC_PORT_BASE = 11110        # control rpc port base = base + rankId (smem_ralloc_def.h default)
+NIC_PORT_BASE = 10005        # data-plane nic port base (set_nic); NOT the control rpc port
+RPC_PORT_BASE = 11100        # control rpc port base = base + rankId (smem_ralloc_def.h default)
 DEFAULT_WORKERS = 4          # concurrent pool creators (each its own pool id)
 DEFAULT_DEVS = "0,1,2,3"     # one NPU per worker; concurrent first-time device init on ONE
                               # card from several processes deadlocks in the device layer
