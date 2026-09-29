@@ -485,6 +485,7 @@ Result HybmConnBasedSegment::ReserveMemorySpace(void **address) noexcept
         if (mapped == MAP_FAILED || (uint64_t)mapped != (uint64_t)startAddr) {
             BM_LOG_ERROR("Failed to mmap size:" << totalSize << " addr:" << startAddr << " ret:" << mapped
                                                 << " error: " << errno);
+            HybmVaManager::GetInstance().FreeReserveGva(reinterpret_cast<uintptr_t>(startAddr));
             return BM_ERROR;
         }
     }
@@ -694,13 +695,7 @@ bool HybmConnBasedSegment::MemoryInRange(const void *begin, uint64_t size) const
 void HybmConnBasedSegment::FreeMemory() noexcept
 {
     while (!slices_.empty()) {
-        auto slice = slices_.begin()->second.slice;
-        // Only pool slices own backing memory; user-registered slices point to caller-owned HVA.
-        const bool ownsBackingMemory = (slice->gva_ != 0U);
-        ReleaseSliceMemory(slice);
-        if (ownsBackingMemory) {
-            FreeAllocatedMemory(reinterpret_cast<void *>(slice->vAddress_), slice->size_, slice->allocMethod_);
-        }
+        ReleaseSliceMemory(slices_.begin()->second.slice);
     }
     Unmap();
 
@@ -952,6 +947,10 @@ Result HybmConnBasedSegment::ReleaseSliceMemory(const MemSlicePtr &slice) noexce
         }
     }
 #endif
+
+    if (slice->gva_ != 0U) {
+        FreeAllocatedMemory(reinterpret_cast<void *>(slice->vAddress_), slice->size_, slice->allocMethod_);
+    }
 
     return BM_OK;
 }
