@@ -460,26 +460,51 @@ int FixedRanksQpManager::CreateQpWaitingReady(std::unordered_map<uint32_t, AiCor
                     void *extraSocket = nullptr; /* client only: second local socket */
                     void *extraFd = nullptr;
                     bool reportedDup = false;
-                    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
-                    while (std::chrono::steady_clock::now() < deadline) {
-                        if (clientSide && extraSocket == nullptr) {
-                            extraSocket = CreateLocalSocket();
-                            if (extraSocket == nullptr) {
+                    if (clientSide) {
+                        /* v2: tag "1" first (matched by the server-side tag whitelist added in
+                         * the server branch), then an empty tag fallback (rides the primary
+                         * whitelist entry); both failing indicates a same-IP single-connect
+                         * policy and is the readout for the v3 multi-port variant */
+                        const char *attemptTags[] = {"1", ""};
+                        for (auto tag : attemptTags) {
+                            void *sock = CreateLocalSocket();
+                            if (sock == nullptr) {
                                 BM_LOG_WARN("route-A client rank " << it->first << ": create second socket failed");
                                 break;
                             }
                             HccpSocketConnectInfo connInfo{};
-                            connInfo.handle = extraSocket;
+                            connInfo.handle = sock;
                             connInfo.remoteIp.addr = channel.remoteIp;
                             auto rankIt = currentRanksInfo_.find(it->first);
                             connInfo.port = (rankIt != currentRanksInfo_.end()) ? rankIt->second.network.sin_port : 0;
-                            (void)snprintf(connInfo.tag, sizeof(connInfo.tag), "1");
+                            if (tag[0] != '\0') {
+                                (void)snprintf(connInfo.tag, sizeof(connInfo.tag), "%s", tag);
+                            }
                             auto cret = DlHccpApi::RaSocketBatchConnect(&connInfo, 1);
-                            BM_LOG_INFO("route-A client rank " << it->first
-                                          << ": second socket (tag 1) batch connect ret: " << cret);
-                            if (cret != 0) {
+                            BM_LOG_INFO("route-A client rank " << it->first << ": second socket (tag '" << tag
+                                          << "') batch connect ret: " << cret << " (0x" << std::hex << cret
+                                          << std::dec << ")");
+                            if (cret == 0) {
+                                extraSocket = sock;
                                 break;
                             }
+                            (void)DlHccpApi::RaSocketDeinit(sock);
+                        }
+                    } else {
+                        /* v2: whitelist tag "1" BEFORE the client's second connect can arrive,
+                         * fixing the v1 omission (whitelist tag matching is exact) */
+                        HccpSocketWhiteListInfo whiteList{};
+                        whiteList.remoteIp.addr = channel.remoteIp;
+                        whiteList.connLimit = rankCount_;
+                        (void)snprintf(whiteList.tag, sizeof(whiteList.tag), "1");
+                        auto wret = DlHccpApi::RaSocketWhiteListAdd(serverSocketHandle_, &whiteList, 1);
+                        BM_LOG_INFO("route-A server rank " << it->first << ": whitelist add for tag '1' ret: "
+                                      << wret << " (0x" << std::hex << wret << std::dec << ")");
+                    }
+                    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+                    while (std::chrono::steady_clock::now() < deadline) {
+                        if (clientSide && extraSocket == nullptr) {
+                            break; /* both connect attempts failed, nothing to poll for */
                         }
                         HccpSocketInfo info{};
                         info.handle = clientSide ? extraSocket : serverSocketHandle_;
@@ -510,11 +535,9 @@ int FixedRanksQpManager::CreateQpWaitingReady(std::unordered_map<uint32_t, AiCor
                         BM_LOG_WARN("route-A " << (clientSide ? "client" : "server") << " rank " << it->first
                                       << ": no distinct second fd within deadline");
                         if (extraSocket != nullptr) {
-                            HccpSocketCloseInfo closeInfo{};
-                            closeInfo.handle = extraSocket;
-                            closeInfo.fd = nullptr;
-                            closeInfo.linger = 1;
-                            (void)DlHccpApi::RaSocketBatchClose(&closeInfo, 1);
+                            /* v2: plain handle teardown -- RaSocketBatchClose with a null fd is
+                             * the suspect of the transient MR-register failure seen in v1 */
+                            (void)DlHccpApi::RaSocketDeinit(extraSocket);
                         }
                         continue;
                     }
@@ -539,7 +562,8 @@ int FixedRanksQpManager::CreateQpWaitingReady(std::unordered_map<uint32_t, AiCor
                     }
                     pret = DlHccpApi::RaQpConnectAsync(probeHandle, extraFd);
                     BM_LOG_INFO("route-A rank " << it->first
-                                  << ": probe qp connect_async on DEDICATED fd ret: " << pret);
+                                  << ": probe qp connect_async on DEDICATED fd ret: " << pret
+                                  << " (0x" << std::hex << pret << std::dec << ")");
                     if (pret != 0) {
                         (void)DlHccpApi::RaQpDestroy(probeHandle);
                         continue;
@@ -588,6 +612,11 @@ int FixedRanksQpManager::CreateQpWaitingReady(std::unordered_map<uint32_t, AiCor
                         closeInfo.fd = p.extraFd;
                         closeInfo.linger = 1;
                         (void)DlHccpApi::RaSocketBatchClose(&closeInfo, 1);
+                        if (clientSide) {
+                            /* the client owns the second local socket handle, tear it down too;
+                             * the server's closeHandle is the shared listen handle, keep it */
+                            (void)DlHccpApi::RaSocketDeinit(p.closeHandle);
+                        }
                     }
                 } else {
                     BM_LOG_WARN("route-A probe verdict: no probe QPs were set up");
