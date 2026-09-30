@@ -9,6 +9,7 @@
  * MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
  * See the Mulan PSL v2 for more details.
 */
+#include <arpa/inet.h>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -31,12 +32,6 @@ constexpr uint32_t MAX_RECV_WR = 128;
 constexpr uint32_t MAX_SEND_WR = 8192;
 constexpr uint32_t CQ_CUSTOM_FLAG = 1;
 constexpr int COPY_INFO_SL = 4;
-/* route-A v4 experiment (MF_SOCKS_PER_PEER=2): per-rank extra client sockets submitted in
- * the SAME initial RaSocketBatchConnect as the primaries, mirroring the HCCL multi-QP wiring
- * (transport_direct_npu.cc: one socket per QP, all sockets set up at link establishment,
- * QP[i] connected over sockets[i]). A late second connect (v2) is rejected by the hccp
- * same-endpoint dedup with 0x5020F. rank -> local extra socket handle */
-static std::unordered_map<uint32_t, void *> gRouteAExtraSockets;
 FixedRanksQpManager::FixedRanksQpManager(uint32_t deviceId, uint32_t rankId, uint32_t rankCount,
                                          sockaddr_in devNet) noexcept
     : DeviceQpManager(deviceId, rankId, rankCount, devNet, HYBM_ROLE_PEER)
@@ -241,10 +236,6 @@ int FixedRanksQpManager::StartClientSide() noexcept
     }
 
     std::vector<HccpSocketConnectInfo> connectInfos;
-    uint32_t socksPerPeer = 1;
-    if (const char *env = getenv("MF_SOCKS_PER_PEER")) {
-        socksPerPeer = static_cast<uint32_t>(atoi(env));
-    }
     for (auto it = currentRanksInfo_.begin(); it != currentRanksInfo_.end(); ++it) {
         if (it->first >= rankId_) {
             continue; // client connect to small ranks.
@@ -265,25 +256,6 @@ int FixedRanksQpManager::StartClientSide() noexcept
         bzero(connectInfo.tag, sizeof(connectInfo.tag));
         BM_LOG_DEBUG("add connecting server " << connectInfo);
         connectInfos.emplace_back(connectInfo);
-
-        if (socksPerPeer > 1) {
-            /* v4: the extra socket rides the SAME initial batch connect as the primary --
-             * HCCL's proven wiring (one socket per QP, all sockets up front at link setup) */
-            auto extraHandle = CreateLocalSocket();
-            if (extraHandle == nullptr) {
-                BM_LOG_WARN("route-A client rank " << it->first << ": create extra socket failed");
-            } else {
-                gRouteAExtraSockets[it->first] = extraHandle;
-                HccpSocketConnectInfo extraInfo{};
-                extraInfo.handle = extraHandle;
-                extraInfo.remoteIp.addr = it->second.network.sin_addr;
-                extraInfo.port = it->second.network.sin_port;
-                bzero(extraInfo.tag, sizeof(extraInfo.tag));
-                connectInfos.emplace_back(extraInfo);
-                BM_LOG_INFO("route-A client rank " << it->first
-                              << ": extra socket added to the initial connect batch");
-            }
-        }
     }
 
     auto ret = DlHccpApi::RaSocketBatchConnect(connectInfos.data(), connectInfos.size());
@@ -465,18 +437,23 @@ int FixedRanksQpManager::CreateQpWaitingReady(std::unordered_map<uint32_t, AiCor
             }
         }
         if (connectingCount == 0) {
-            /* route-A v4 experiment (MF_SOCKS_PER_PEER=2): verify N-sockets-per-peer following
-             * the HCCL multi-QP wiring. The client's extra socket was submitted in the same
-             * initial batch connect as the primary (StartClientSide), the server fetches the
-             * second accepted fd, then a probe QP is connected over the dedicated fd (the
-             * primary single-QP flow on its own socket). Primary channel/QP1 machinery is
-             * untouched. Set on BOTH sides. */
+            /* route-A v3 experiment (MF_SOCKS_PER_PEER=2), multi-port variant -- the only
+             * client-side multiplicity left after v1-v4 ruled everything else out: the same
+             * (ip,port) endpoint admits exactly one connection (late connect -> explicit
+             * 0x5020F rejection + MR-register poisoning, in-batch duplicate -> silently
+             * ignored), while the socket layer natively multiplexes by port (listen-port
+             * retry loop, per-rank ports in the HCCL rank table). Server listens on
+             * port+1 with its own handle and whitelist, client connects a fresh socket to
+             * port+1, a probe QP rides that dedicated fd. Primary machinery untouched.
+             * Set on BOTH sides. */
             uint32_t socksPerPeer = 1;
             if (const char *env = getenv("MF_SOCKS_PER_PEER")) {
                 socksPerPeer = static_cast<uint32_t>(atoi(env));
             }
             if (socksPerPeer > 1) {
                 const bool clientSide = (&connections == &clientConnections_);
+                void *secondListenHandle = nullptr; /* server only: extra listen on port+1 */
+                uint16_t secondPort = 0;
                 struct RouteAProbe {
                     uint32_t rank;
                     void *qp;
@@ -485,24 +462,76 @@ int FixedRanksQpManager::CreateQpWaitingReady(std::unordered_map<uint32_t, AiCor
                     int lastStatus;
                 };
                 std::vector<RouteAProbe> probes;
+                if (!clientSide && !connections.empty()) {
+                    secondListenHandle = CreateLocalSocket();
+                    if (secondListenHandle == nullptr) {
+                        BM_LOG_WARN("route-A server: create second listen socket failed");
+                    } else {
+                        secondPort = htons(static_cast<uint16_t>(ntohs(deviceAddress_.sin_port) + 1));
+                        HccpSocketListenInfo listenInfo{};
+                        listenInfo.handle = secondListenHandle;
+                        listenInfo.port = secondPort;
+                        auto lret = DlHccpApi::RaSocketListenStart(&listenInfo, 1);
+                        BM_LOG_INFO("route-A server: second listen on port " << ntohs(secondPort)
+                                      << " ret: " << lret << " (0x" << std::hex << lret << std::dec << ")");
+                        if (lret != 0) {
+                            (void)DlHccpApi::RaSocketDeinit(secondListenHandle);
+                            secondListenHandle = nullptr;
+                        }
+                    }
+                }
+                if (clientSide && !connections.empty()) {
+                    /* let the server's second listen come up first: both route-A phases start
+                     * at nearly the same moment (v4 logs: ~100ms apart) */
+                    std::this_thread::sleep_for(std::chrono::seconds(2));
+                }
                 for (auto it = connections.begin(); it != connections.end(); ++it) {
                     auto &channel = it->second;
-                    void *extraSocket = nullptr; /* client only: extra local socket (pre-submitted) */
+                    void *extraSocket = nullptr; /* client only: fresh socket to port+1 */
                     void *extraFd = nullptr;
                     bool reportedDup = false;
                     if (clientSide) {
-                        auto extraIt = gRouteAExtraSockets.find(it->first);
-                        if (extraIt == gRouteAExtraSockets.end()) {
-                            BM_LOG_WARN("route-A client rank " << it->first << ": no pre-submitted extra socket");
+                        extraSocket = CreateLocalSocket();
+                        if (extraSocket == nullptr) {
+                            BM_LOG_WARN("route-A client rank " << it->first << ": create extra socket failed");
                             continue;
                         }
-                        extraSocket = extraIt->second;
-                        gRouteAExtraSockets.erase(extraIt); /* teardown below is the sole owner now */
+                        HccpSocketConnectInfo connInfo{};
+                        connInfo.handle = extraSocket;
+                        connInfo.remoteIp.addr = channel.remoteIp;
+                        auto rankIt = currentRanksInfo_.find(it->first);
+                        uint16_t primaryPort =
+                            (rankIt != currentRanksInfo_.end()) ? rankIt->second.network.sin_port : 0;
+                        connInfo.port = htons(static_cast<uint16_t>(ntohs(primaryPort) + 1));
+                        bzero(connInfo.tag, sizeof(connInfo.tag));
+                        auto cret = DlHccpApi::RaSocketBatchConnect(&connInfo, 1);
+                        BM_LOG_INFO("route-A client rank " << it->first << ": connect to port "
+                                      << static_cast<uint32_t>(ntohs(primaryPort)) + 1
+                                      << " ret: " << cret << " (0x" << std::hex << cret << std::dec << ")");
+                        if (cret != 0) {
+                            BM_LOG_WARN("route-A client rank " << it->first
+                                          << ": port+1 connect rejected -- explicit refusal may poison "
+                                          << "MR-register in this run; rerun without MF_SOCKS_PER_PEER");
+                            (void)DlHccpApi::RaSocketDeinit(extraSocket);
+                            continue;
+                        }
+                    } else if (secondListenHandle != nullptr) {
+                        /* whitelist the peer on the second listen handle (empty tag, same as
+                         * the primary combination proven to work) */
+                        HccpSocketWhiteListInfo whiteList{};
+                        whiteList.remoteIp.addr = channel.remoteIp;
+                        whiteList.connLimit = rankCount_;
+                        bzero(whiteList.tag, sizeof(whiteList.tag));
+                        auto wret = DlHccpApi::RaSocketWhiteListAdd(secondListenHandle, &whiteList, 1);
+                        BM_LOG_INFO("route-A server rank " << it->first << ": whitelist add on second listen"
+                                      << " ret: " << wret << " (0x" << std::hex << wret << std::dec << ")");
+                    } else {
+                        continue; /* no second listen, nothing to probe for this rank */
                     }
                     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
                     while (std::chrono::steady_clock::now() < deadline) {
                         HccpSocketInfo info{};
-                        info.handle = clientSide ? extraSocket : serverSocketHandle_;
+                        info.handle = clientSide ? extraSocket : secondListenHandle;
                         info.fd = nullptr;
                         info.remoteIp.addr = channel.remoteIp;
                         info.status = 0;
@@ -525,17 +554,14 @@ int FixedRanksQpManager::CreateQpWaitingReady(std::unordered_map<uint32_t, AiCor
                             }
                         } else if (gret == 0 && cnt > 0 && info.status == 2) {
                             BM_LOG_WARN("route-A " << (clientSide ? "client" : "server") << " rank " << it->first
-                                          << ": extra socket connect status 2 (timeout/rejected) -- "
-                                          << "same-endpoint multiplicity denied even in the initial batch");
+                                          << ": extra socket connect status 2 (timeout/rejected)");
                             break;
                         }
                         std::this_thread::sleep_for(std::chrono::milliseconds(100));
                     }
                     if (extraFd == nullptr) {
                         BM_LOG_WARN("route-A " << (clientSide ? "client" : "server") << " rank " << it->first
-                                      << ": no distinct second fd within deadline"
-                                      << " (a rejected extra connect may poison MR-register in this run;"
-                                      << " rerun without MF_SOCKS_PER_PEER to recover)");
+                                      << ": no distinct second fd within deadline");
                         if (extraSocket != nullptr) {
                             (void)DlHccpApi::RaSocketDeinit(extraSocket);
                         }
@@ -569,7 +595,7 @@ int FixedRanksQpManager::CreateQpWaitingReady(std::unordered_map<uint32_t, AiCor
                         continue;
                     }
                     probes.push_back(RouteAProbe{it->first, probeHandle,
-                                                 clientSide ? extraSocket : serverSocketHandle_, extraFd, -1});
+                                                 clientSide ? extraSocket : secondListenHandle, extraFd, -1});
                 }
 
                 if (!probes.empty()) {
@@ -620,6 +646,15 @@ int FixedRanksQpManager::CreateQpWaitingReady(std::unordered_map<uint32_t, AiCor
                     }
                 } else {
                     BM_LOG_WARN("route-A probe verdict: no probe QPs were set up");
+                }
+                if (secondListenHandle != nullptr) {
+                    HccpSocketListenInfo stopInfo{};
+                    stopInfo.handle = secondListenHandle;
+                    stopInfo.port = secondPort;
+                    auto sret = DlHccpApi::RaSocketListenStop(&stopInfo, 1);
+                    BM_LOG_INFO("route-A server: second listen stop ret: " << sret);
+                    (void)DlHccpApi::RaSocketDeinit(secondListenHandle);
+                    secondListenHandle = nullptr;
                 }
             }
             return FillQpInfo();
