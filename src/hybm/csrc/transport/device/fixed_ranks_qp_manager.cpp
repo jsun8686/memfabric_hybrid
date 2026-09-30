@@ -10,6 +10,8 @@
  * See the Mulan PSL v2 for more details.
 */
 #include <chrono>
+#include <cstdlib>
+#include <vector>
 #include "hybm_logger.h"
 #include "dl_acl_api.h"
 #include "dl_hccp_api.h"
@@ -395,6 +397,22 @@ int FixedRanksQpManager::WaitConnectionsReady(std::unordered_map<uint32_t, AiCor
 
 int FixedRanksQpManager::CreateQpWaitingReady(std::unordered_map<uint32_t, AiCoreConnChannel> &connections) noexcept
 {
+    /* one-shot experiment knob: MF_QP_PER_PEER=2 creates one extra probe QP per connection
+     * and connects it over the SAME socket fd, verifying whether the hccp RS accepts multiple
+     * QP handshakes per socket (the open question for the multi-QP design). The probe keeps
+     * its own handle/info, the channel's QP1 state stays untouched. Must be set on BOTH
+     * sides, the handshake pairing is symmetric. */
+    uint32_t qpPerPeer = 1;
+    if (const char *env = getenv("MF_QP_PER_PEER")) {
+        qpPerPeer = static_cast<uint32_t>(atoi(env));
+    }
+    struct ProbeQp {
+        uint32_t rank;
+        void *handle;
+        int lastStatus;
+    };
+    std::vector<ProbeQp> probes;
+
     for (auto it = connections.begin(); it != connections.end(); ++it) {
         auto ret = CreateOneQp(it->second);
         if (ret != 0) {
@@ -407,10 +425,39 @@ int FixedRanksQpManager::CreateQpWaitingReady(std::unordered_map<uint32_t, AiCor
             BM_LOG_ERROR("connect AI QP to " << it->first << " failed: " << ret);
             return BM_DL_FUNCTION_FAILED;
         }
+
+        if (qpPerPeer > 1) {
+            /* probe QP: same attrs as CreateOneQp, local info/handle only */
+            HccpQpExtAttrs attr{};
+            attr.qpMode = NETWORK_OFFLINE;
+            attr.version = QP_VERSION;
+            attr.cqAttr.sendCqDepth = SEND_CQ_DEPTH;
+            attr.cqAttr.recvCqDepth = RECV_DQ_DEPTH;
+            attr.qp_attr.cap.max_recv_sge = MAX_RECV_SGE;
+            attr.qp_attr.cap.max_recv_wr = MAX_RECV_WR;
+            attr.qp_attr.qp_type = IBV_QPT_RC;
+            attr.qp_attr.cap.max_send_wr = MAX_SEND_WR;
+            attr.data_plane_flag.bs.cq_cstm = CQ_CUSTOM_FLAG;
+            HccpAiQpInfo probeInfo{};
+            void *probeHandle = nullptr;
+            ret = DlHccpApi::RaQpAiCreate(rdmaHandle_, attr, probeInfo, probeHandle);
+            if (ret != 0 || probeHandle == nullptr) {
+                BM_LOG_WARN("probe qp create to " << it->first << " failed: " << ret);
+                continue;
+            }
+            ret = DlHccpApi::RaQpConnectAsync(probeHandle, it->second.socketFd);
+            BM_LOG_INFO("probe qp to " << it->first << ": create ok, connect_async on SAME fd ret: " << ret);
+            if (ret != 0) {
+                (void)DlHccpApi::RaQpDestroy(probeHandle);
+                continue;
+            }
+            probes.push_back(ProbeQp{it->first, probeHandle, -1});
+        }
     }
 
     auto start = std::chrono::steady_clock::now();
     auto timeout = start + std::chrono::minutes(1);
+    int mainVerdict = BM_TIMEOUT;
     while (std::chrono::steady_clock::now() < timeout) {
         int connectingCount = 0;
         for (auto it = connections.begin(); it != connections.end(); ++it) {
@@ -425,11 +472,56 @@ int FixedRanksQpManager::CreateQpWaitingReady(std::unordered_map<uint32_t, AiCor
             }
         }
         if (connectingCount == 0) {
-            return FillQpInfo();
+            mainVerdict = BM_OK;
+            break;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
-    return BM_TIMEOUT;
+
+    if (!probes.empty()) {
+        /* poll the probes and log status transitions: 0=not connected 1=connected 2=timeout
+         * 3=connecting; the verdict line is the experiment readout */
+        auto probeDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+        uint32_t probeConnected = 0;
+        while (std::chrono::steady_clock::now() < probeDeadline) {
+            uint32_t pending = 0;
+            for (auto &p : probes) {
+                int status = 0;
+                auto ret = DlHccpApi::RaGetQpStatus(p.handle, status);
+                if (ret != 0) {
+                    if (p.lastStatus != -2) {
+                        BM_LOG_WARN("probe qp " << p.rank << " get status failed: " << ret);
+                        p.lastStatus = -2;
+                    }
+                    pending++;
+                    continue;
+                }
+                if (status != p.lastStatus) {
+                    BM_LOG_INFO("probe qp " << p.rank << " status: " << p.lastStatus << " -> " << status);
+                    p.lastStatus = status;
+                }
+                if (status != 1) {
+                    pending++;
+                }
+            }
+            probeConnected = static_cast<uint32_t>(probes.size()) - pending;
+            if (pending == 0) {
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+        BM_LOG_INFO("multi-QP probe verdict: " << probeConnected << "/" << probes.size()
+                      << " probe QPs connected on shared socket fds"
+                      << " (main QPs verdict: " << mainVerdict << ")");
+        for (auto &p : probes) {
+            (void)DlHccpApi::RaQpDestroy(p.handle);
+        }
+    }
+
+    if (mainVerdict != BM_OK) {
+        return mainVerdict;
+    }
+    return FillQpInfo();
 }
 
 int FixedRanksQpManager::CreateOneQp(AiCoreConnChannel &channel) noexcept
