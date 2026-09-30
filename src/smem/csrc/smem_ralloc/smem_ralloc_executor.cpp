@@ -73,7 +73,11 @@ Result SmemRallocExecutor::OnJoinAlloc(SmemRallocRpcMsg &msg)
      * 180 s JOIN_ALLOC rpc timeout so the 2 AccWrk threads can never both park here forever;
      * on timeout the client's bounded re-placement retries cover it. */
     const uint32_t lockWaitSec = mf::MfEnvUtil::GetOptionalUintOrDefault("MF_RALLOC_JOIN_LOCK_WAIT_SEC", 150U);
-    std::unique_lock<std::timed_mutex> poolJoinLock(manager.PoolJoinLock(msg.poolId));
+    /* defer_lock is mandatory: the plain unique_lock(mutex) ctor already calls lock(), and a
+     * subsequent try_lock_for would re-enter a mutex this thread owns -- undefined behavior
+     * for a non-recursive timed_mutex (observed as the join service stalling: the holder
+     * self-waits the full timeout while every other AccWrk parks unbounded in the ctor). */
+    std::unique_lock<std::timed_mutex> poolJoinLock(manager.PoolJoinLock(msg.poolId), std::defer_lock);
     if (!poolJoinLock.try_lock_for(std::chrono::seconds(lockWaitSec))) {
         SM_LOG_ERROR("join alloc timed out waiting for the pool join lock, pool: " << msg.poolId
                       << " requester: " << msg.reqRank << " waited: " << lockWaitSec << "s");

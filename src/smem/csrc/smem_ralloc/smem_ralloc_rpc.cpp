@@ -13,6 +13,7 @@
 
 #include <chrono>
 #include <cstring>
+#include <exception>
 #include <vector>
 
 #include "acc_tcp_shared_buf.h"
@@ -328,16 +329,35 @@ int32_t SmemRallocRpcService::OnRequest(const acc::AccTcpRequestContext &context
         SM_LOG_WARN("no handler for rpc op: " << msg.op);
         msg.result = SM_NOT_SUPPORTED;
     } else {
-        msg.result = handler(msg);
-        if (msg.result != SM_OK) {
-            SM_LOG_WARN("rpc op: " << msg.op << " handled with result: " << msg.result);
+        /* exception boundary: handlers run on AccTcpWorker threads whose trampoline has no
+         * catch handler -- an escaping exception (bad_alloc / system_error / ...) unwinds to
+         * the thread entry and std::terminate's the whole daemon (observed as a SIGABRT in
+         * OnRequest under a concurrent join). Catch it here, log what() -- that line is the
+         * evidence pinning any future crash-of-this-class -- and reply an error instead. */
+        try {
+            msg.result = handler(msg);
+            if (msg.result != SM_OK) {
+                SM_LOG_WARN("rpc op: " << msg.op << " handled with result: " << msg.result);
+            }
+        } catch (const std::exception &e) {
+            SM_LOG_ERROR("rpc op: " << msg.op << " handler threw an exception, what(): " << e.what());
+            msg.result = SM_ERROR;
+        } catch (...) {
+            SM_LOG_ERROR("rpc op: " << msg.op << " handler threw an unknown exception");
+            msg.result = SM_ERROR;
         }
     }
 
-    auto respBuf = acc::AccDataBuffer::Create(&msg, sizeof(SmemRallocRpcMsg));
-    auto ret = context.Reply(SM_OK, respBuf);
-    if (ret != SM_OK) {
-        SM_LOG_ERROR("rpc reply failed, result: " << ret);
+    try {
+        auto respBuf = acc::AccDataBuffer::Create(&msg, sizeof(SmemRallocRpcMsg));
+        auto ret = context.Reply(SM_OK, respBuf);
+        if (ret != SM_OK) {
+            SM_LOG_ERROR("rpc reply failed, result: " << ret);
+        }
+    } catch (const std::exception &e) {
+        SM_LOG_ERROR("rpc reply path threw an exception, op: " << msg.op << " what(): " << e.what());
+    } catch (...) {
+        SM_LOG_ERROR("rpc reply path threw an unknown exception, op: " << msg.op);
     }
     return SM_OK;
 }
