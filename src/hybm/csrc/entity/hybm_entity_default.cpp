@@ -95,7 +95,16 @@ Result MemEntityDefault::InitTagManager()
 
 int32_t MemEntityDefault::Initialize(const hybm_options *options) noexcept
 {
-    BM_ASSERT_LOG_AND_RETURN(!initialized_, "the object is initialized.", BM_OK);
+    /* full mutual exclusion against UnInitialize and other Initializers: a same-pool
+     * concurrent join could previously slip a second Initialize (or a recycle's
+     * UnInitialize) past the unlocked !initialized_ check and tear the entity mid-build
+     * (observed as a SIGSEGV in InitTransManager's string handling). Under the lock the
+     * check-then-act window closes: the racing joiner waits and then reuses the entity. */
+    std::lock_guard<std::mutex> lock(initMutex_);
+    if (initialized_) {
+        BM_LOG_INFO("the object is initialized, reuse the existing initialization.");
+        return BM_OK;
+    }
     BM_ASSERT_LOG_AND_RETURN((id_ >= 0 && (uint32_t)(id_) < HYBM_ENTITY_NUM_MAX),
                              "input entity id is invalid, input: " << id_
                                                                    << " must be less than: " << HYBM_ENTITY_NUM_MAX,
@@ -126,6 +135,10 @@ int32_t MemEntityDefault::Initialize(const hybm_options *options) noexcept
 
 void MemEntityDefault::UnInitialize() noexcept
 {
+    /* same lock as Initialize: an UnInitialize running against an in-flight Initialize
+     * (the leftover-recycle path of a concurrent join) would free members the builder
+     * is still writing into */
+    std::lock_guard<std::mutex> lock(initMutex_);
     ReleaseResources();
 }
 

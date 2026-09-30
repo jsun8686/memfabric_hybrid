@@ -116,6 +116,10 @@ private:
 private:
     static thread_local bool isSetDevice_;
     bool initialized_{false};
+    /* serializes Initialize/UnInitialize on one entity: a same-pool concurrent join could
+     * race a recycle's UnInitialize against a running Initialize (or two Initializations)
+     * on the shared entity slot and tear its members (observed SIGSEGV in InitTransManager) */
+    std::mutex initMutex_;
     const int32_t id_; /* id of the engine */
     hybm_options options_{};
     void *hbmGva_{nullptr};  // the hbm medium, started gva, no rankId offset

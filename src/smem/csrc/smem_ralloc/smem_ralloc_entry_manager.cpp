@@ -180,6 +180,16 @@ int32_t SmemRallocEntryManager::AutoRanking()
     return SM_ERROR;
 }
 
+std::timed_mutex &SmemRallocEntryManager::PoolJoinLock(uint32_t poolId)
+{
+    std::lock_guard<std::mutex> guard(entryMutex_);
+    auto &lock = poolJoinLocks_[poolId];
+    if (lock == nullptr) {
+        lock = std::make_unique<std::timed_mutex>();
+    }
+    return *lock;
+}
+
 Result SmemRallocEntryManager::CreateEntryById(uint32_t id, SmemRallocEntryPtr &entry /* out */)
 {
     std::lock_guard<std::mutex> guard(entryMutex_);

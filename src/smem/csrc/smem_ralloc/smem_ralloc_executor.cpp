@@ -9,9 +9,12 @@
  * MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
  * See the Mulan PSL v2 for more details.
  */
+#include <chrono>
+#include <mutex>
 #include "smem_ralloc_executor.h"
 
 #include "smem_logger.h"
+#include "mf_env_util.h"
 #include "smem_ralloc_entry.h"
 #include "smem_ralloc_entry_manager.h"
 #include "smem_ralloc_helper.h"
@@ -60,6 +63,22 @@ Result SmemRallocExecutor::OnJoinAlloc(SmemRallocRpcMsg &msg)
     if (manager.GetConfig().role != SMEM_RALLOC_ROLE_FAR) {
         SM_LOG_ERROR("join alloc rejected on NEAR role node, pool: " << msg.poolId);
         return SM_NOT_SUPPORTED;
+    }
+
+    /* serialize same-pool joins on this node (extend / recycle / create phases). A racing
+     * recycle could double-UnInitialize a leftover or slip a second Create past the map
+     * dedup, both landing two Initializations (or an UnInitialize against a running
+     * Initialize) on the same shared hybm entity slot -- observed as a contributor crash
+     * (SIGSEGV) under a 4-client concurrent join. The wait is bounded below the client-side
+     * 180 s JOIN_ALLOC rpc timeout so the 2 AccWrk threads can never both park here forever;
+     * on timeout the client's bounded re-placement retries cover it. */
+    const uint32_t lockWaitSec = mf::MfEnvUtil::GetOptionalUintOrDefault("MF_RALLOC_JOIN_LOCK_WAIT_SEC", 150U);
+    std::unique_lock<std::timed_mutex> poolJoinLock(manager.PoolJoinLock(msg.poolId));
+    if (!poolJoinLock.try_lock_for(std::chrono::seconds(lockWaitSec))) {
+        SM_LOG_ERROR("join alloc timed out waiting for the pool join lock, pool: " << msg.poolId
+                      << " requester: " << msg.reqRank << " waited: " << lockWaitSec << "s");
+        manager.NotifyPlacementFailure(msg);
+        return SM_NOT_INITIALIZED;
     }
 
     /* extend branch: pool already exists on this node, extend one more block on its local slot */
