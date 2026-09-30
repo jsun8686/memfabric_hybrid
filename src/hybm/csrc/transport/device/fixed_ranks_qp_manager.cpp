@@ -9,7 +9,6 @@
  * MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
  * See the Mulan PSL v2 for more details.
 */
-#include <arpa/inet.h>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -256,6 +255,19 @@ int FixedRanksQpManager::StartClientSide() noexcept
         bzero(connectInfo.tag, sizeof(connectInfo.tag));
         BM_LOG_DEBUG("add connecting server " << connectInfo);
         connectInfos.emplace_back(connectInfo);
+        if (getenv("MF_SOCKS_PER_PEER") != nullptr) {
+            /* route-A v5: HCCL-style same-endpoint multiplicity -- HcclSocketManager builds
+             * socketsPerLink sockets per peer to the SAME (ip,port) on the SAME local
+             * handle, each connection carrying a unique tag (MakeUniqueConnTag:
+             * "<commTag>_Inter_MultiSocket_<clientRank>_<i>"). v1-v4 recap: late connect ->
+             * 0x5020F rejection, in-batch duplicate with the SAME empty tag -> silently
+             * ignored; the untested cell is exactly this one: in-batch + distinct tag.
+             * We are the client, so clientRank is our own rankId_. */
+            HccpSocketConnectInfo extra = connectInfo;
+            snprintf(extra.tag, sizeof(extra.tag), "mf_q2_%u_1", rankId_);
+            BM_LOG_INFO("route-A client: extra batch entry to rank " << it->first << " tag '" << extra.tag << "'");
+            connectInfos.emplace_back(extra);
+        }
     }
 
     auto ret = DlHccpApi::RaSocketBatchConnect(connectInfos.data(), connectInfos.size());
@@ -299,6 +311,19 @@ int FixedRanksQpManager::GenerateWhiteList() noexcept
         bzero(info.tag, sizeof(info.tag));
         whitelist.emplace_back(info);
         serverConnections_.emplace(it->first, AiCoreConnChannel{info.remoteIp.addr, serverSocketHandle_});
+        if (getenv("MF_SOCKS_PER_PEER") != nullptr) {
+            /* route-A v5: HCCL adds all per-tag whitelist entries up front, before any
+             * client connects (HcclSocketManager::ConstructWhiteList loops i <
+             * socketsPerLink). The peer's second connection carries tag
+             * "mf_q2_<clientRank>_1" -- clientRank is the remote rank here because the
+             * peer is the connecting client, so both ends derive the same string. */
+            HccpSocketWhiteListInfo extra{};
+            extra.remoteIp.addr = it->second.network.sin_addr;
+            extra.connLimit = rankCount_;
+            snprintf(extra.tag, sizeof(extra.tag), "mf_q2_%u_1", it->first);
+            whitelist.emplace_back(extra);
+            BM_LOG_INFO("route-A server: extra whitelist entry rank " << it->first << " tag '" << extra.tag << "'");
+        }
     }
 
     if (whitelist.empty()) {
@@ -437,138 +462,82 @@ int FixedRanksQpManager::CreateQpWaitingReady(std::unordered_map<uint32_t, AiCor
             }
         }
         if (connectingCount == 0) {
-            /* route-A v3 experiment (MF_SOCKS_PER_PEER=2), multi-port variant -- the only
-             * client-side multiplicity left after v1-v4 ruled everything else out: the same
-             * (ip,port) endpoint admits exactly one connection (late connect -> explicit
-             * 0x5020F rejection + MR-register poisoning, in-batch duplicate -> silently
-             * ignored), while the socket layer natively multiplexes by port (listen-port
-             * retry loop, per-rank ports in the HCCL rank table). Server listens on
-             * port+1 with its own handle and whitelist, client connects a fresh socket to
-             * port+1, a probe QP rides that dedicated fd. Primary machinery untouched.
-             * Set on BOTH sides. */
+            /* route-A v5 experiment (MF_SOCKS_PER_PEER=2) -- HCCL-style same-endpoint
+             * multiplicity by per-connection TAG. Evidence chain: HCCL's HcclSocketManager
+             * (ConstructSockets/MakeUniqueConnTag/ConstructWhiteList) builds
+             * socketsPerLink connections per peer to the SAME (ip,port) on the SAME local
+             * handle, each carrying a unique tag "<commTag>_Inter_MultiSocket_<clientRank>_<i>",
+             * whitelisted per-tag up front on the server's single listen socket. Our recap:
+             * late connect to a busy endpoint -> explicit 0x5020F rejection + MR-register
+             * poisoning, in-batch duplicate with the SAME empty tag -> silently ignored --
+             * the untested cell is "in-batch + distinct tag", exactly what HCCL ships.
+             * Client appends the tagged entry in StartClientSide's initial batch; server
+             * whitelists it in GenerateWhiteList before any connect arrives. Here both
+             * sides fetch the extra fd by a tag-scoped query and a probe QP rides it.
+             * Primary machinery untouched. Set on BOTH sides. */
             uint32_t socksPerPeer = 1;
             if (const char *env = getenv("MF_SOCKS_PER_PEER")) {
                 socksPerPeer = static_cast<uint32_t>(atoi(env));
             }
             if (socksPerPeer > 1) {
                 const bool clientSide = (&connections == &clientConnections_);
-                void *secondListenHandle = nullptr; /* server only: extra listen on port+1 */
-                uint16_t secondPort = 0;
                 struct RouteAProbe {
                     uint32_t rank;
                     void *qp;
-                    void *closeHandle; /* owning socket handle for the extra fd teardown */
+                    void *ownHandle; /* local socket handle owning the extra fd (shared with primary) */
                     void *extraFd;
                     int lastStatus;
                 };
                 std::vector<RouteAProbe> probes;
-                if (!clientSide && !connections.empty()) {
-                    secondListenHandle = CreateLocalSocket();
-                    if (secondListenHandle == nullptr) {
-                        BM_LOG_WARN("route-A server: create second listen socket failed");
-                    } else {
-                        secondPort = htons(static_cast<uint16_t>(ntohs(deviceAddress_.sin_port) + 1));
-                        HccpSocketListenInfo listenInfo{};
-                        listenInfo.handle = secondListenHandle;
-                        listenInfo.port = secondPort;
-                        auto lret = DlHccpApi::RaSocketListenStart(&listenInfo, 1);
-                        BM_LOG_INFO("route-A server: second listen on port " << ntohs(secondPort)
-                                      << " ret: " << lret << " (0x" << std::hex << lret << std::dec << ")");
-                        if (lret != 0) {
-                            (void)DlHccpApi::RaSocketDeinit(secondListenHandle);
-                            secondListenHandle = nullptr;
-                        }
-                    }
-                }
-                if (clientSide && !connections.empty()) {
-                    /* let the server's second listen come up first: both route-A phases start
-                     * at nearly the same moment (v4 logs: ~100ms apart) */
-                    std::this_thread::sleep_for(std::chrono::seconds(2));
-                }
                 for (auto it = connections.begin(); it != connections.end(); ++it) {
                     auto &channel = it->second;
-                    void *extraSocket = nullptr; /* client only: fresh socket to port+1 */
                     void *extraFd = nullptr;
                     bool reportedDup = false;
-                    if (clientSide) {
-                        extraSocket = CreateLocalSocket();
-                        if (extraSocket == nullptr) {
-                            BM_LOG_WARN("route-A client rank " << it->first << ": create extra socket failed");
-                            continue;
-                        }
-                        HccpSocketConnectInfo connInfo{};
-                        connInfo.handle = extraSocket;
-                        connInfo.remoteIp.addr = channel.remoteIp;
-                        auto rankIt = currentRanksInfo_.find(it->first);
-                        uint16_t primaryPort =
-                            (rankIt != currentRanksInfo_.end()) ? rankIt->second.network.sin_port : 0;
-                        connInfo.port = htons(static_cast<uint16_t>(ntohs(primaryPort) + 1));
-                        bzero(connInfo.tag, sizeof(connInfo.tag));
-                        auto cret = DlHccpApi::RaSocketBatchConnect(&connInfo, 1);
-                        BM_LOG_INFO("route-A client rank " << it->first << ": connect to port "
-                                      << static_cast<uint32_t>(ntohs(primaryPort)) + 1
-                                      << " ret: " << cret << " (0x" << std::hex << cret << std::dec << ")");
-                        if (cret != 0) {
-                            BM_LOG_WARN("route-A client rank " << it->first
-                                          << ": port+1 connect rejected -- explicit refusal may poison "
-                                          << "MR-register in this run; rerun without MF_SOCKS_PER_PEER");
-                            (void)DlHccpApi::RaSocketDeinit(extraSocket);
-                            continue;
-                        }
-                    } else if (secondListenHandle != nullptr) {
-                        /* whitelist the peer on the second listen handle (empty tag, same as
-                         * the primary combination proven to work) */
-                        HccpSocketWhiteListInfo whiteList{};
-                        whiteList.remoteIp.addr = channel.remoteIp;
-                        whiteList.connLimit = rankCount_;
-                        bzero(whiteList.tag, sizeof(whiteList.tag));
-                        auto wret = DlHccpApi::RaSocketWhiteListAdd(secondListenHandle, &whiteList, 1);
-                        BM_LOG_INFO("route-A server rank " << it->first << ": whitelist add on second listen"
-                                      << " ret: " << wret << " (0x" << std::hex << wret << std::dec << ")");
-                    } else {
-                        continue; /* no second listen, nothing to probe for this rank */
-                    }
+                    /* the tag must match on both ends: derive it from the CLIENT's rank,
+                     * like HCCL's MakeUniqueConnTag (clientRank + link index); the remote
+                     * peer is the client when we are the server */
+                    const uint32_t clientRank = clientSide ? rankId_ : it->first;
+                    char tag[64];
+                    snprintf(tag, sizeof(tag), "mf_q2_%u_1", clientRank);
                     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
                     while (std::chrono::steady_clock::now() < deadline) {
                         HccpSocketInfo info{};
-                        info.handle = clientSide ? extraSocket : secondListenHandle;
+                        info.handle = channel.socketHandle;
                         info.fd = nullptr;
                         info.remoteIp.addr = channel.remoteIp;
                         info.status = 0;
+                        snprintf(info.tag, sizeof(info.tag), "%s", tag);
                         uint32_t cnt = 0;
                         auto gret = DlHccpApi::RaGetSockets(clientSide ? 1U : 0U, &info, 1, cnt);
                         if (gret == 0 && cnt > 0 && info.status == 1) {
-                            if (info.fd == channel.socketFd) {
+                            if (info.fd == nullptr || info.fd == channel.socketFd) {
                                 if (!reportedDup) {
                                     reportedDup = true;
                                     BM_LOG_INFO("route-A " << (clientSide ? "client" : "server") << " rank "
-                                                  << it->first << ": query returned the PRIMARY fd again, "
-                                                  << "waiting for a distinct second fd");
+                                                  << it->first << ": tag query '" << tag << "' answered with the "
+                                                  << "primary fd, waiting for a distinct tagged fd");
                                 }
                             } else {
                                 extraFd = info.fd;
                                 BM_LOG_INFO("route-A " << (clientSide ? "client" : "server") << " rank "
-                                              << it->first << ": got second fd: " << extraFd
+                                              << it->first << ": got tagged fd: " << extraFd
                                               << " (primary: " << channel.socketFd << ") tag: '" << info.tag << "'");
                                 break;
                             }
                         } else if (gret == 0 && cnt > 0 && info.status == 2) {
                             BM_LOG_WARN("route-A " << (clientSide ? "client" : "server") << " rank " << it->first
-                                          << ": extra socket connect status 2 (timeout/rejected)");
+                                          << ": tagged socket '" << tag << "' status 2 (timeout/rejected)");
                             break;
                         }
                         std::this_thread::sleep_for(std::chrono::milliseconds(100));
                     }
                     if (extraFd == nullptr) {
                         BM_LOG_WARN("route-A " << (clientSide ? "client" : "server") << " rank " << it->first
-                                      << ": no distinct second fd within deadline");
-                        if (extraSocket != nullptr) {
-                            (void)DlHccpApi::RaSocketDeinit(extraSocket);
-                        }
+                                      << ": no distinct tagged fd within deadline (tag '" << tag << "')");
                         continue;
                     }
 
-                    /* probe QP on the dedicated second fd */
+                    /* probe QP on the tagged second fd */
                     HccpQpExtAttrs attr{};
                     attr.qpMode = NETWORK_OFFLINE;
                     attr.version = QP_VERSION;
@@ -588,14 +557,13 @@ int FixedRanksQpManager::CreateQpWaitingReady(std::unordered_map<uint32_t, AiCor
                     }
                     pret = DlHccpApi::RaQpConnectAsync(probeHandle, extraFd);
                     BM_LOG_INFO("route-A rank " << it->first
-                                  << ": probe qp connect_async on DEDICATED fd ret: " << pret
+                                  << ": probe qp connect_async on TAGGED fd ret: " << pret
                                   << " (0x" << std::hex << pret << std::dec << ")");
                     if (pret != 0) {
                         (void)DlHccpApi::RaQpDestroy(probeHandle);
                         continue;
                     }
-                    probes.push_back(RouteAProbe{it->first, probeHandle,
-                                                 clientSide ? extraSocket : secondListenHandle, extraFd, -1});
+                    probes.push_back(RouteAProbe{it->first, probeHandle, channel.socketHandle, extraFd, -1});
                 }
 
                 if (!probes.empty()) {
@@ -630,31 +598,17 @@ int FixedRanksQpManager::CreateQpWaitingReady(std::unordered_map<uint32_t, AiCor
                         std::this_thread::sleep_for(std::chrono::milliseconds(200));
                     }
                     BM_LOG_INFO("route-A probe verdict: " << probeConnected << "/" << probes.size()
-                                  << " QPs connected on dedicated second sockets");
+                                  << " QPs connected on tagged second sockets");
                     for (auto &p : probes) {
                         (void)DlHccpApi::RaQpDestroy(p.qp);
                         HccpSocketCloseInfo closeInfo{};
-                        closeInfo.handle = p.closeHandle;
+                        closeInfo.handle = p.ownHandle;
                         closeInfo.fd = p.extraFd;
                         closeInfo.linger = 1;
                         (void)DlHccpApi::RaSocketBatchClose(&closeInfo, 1);
-                        if (clientSide) {
-                            /* the client owns the second local socket handle, tear it down too;
-                             * the server's closeHandle is the shared listen handle, keep it */
-                            (void)DlHccpApi::RaSocketDeinit(p.closeHandle);
-                        }
                     }
                 } else {
                     BM_LOG_WARN("route-A probe verdict: no probe QPs were set up");
-                }
-                if (secondListenHandle != nullptr) {
-                    HccpSocketListenInfo stopInfo{};
-                    stopInfo.handle = secondListenHandle;
-                    stopInfo.port = secondPort;
-                    auto sret = DlHccpApi::RaSocketListenStop(&stopInfo, 1);
-                    BM_LOG_INFO("route-A server: second listen stop ret: " << sret);
-                    (void)DlHccpApi::RaSocketDeinit(secondListenHandle);
-                    secondListenHandle = nullptr;
                 }
             }
             return FillQpInfo();
