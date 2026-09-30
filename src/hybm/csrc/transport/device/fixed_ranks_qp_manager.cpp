@@ -10,6 +10,9 @@
  * See the Mulan PSL v2 for more details.
 */
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <vector>
 #include "hybm_logger.h"
 #include "dl_acl_api.h"
 #include "dl_hccp_api.h"
@@ -329,6 +332,14 @@ int FixedRanksQpManager::CheckReadyConnection(std::unordered_map<uint32_t, AiCor
     }
 
     if (pos->second.socketFd != nullptr) {
+        if (getenv("MF_SOCKS_PER_PEER") != nullptr) {
+            /* route-A experiment: a second tagged socket per peer may surface in the normal
+             * polling loop, do not kill the join -- the experiment phase fetches the extra
+             * fd by explicit query, this log line itself is a semantics readout */
+            BM_LOG_INFO("route-A: extra accept from rank " << rankId << " surfaced in normal polling, fd: "
+                          << socketInfo.fd << " tag: '" << socketInfo.tag << "'");
+            return BM_OK;
+        }
         BM_LOG_ERROR("socket ip(" << DescribeIPv4(addr) << ") already get socket fd.");
         return BM_DL_FUNCTION_FAILED;
     }
@@ -425,6 +436,163 @@ int FixedRanksQpManager::CreateQpWaitingReady(std::unordered_map<uint32_t, AiCor
             }
         }
         if (connectingCount == 0) {
+            /* route-A experiment (MF_SOCKS_PER_PEER=2): verify N-sockets-per-peer before the
+             * real multi-QP work. Client side opens a SECOND tagged socket to each peer,
+             * server side fetches the second accepted fd, then a probe QP is connected over
+             * the dedicated fd (exactly the primary single-QP flow on its own socket). The
+             * primary channel/QP1 machinery is untouched. Set on BOTH sides. */
+            uint32_t socksPerPeer = 1;
+            if (const char *env = getenv("MF_SOCKS_PER_PEER")) {
+                socksPerPeer = static_cast<uint32_t>(atoi(env));
+            }
+            if (socksPerPeer > 1) {
+                const bool clientSide = (&connections == &clientConnections_);
+                struct RouteAProbe {
+                    uint32_t rank;
+                    void *qp;
+                    void *closeHandle; /* owning socket handle for the extra fd teardown */
+                    void *extraFd;
+                    int lastStatus;
+                };
+                std::vector<RouteAProbe> probes;
+                for (auto it = connections.begin(); it != connections.end(); ++it) {
+                    auto &channel = it->second;
+                    void *extraSocket = nullptr; /* client only: second local socket */
+                    void *extraFd = nullptr;
+                    bool reportedDup = false;
+                    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+                    while (std::chrono::steady_clock::now() < deadline) {
+                        if (clientSide && extraSocket == nullptr) {
+                            extraSocket = CreateLocalSocket();
+                            if (extraSocket == nullptr) {
+                                BM_LOG_WARN("route-A client rank " << it->first << ": create second socket failed");
+                                break;
+                            }
+                            HccpSocketConnectInfo connInfo{};
+                            connInfo.handle = extraSocket;
+                            connInfo.remoteIp.addr = channel.remoteIp;
+                            auto rankIt = currentRanksInfo_.find(it->first);
+                            connInfo.port = (rankIt != currentRanksInfo_.end()) ? rankIt->second.network.sin_port : 0;
+                            (void)snprintf(connInfo.tag, sizeof(connInfo.tag), "1");
+                            auto cret = DlHccpApi::RaSocketBatchConnect(&connInfo, 1);
+                            BM_LOG_INFO("route-A client rank " << it->first
+                                          << ": second socket (tag 1) batch connect ret: " << cret);
+                            if (cret != 0) {
+                                break;
+                            }
+                        }
+                        HccpSocketInfo info{};
+                        info.handle = clientSide ? extraSocket : serverSocketHandle_;
+                        info.fd = nullptr;
+                        info.remoteIp.addr = channel.remoteIp;
+                        info.status = 0;
+                        uint32_t cnt = 0;
+                        auto gret = DlHccpApi::RaGetSockets(clientSide ? 1U : 0U, &info, 1, cnt);
+                        if (gret == 0 && cnt > 0 && info.status == 1) {
+                            if (info.fd == channel.socketFd) {
+                                if (!reportedDup) {
+                                    reportedDup = true;
+                                    BM_LOG_INFO("route-A " << (clientSide ? "client" : "server") << " rank "
+                                                  << it->first << ": query returned the PRIMARY fd again, "
+                                                  << "waiting for a distinct second fd");
+                                }
+                            } else {
+                                extraFd = info.fd;
+                                BM_LOG_INFO("route-A " << (clientSide ? "client" : "server") << " rank "
+                                              << it->first << ": got second fd: " << extraFd
+                                              << " (primary: " << channel.socketFd << ") tag: '" << info.tag << "'");
+                                break;
+                            }
+                        }
+                        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                    }
+                    if (extraFd == nullptr) {
+                        BM_LOG_WARN("route-A " << (clientSide ? "client" : "server") << " rank " << it->first
+                                      << ": no distinct second fd within deadline");
+                        if (extraSocket != nullptr) {
+                            HccpSocketCloseInfo closeInfo{};
+                            closeInfo.handle = extraSocket;
+                            closeInfo.fd = nullptr;
+                            closeInfo.linger = 1;
+                            (void)DlHccpApi::RaSocketBatchClose(&closeInfo, 1);
+                        }
+                        continue;
+                    }
+
+                    /* probe QP on the dedicated second fd */
+                    HccpQpExtAttrs attr{};
+                    attr.qpMode = NETWORK_OFFLINE;
+                    attr.version = QP_VERSION;
+                    attr.cqAttr.sendCqDepth = SEND_CQ_DEPTH;
+                    attr.cqAttr.recvCqDepth = RECV_DQ_DEPTH;
+                    attr.qp_attr.cap.max_recv_sge = MAX_RECV_SGE;
+                    attr.qp_attr.cap.max_recv_wr = MAX_RECV_WR;
+                    attr.qp_attr.qp_type = IBV_QPT_RC;
+                    attr.qp_attr.cap.max_send_wr = MAX_SEND_WR;
+                    attr.data_plane_flag.bs.cq_cstm = CQ_CUSTOM_FLAG;
+                    HccpAiQpInfo probeInfo{};
+                    void *probeHandle = nullptr;
+                    auto pret = DlHccpApi::RaQpAiCreate(rdmaHandle_, attr, probeInfo, probeHandle);
+                    if (pret != 0 || probeHandle == nullptr) {
+                        BM_LOG_WARN("route-A rank " << it->first << ": probe qp create failed: " << pret);
+                        continue;
+                    }
+                    pret = DlHccpApi::RaQpConnectAsync(probeHandle, extraFd);
+                    BM_LOG_INFO("route-A rank " << it->first
+                                  << ": probe qp connect_async on DEDICATED fd ret: " << pret);
+                    if (pret != 0) {
+                        (void)DlHccpApi::RaQpDestroy(probeHandle);
+                        continue;
+                    }
+                    probes.push_back(RouteAProbe{it->first, probeHandle,
+                                                 clientSide ? extraSocket : serverSocketHandle_, extraFd, -1});
+                }
+
+                if (!probes.empty()) {
+                    auto probeDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+                    uint32_t probeConnected = 0;
+                    while (std::chrono::steady_clock::now() < probeDeadline) {
+                        uint32_t pending = 0;
+                        for (auto &p : probes) {
+                            int status = 0;
+                            auto sret = DlHccpApi::RaGetQpStatus(p.qp, status);
+                            if (sret != 0) {
+                                if (p.lastStatus != -2) {
+                                    BM_LOG_WARN("route-A probe qp " << p.rank << " get status failed: " << sret);
+                                    p.lastStatus = -2;
+                                }
+                                pending++;
+                                continue;
+                            }
+                            if (status != p.lastStatus) {
+                                BM_LOG_INFO("route-A probe qp " << p.rank << " status: " << p.lastStatus
+                                              << " -> " << status);
+                                p.lastStatus = status;
+                            }
+                            if (status != 1) {
+                                pending++;
+                            }
+                        }
+                        probeConnected = static_cast<uint32_t>(probes.size()) - pending;
+                        if (pending == 0) {
+                            break;
+                        }
+                        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                    }
+                    BM_LOG_INFO("route-A probe verdict: " << probeConnected << "/" << probes.size()
+                                  << " QPs connected on dedicated second sockets");
+                    for (auto &p : probes) {
+                        (void)DlHccpApi::RaQpDestroy(p.qp);
+                        HccpSocketCloseInfo closeInfo{};
+                        closeInfo.handle = p.closeHandle;
+                        closeInfo.fd = p.extraFd;
+                        closeInfo.linger = 1;
+                        (void)DlHccpApi::RaSocketBatchClose(&closeInfo, 1);
+                    }
+                } else {
+                    BM_LOG_WARN("route-A probe verdict: no probe QPs were set up");
+                }
+            }
             return FillQpInfo();
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
