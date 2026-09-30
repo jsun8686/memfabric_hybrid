@@ -22,6 +22,26 @@
 #include "kernel_operator.h"
 #include "smem_ralloc_aicore_base_rdma.h"
 #include "smem_ralloc_device_launch_def.h"
+#include <cstdlib>
+
+/* host-side launch config: one kernel block per QP lane. Reads the same env as the
+ * transport layer (FixedRanksQpManager::ResolveQpsPerPeer), so table layout, block
+ * count and lane mapping stay consistent, and graph capture replays identically. */
+static uint32_t smem_ralloc_device_qps_per_peer()
+{
+    const char *env = getenv("MF_QPS_PER_PEER");
+    if (env == nullptr) {
+        return 1;
+    }
+    long v = atol(env);
+    if (v < 1) {
+        v = 1;
+    }
+    if (v > 4) {
+        v = 4;
+    }
+    return (uint32_t)v;
+}
 
 /* must carry __aicore__: helpers without it compile as host functions and cannot be called
  * from __global__ __aicore__ kernels, nor use aicore-only TPipe/TQue APIs inside */
@@ -102,7 +122,13 @@ extern "C" void smem_ralloc_device_read_run_submit(uint32_t entityId, uint32_t s
 extern "C" __global__ __aicore__ void smem_ralloc_device_batch_run_kernel(struct smem_ralloc_device_batch_args args)
 {
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
-    if (AscendC::GetBlockIdx() != 0) {
+    /* multi-QP: one block per QP lane, block b exclusively owns lane b (the SQ head is a
+     * single-producer index -- two blocks posting into one lane would race it). Blocks
+     * beyond the table's lane count (stale table vs newer launch config) exit. */
+    __gm__ void *qpInfoVa = smem_ralloc_get_qp_info_address(args.entityId);
+    uint32_t laneNum = ((__gm__ SmemRallocRdmaInfo *)qpInfoVa)->qpNum;
+    uint32_t blockIdx = AscendC::GetBlockIdx();
+    if (laneNum == 0 || blockIdx >= laneNum) {
         return;
     }
 
@@ -113,30 +139,33 @@ extern "C" __global__ __aicore__ void smem_ralloc_device_batch_run_kernel(struct
     AscendC::LocalTensor<uint32_t> ubLocal32;
     smem_ralloc_device_ub_alloc(pipe, que64, que32, ubLocal64, ubLocal32);
 
-    for (uint32_t i = 0; i < args.count; i++) {
+    /* even deterministic distribution: segment j goes to block j % laneNum, so a graph
+     * replay issues the identical WQE stream per lane */
+    for (uint32_t i = blockIdx; i < args.count; i += laneNum) {
         const struct smem_ralloc_device_batch_seg *seg = &args.segs[i];
         if (seg->isWrite != 0U) {
             smem_ralloc_roce_write(args.entityId, (__gm__ uint8_t *)seg->src, (__gm__ uint8_t *)seg->dst,
-                                   seg->peerRank, 0, seg->size, ubLocal64, ubLocal32);
+                                   seg->peerRank, blockIdx, seg->size, ubLocal64, ubLocal32);
         } else {
             smem_ralloc_roce_read(args.entityId, (__gm__ uint8_t *)seg->src, (__gm__ uint8_t *)seg->dst,
-                                  seg->peerRank, 0, seg->size, ubLocal64, ubLocal32);
+                                  seg->peerRank, blockIdx, seg->size, ubLocal64, ubLocal32);
         }
     }
 
-    /* one quiet per distinct peer: the CQE consumer index is per connection, a single
-     * quiet waits for every segment already posted on that connection */
-    for (uint32_t i = 0; i < args.count; i++) {
+    /* per-block quiet: each block waits only for the WQEs it posted on its own lane, the
+     * N lanes' completion waits overlap in parallel (single-lane configs keep today's
+     * one-quiet-per-distinct-peer semantics on the lanes used) */
+    for (uint32_t i = blockIdx; i < args.count; i += laneNum) {
         uint32_t peer = args.segs[i].peerRank;
         bool first = true;
-        for (uint32_t j = 0; j < i; j++) {
+        for (uint32_t j = blockIdx; j < i; j += laneNum) {
             if (args.segs[j].peerRank == peer) {
                 first = false;
                 break;
             }
         }
         if (first) {
-            (void)smem_ralloc_roce_quiet(args.entityId, peer, 0, ubLocal64, ubLocal32);
+            (void)smem_ralloc_roce_quiet(args.entityId, peer, blockIdx, ubLocal64, ubLocal32);
         }
     }
 
@@ -147,6 +176,7 @@ extern "C" __global__ __aicore__ void smem_ralloc_device_batch_run_kernel(struct
 extern "C" void smem_ralloc_device_batch_run_submit(const struct smem_ralloc_device_batch_args *args, void *stream)
 {
     /* host side: copy the precheck-resolved segment table into the launch argument area,
-     * the kernel receives it by value and never dereferences host memory */
-    smem_ralloc_device_batch_run_kernel<<<1, nullptr, stream>>>(*args);
+     * the kernel receives it by value and never dereferences host memory; launch one
+     * block per QP lane so the kernel's block-to-lane mapping has a 1:1 producer */
+    smem_ralloc_device_batch_run_kernel<<<smem_ralloc_device_qps_per_peer(), nullptr, stream>>>(*args);
 }

@@ -162,6 +162,26 @@ kill -TERM <daemon_pid>
 - verify 失败但 warmup 成功：优先怀疑计时期间链路/对端异常，`log/far_dev{N}.log`
   找 CQE 状态打印
 
+## 多 QP（MF_QPS_PER_PEER）
+
+设备侧每对 rank 建 N 条 QP 连接（N=env 值，钳制 [1,4]，默认 1 = 原单 QP 行为），内核
+批量任务均匀分发到各 lane 并行：
+
+- **连接拓扑**：全部 lane 连同一 `(ip, port)`，以 tag 区分（lane 0 = 原空 tag 主连接，
+  lane i≥1 = `mf_q2_<clientRank>_<i>`，client 侧 rank 生成、双端一致——与 HCCL
+  `HcclSocketManager` 生产接线同款；本 hccp 构建经 route-A v5 实验验证支持）
+- **内核形态**：批量内核 `blockDim = N`，block b 独占 lane b（SQ head 是单生产者索引，
+  1:1 绑定免锁）；段 j 走 block `j % N`，确定性分发（graph 重放一致）；每 block 末尾
+  只 quiet 自己 lane 的 distinct peer——N 路 quiet 并行等待，**小 IO 区每 chunk 的串行
+  quiet（~1.8us/段）是主要收益靶点**
+- **运行**：双端同设，如 `MF_QPS_PER_PEER=2 python3 memfabric_daemon.py ...` /
+  `MF_QPS_PER_PEER=2 python3 memfabric_client.py ...`（不全设 = 连接失败，all-or-nothing：
+  任一 lane 失败即中止启动，不留死 lane）
+- **判读**：`multi-QP enabled`（Startup）/ `multi-QP client|server ... lane i ... tag`
+  （建立）；性能对比看 2K-16K 小 IO 区每块时间（单 QP 基线 1.65-2.03us/块）与
+  128K-1M 大 IO 吞吐（应持平，已线速）；direct 模式单发不受益（单段无分发）
+- 历史实验门控 `MF_SOCKS_PER_PEER` 已由正式实现取代并移除
+
 ## 排障（精简）
 | 症状 | 处置 |
 |---|---|

@@ -36,18 +36,25 @@ public:
     void PutQpHandle(UserQpInfo *qp) const noexcept override;
 
 private:
+    /* upper bound of QP lanes per peer (MF_QPS_PER_PEER, clamped); lane 0 is the legacy
+     * empty-tag primary connection, lanes 1..N-1 carry tagged connections
+     * "mf_q2_<clientRank>_<lane>" multiplexing the same (ip, port) endpoint */
+    static constexpr uint32_t MAX_QP_LANES = 4;
+
     struct AiCoreConnChannel {
         in_addr remoteIp;
         void *socketHandle;
-        void *socketFd{nullptr};
-        void *qpHandle{};
-        HccpAiQpInfo aiQpInfo{};
-        int qpStatus{-1};
+        void *socketFd[MAX_QP_LANES]{};
+        void *qpHandle[MAX_QP_LANES]{};
+        HccpAiQpInfo aiQpInfo[MAX_QP_LANES]{};
+        int qpStatus[MAX_QP_LANES]{-1, -1, -1, -1};
 
         explicit AiCoreConnChannel(const in_addr ip) : AiCoreConnChannel{ip, nullptr} {}
         AiCoreConnChannel(in_addr ip, void *sock) : remoteIp{ip}, socketHandle{sock} {}
     };
 
+    static uint32_t ResolveQpsPerPeer() noexcept;
+    static void MakeLaneTag(char *buf, size_t bufSize, uint32_t clientRank, uint32_t lane) noexcept;
     bool ReserveQpInfoSpace() noexcept;
     void ReleaseQpInfoSpace() noexcept;
     int StartServerSide() noexcept;
@@ -58,7 +65,7 @@ private:
                              const std::unordered_map<in_addr_t, uint32_t> addr2index,
                              const HccpSocketInfo &socketInfo) noexcept;
     int CreateQpWaitingReady(std::unordered_map<uint32_t, AiCoreConnChannel> &connections) noexcept;
-    int CreateOneQp(AiCoreConnChannel &channel) noexcept;
+    int CreateOneQp(AiCoreConnChannel &channel, uint32_t lane) noexcept;
     int FillQpInfo() noexcept;
     void CopyAiWQInfo(struct AiQpRMAWQ &dest, const struct ai_data_plane_wq &src, DBMode dbMode, uint32_t sl) noexcept;
     void CopyAiCQInfo(struct AiQpRMACQ &dest, const ai_data_plane_cq &source, DBMode dbMode) noexcept;
@@ -72,6 +79,7 @@ private:
     std::atomic<int> serverConnectResult{-1};
     std::atomic<int> clientConnectResult{-1};
     uint32_t qpInfoSize_{0};
+    uint32_t qpsPerPeer_{1};
     void *rdmaHandle_{nullptr};
     std::unordered_map<uint32_t, ConnectRankInfo> currentRanksInfo_;
     MemoryRegionMap currentLocalMrs_;
