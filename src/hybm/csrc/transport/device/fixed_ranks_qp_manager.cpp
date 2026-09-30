@@ -31,6 +31,12 @@ constexpr uint32_t MAX_RECV_WR = 128;
 constexpr uint32_t MAX_SEND_WR = 8192;
 constexpr uint32_t CQ_CUSTOM_FLAG = 1;
 constexpr int COPY_INFO_SL = 4;
+/* route-A v4 experiment (MF_SOCKS_PER_PEER=2): per-rank extra client sockets submitted in
+ * the SAME initial RaSocketBatchConnect as the primaries, mirroring the HCCL multi-QP wiring
+ * (transport_direct_npu.cc: one socket per QP, all sockets set up at link establishment,
+ * QP[i] connected over sockets[i]). A late second connect (v2) is rejected by the hccp
+ * same-endpoint dedup with 0x5020F. rank -> local extra socket handle */
+static std::unordered_map<uint32_t, void *> gRouteAExtraSockets;
 FixedRanksQpManager::FixedRanksQpManager(uint32_t deviceId, uint32_t rankId, uint32_t rankCount,
                                          sockaddr_in devNet) noexcept
     : DeviceQpManager(deviceId, rankId, rankCount, devNet, HYBM_ROLE_PEER)
@@ -235,6 +241,10 @@ int FixedRanksQpManager::StartClientSide() noexcept
     }
 
     std::vector<HccpSocketConnectInfo> connectInfos;
+    uint32_t socksPerPeer = 1;
+    if (const char *env = getenv("MF_SOCKS_PER_PEER")) {
+        socksPerPeer = static_cast<uint32_t>(atoi(env));
+    }
     for (auto it = currentRanksInfo_.begin(); it != currentRanksInfo_.end(); ++it) {
         if (it->first >= rankId_) {
             continue; // client connect to small ranks.
@@ -255,6 +265,25 @@ int FixedRanksQpManager::StartClientSide() noexcept
         bzero(connectInfo.tag, sizeof(connectInfo.tag));
         BM_LOG_DEBUG("add connecting server " << connectInfo);
         connectInfos.emplace_back(connectInfo);
+
+        if (socksPerPeer > 1) {
+            /* v4: the extra socket rides the SAME initial batch connect as the primary --
+             * HCCL's proven wiring (one socket per QP, all sockets up front at link setup) */
+            auto extraHandle = CreateLocalSocket();
+            if (extraHandle == nullptr) {
+                BM_LOG_WARN("route-A client rank " << it->first << ": create extra socket failed");
+            } else {
+                gRouteAExtraSockets[it->first] = extraHandle;
+                HccpSocketConnectInfo extraInfo{};
+                extraInfo.handle = extraHandle;
+                extraInfo.remoteIp.addr = it->second.network.sin_addr;
+                extraInfo.port = it->second.network.sin_port;
+                bzero(extraInfo.tag, sizeof(extraInfo.tag));
+                connectInfos.emplace_back(extraInfo);
+                BM_LOG_INFO("route-A client rank " << it->first
+                              << ": extra socket added to the initial connect batch");
+            }
+        }
     }
 
     auto ret = DlHccpApi::RaSocketBatchConnect(connectInfos.data(), connectInfos.size());
@@ -436,11 +465,12 @@ int FixedRanksQpManager::CreateQpWaitingReady(std::unordered_map<uint32_t, AiCor
             }
         }
         if (connectingCount == 0) {
-            /* route-A experiment (MF_SOCKS_PER_PEER=2): verify N-sockets-per-peer before the
-             * real multi-QP work. Client side opens a SECOND tagged socket to each peer,
-             * server side fetches the second accepted fd, then a probe QP is connected over
-             * the dedicated fd (exactly the primary single-QP flow on its own socket). The
-             * primary channel/QP1 machinery is untouched. Set on BOTH sides. */
+            /* route-A v4 experiment (MF_SOCKS_PER_PEER=2): verify N-sockets-per-peer following
+             * the HCCL multi-QP wiring. The client's extra socket was submitted in the same
+             * initial batch connect as the primary (StartClientSide), the server fetches the
+             * second accepted fd, then a probe QP is connected over the dedicated fd (the
+             * primary single-QP flow on its own socket). Primary channel/QP1 machinery is
+             * untouched. Set on BOTH sides. */
             uint32_t socksPerPeer = 1;
             if (const char *env = getenv("MF_SOCKS_PER_PEER")) {
                 socksPerPeer = static_cast<uint32_t>(atoi(env));
@@ -457,55 +487,20 @@ int FixedRanksQpManager::CreateQpWaitingReady(std::unordered_map<uint32_t, AiCor
                 std::vector<RouteAProbe> probes;
                 for (auto it = connections.begin(); it != connections.end(); ++it) {
                     auto &channel = it->second;
-                    void *extraSocket = nullptr; /* client only: second local socket */
+                    void *extraSocket = nullptr; /* client only: extra local socket (pre-submitted) */
                     void *extraFd = nullptr;
                     bool reportedDup = false;
                     if (clientSide) {
-                        /* v2: tag "1" first (matched by the server-side tag whitelist added in
-                         * the server branch), then an empty tag fallback (rides the primary
-                         * whitelist entry); both failing indicates a same-IP single-connect
-                         * policy and is the readout for the v3 multi-port variant */
-                        const char *attemptTags[] = {"1", ""};
-                        for (auto tag : attemptTags) {
-                            void *sock = CreateLocalSocket();
-                            if (sock == nullptr) {
-                                BM_LOG_WARN("route-A client rank " << it->first << ": create second socket failed");
-                                break;
-                            }
-                            HccpSocketConnectInfo connInfo{};
-                            connInfo.handle = sock;
-                            connInfo.remoteIp.addr = channel.remoteIp;
-                            auto rankIt = currentRanksInfo_.find(it->first);
-                            connInfo.port = (rankIt != currentRanksInfo_.end()) ? rankIt->second.network.sin_port : 0;
-                            if (tag[0] != '\0') {
-                                (void)snprintf(connInfo.tag, sizeof(connInfo.tag), "%s", tag);
-                            }
-                            auto cret = DlHccpApi::RaSocketBatchConnect(&connInfo, 1);
-                            BM_LOG_INFO("route-A client rank " << it->first << ": second socket (tag '" << tag
-                                          << "') batch connect ret: " << cret << " (0x" << std::hex << cret
-                                          << std::dec << ")");
-                            if (cret == 0) {
-                                extraSocket = sock;
-                                break;
-                            }
-                            (void)DlHccpApi::RaSocketDeinit(sock);
+                        auto extraIt = gRouteAExtraSockets.find(it->first);
+                        if (extraIt == gRouteAExtraSockets.end()) {
+                            BM_LOG_WARN("route-A client rank " << it->first << ": no pre-submitted extra socket");
+                            continue;
                         }
-                    } else {
-                        /* v2: whitelist tag "1" BEFORE the client's second connect can arrive,
-                         * fixing the v1 omission (whitelist tag matching is exact) */
-                        HccpSocketWhiteListInfo whiteList{};
-                        whiteList.remoteIp.addr = channel.remoteIp;
-                        whiteList.connLimit = rankCount_;
-                        (void)snprintf(whiteList.tag, sizeof(whiteList.tag), "1");
-                        auto wret = DlHccpApi::RaSocketWhiteListAdd(serverSocketHandle_, &whiteList, 1);
-                        BM_LOG_INFO("route-A server rank " << it->first << ": whitelist add for tag '1' ret: "
-                                      << wret << " (0x" << std::hex << wret << std::dec << ")");
+                        extraSocket = extraIt->second;
+                        gRouteAExtraSockets.erase(extraIt); /* teardown below is the sole owner now */
                     }
                     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(15);
                     while (std::chrono::steady_clock::now() < deadline) {
-                        if (clientSide && extraSocket == nullptr) {
-                            break; /* both connect attempts failed, nothing to poll for */
-                        }
                         HccpSocketInfo info{};
                         info.handle = clientSide ? extraSocket : serverSocketHandle_;
                         info.fd = nullptr;
@@ -528,15 +523,20 @@ int FixedRanksQpManager::CreateQpWaitingReady(std::unordered_map<uint32_t, AiCor
                                               << " (primary: " << channel.socketFd << ") tag: '" << info.tag << "'");
                                 break;
                             }
+                        } else if (gret == 0 && cnt > 0 && info.status == 2) {
+                            BM_LOG_WARN("route-A " << (clientSide ? "client" : "server") << " rank " << it->first
+                                          << ": extra socket connect status 2 (timeout/rejected) -- "
+                                          << "same-endpoint multiplicity denied even in the initial batch");
+                            break;
                         }
                         std::this_thread::sleep_for(std::chrono::milliseconds(100));
                     }
                     if (extraFd == nullptr) {
                         BM_LOG_WARN("route-A " << (clientSide ? "client" : "server") << " rank " << it->first
-                                      << ": no distinct second fd within deadline");
+                                      << ": no distinct second fd within deadline"
+                                      << " (a rejected extra connect may poison MR-register in this run;"
+                                      << " rerun without MF_SOCKS_PER_PEER to recover)");
                         if (extraSocket != nullptr) {
-                            /* v2: plain handle teardown -- RaSocketBatchClose with a null fd is
-                             * the suspect of the transient MR-register failure seen in v1 */
                             (void)DlHccpApi::RaSocketDeinit(extraSocket);
                         }
                         continue;
