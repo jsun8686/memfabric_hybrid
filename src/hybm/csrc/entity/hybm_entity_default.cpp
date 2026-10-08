@@ -16,6 +16,7 @@
 #include "dl_api.h"
 #include "dl_acl_api.h"
 #include "dl_hal_api.h"
+#include "device_rdma_common.h"
 #include "host_hcom_common.h"
 #include "hybm_data_op_host_shm.h"
 #include "hybm_data_op_host_rdma.h"
@@ -94,7 +95,16 @@ Result MemEntityDefault::InitTagManager()
 
 int32_t MemEntityDefault::Initialize(const hybm_options *options) noexcept
 {
-    BM_ASSERT_LOG_AND_RETURN(!initialized_, "the object is initialized.", BM_OK);
+    /* full mutual exclusion against UnInitialize and other Initializers: a same-pool
+     * concurrent join could previously slip a second Initialize (or a recycle's
+     * UnInitialize) past the unlocked !initialized_ check and tear the entity mid-build
+     * (observed as a SIGSEGV in InitTransManager's string handling). Under the lock the
+     * check-then-act window closes: the racing joiner waits and then reuses the entity. */
+    std::lock_guard<std::mutex> lock(initMutex_);
+    if (initialized_) {
+        BM_LOG_INFO("the object is initialized, reuse the existing initialization.");
+        return BM_OK;
+    }
     BM_ASSERT_LOG_AND_RETURN((id_ >= 0 && (uint32_t)(id_) < HYBM_ENTITY_NUM_MAX),
                              "input entity id is invalid, input: " << id_
                                                                    << " must be less than: " << HYBM_ENTITY_NUM_MAX,
@@ -125,6 +135,10 @@ int32_t MemEntityDefault::Initialize(const hybm_options *options) noexcept
 
 void MemEntityDefault::UnInitialize() noexcept
 {
+    /* same lock as Initialize: an UnInitialize running against an in-flight Initialize
+     * (the leftover-recycle path of a concurrent join) would free members the builder
+     * is still writing into */
+    std::lock_guard<std::mutex> lock(initMutex_);
     ReleaseResources();
 }
 
@@ -331,6 +345,21 @@ void *MemEntityDefault::GetSliceVa(hybm_mem_slice_t slice)
     }
 
     BM_LOG_ERROR("failed to get slice va, invalid slice:" << slice);
+    return nullptr;
+}
+
+void *MemEntityDefault::GetSliceGva(hybm_mem_slice_t slice)
+{
+    /* the global (device-endpoint) address of the slice: with 56-bit GVA enabled this differs
+     * from GetSliceVa's local-access address (vAddress_), which trans still relies on */
+    std::shared_ptr<MemSlice> memSlice;
+    if (hbmSegment_ != nullptr && (memSlice = hbmSegment_->GetMemSlice(slice, true)) != nullptr) {
+        return reinterpret_cast<void *>(memSlice->gva_);
+    } else if (dramSegment_ != nullptr && (memSlice = dramSegment_->GetMemSlice(slice)) != nullptr) {
+        return reinterpret_cast<void *>(memSlice->gva_);
+    }
+
+    BM_LOG_ERROR("failed to get slice gva, invalid slice:" << slice);
     return nullptr;
 }
 
@@ -595,14 +624,22 @@ int32_t MemEntityDefault::ImportForTransportManager()
     if (transportPrepared_) {
         ret = transportManager_->UpdateRankOptions(prepareOptions);
     } else {
-        ret = transportManager_->Prepare(prepareOptions);
-        if (ret != BM_OK) {
-            BM_LOG_ERROR("Failed to prepare transport connect data, ret: " << ret);
-            return ret;
-        }
-        ret = transportManager_->Connect();
+        /* go through ConnectWithOptions so the base-class connected_ flag is set here; calling
+         * Prepare/Connect directly leaves it cleared and later slice imports (which also go
+         * through ConnectWithOptions) would re-Prepare an already started qp manager */
+        ret = transportManager_->ConnectWithOptions(prepareOptions);
         if (ret != BM_OK) {
             BM_LOG_ERROR("Failed to prepare transport connect, ret: " << ret);
+            return ret;
+        }
+        /* the device meta record (qpInfoAddress etc.) may have been written before the QP table
+         * existed (e.g. AllocLocalMemory during extend_local); refresh it now that QPs are ready
+         * so kernels can locate the QP/MR table. Bind this thread first: this can run on a
+         * group callback thread that has never set a device context. */
+        DlAclApi::AclrtSetDevice(HybmGetInitDeviceId());
+        ret = UpdateHybmDeviceInfo(extraCtxSize_);
+        if (ret != BM_OK) {
+            BM_LOG_ERROR("Failed to refresh device meta after transport connect, ret: " << ret);
             return ret;
         }
     }
@@ -682,6 +719,39 @@ int32_t MemEntityDefault::SetExtraContext(const void *context, uint32_t size) no
     }
 
     return UpdateHybmDeviceInfo(size);
+}
+
+int32_t MemEntityDefault::QueryMemoryKey(uint64_t addr, uint64_t &mrAddr, uint64_t &size, uint32_t &lkey,
+                                         uint32_t &rkey, uint64_t &regAddress) noexcept
+{
+    if (!initialized_) {
+        BM_LOG_ERROR("the object is not initialized, please check whether Initialize is called.");
+        return BM_NOT_INITIALIZED;
+    }
+    if (transportManager_ == nullptr) {
+        BM_LOG_ERROR("query memory key failed, no transport manager on this entity");
+        return BM_NOT_SUPPORTED;
+    }
+
+    transport::TransportMemoryKey key{};
+    auto ret = transportManager_->QueryMemoryKey(addr, key);
+    if (ret != BM_OK) {
+        BM_LOG_ERROR("query memory key failed, addr: " << std::hex << addr << " ret: " << ret);
+        return ret;
+    }
+
+    /* TransportMemoryKey is a raw key blob whose first sizeof(RegMemResult) bytes carry the
+     * device-rdma key fields (device segment occupies the low keys, see ComposeTransportManager) */
+    transport::device::RegMemKeyUnion keyUnion{};
+    keyUnion.commonKey = key;
+    mrAddr = keyUnion.deviceKey.address;
+    size = keyUnion.deviceKey.size;
+    lkey = keyUnion.deviceKey.lkey;
+    rkey = keyUnion.deviceKey.rkey;
+    regAddress = keyUnion.deviceKey.regAddress;
+    BM_LOG_INFO("query memory key ok, addr: " << std::hex << addr << " mrAddr: " << mrAddr
+                                              << " regAddress: " << regAddress << " size: " << std::dec << size);
+    return BM_OK;
 }
 
 void MemEntityDefault::Unmap() noexcept
@@ -773,6 +843,11 @@ int32_t MemEntityDefault::CopyData(hybm_copy_params &params, hybm_data_copy_dire
     if (!initialized_) {
         BM_LOG_ERROR("the object is not initialized, please check whether Initialize is called.");
         return BM_NOT_INITIALIZED;
+    }
+    if (dataOperator_ == nullptr) {
+        BM_LOG_ERROR("Data copy failed, dataOperator_ is null (entity without a host copy "
+                     "operator, e.g. ai core initiate).");
+        return BM_ERROR;
     }
     BM_ASSERT_RETURN(SetThreadAclDevice() == BM_OK, BM_ERROR);
 
@@ -960,6 +1035,7 @@ int MemEntityDefault::UpdateHybmDeviceInfo(uint32_t extCtxSize) noexcept
 
     SetHybmDeviceInfo(info);
     info.extraContextSize = extCtxSize;
+    extraCtxSize_ = extCtxSize;
     auto ret = DlAclApi::AclrtMemcpy((void *)addr, HYBM_LARGE_PAGE_SIZE, &info, sizeof(HybmDeviceMeta),
                                      ACL_MEMCPY_HOST_TO_DEVICE);
     if (ret != BM_OK) {
@@ -998,6 +1074,19 @@ int32_t MemEntityDefault::ImportForTransportPrecheck(const ExchangeInfoReader de
         // trans需要更新transportKey中的address
         if (options_.scene == HYBM_SCENE_TRANS && addresses != nullptr) {
             transportManager_->UpdateMemoryKey(transportKey.key, addresses[i]);
+        }
+
+        const auto exportedAddr = transportKey.address;
+        const bool inGvmBand = exportedAddr >= HYBM_GVM_START_ADDR && exportedAddr < HYBM_GVM_END_ADDR;
+        const bool in56BitsBand =
+            exportedAddr >= HYBM_56BITS_GVA_START_ADDR && exportedAddr < HYBM_56BITS_GVA_END_ADDR;
+        if (options_.scene != HYBM_SCENE_TRANS && (inGvmBand || in56BitsBand) &&
+            !CheckAddressInEntity(reinterpret_cast<const void *>(exportedAddr), 1)) {
+            BM_LOG_ERROR("pool window base diverged: remote rank(" << transportKey.rankId << ") slice addr:0x"
+                         << std::hex << exportedAddr << " is inside the pool GVA band but outside local windows"
+                         << " (hbm base:0x" << hbmGva_ << ", dram base:0x" << dramGva_
+                         << "); all ranks of one pool must share the same GVA window base");
+            return BM_ERROR;
         }
 
         std::unique_lock<std::mutex> uniqueLock{importMutex_};

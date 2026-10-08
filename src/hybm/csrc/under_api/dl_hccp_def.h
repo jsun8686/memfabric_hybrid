@@ -153,7 +153,9 @@ enum HccpNotifyType {
 struct HccpSocketConnectInfo {
     void *handle;                      /**< socket handle */
     HccpIpAddr remoteIp;               /**< IP address of remote socket, [0-7] is reserved for vnic */
-    uint16_t port;                     /**< Socket listening port number */
+    uint32_t port;                     /**< Socket listening port number (u32, parity with upstream
+                                        * hccp SocketConnectInfoT: a narrower field lets tag[0..1] leak
+                                        * into the port high bytes and hccp rejects the connect) */
     char tag[HCCP_SOCK_CONN_TAG_SIZE]; /**< tag must ended by '\0' */
 };
 
@@ -359,10 +361,17 @@ struct AiQpRMACQ {
 
 struct RdmaMemRegionInfo {
     uint64_t size{0}; // size of the memory region
-    uint64_t addr{0}; // start address of the memory region
+    uint64_t addr{0}; // start address of the memory region (GVA base)
     uint32_t lkey{0};
     uint32_t rkey{0}; // key of the memory region
+    uint64_t regAddress{0}; // device-dma base the MR was registered under (equals addr for hbm)
 };
+
+/* MR slots per rank in the device-visible table below: a pool block may be re-sliced (dynamic
+ * join / extend), so each rank exposes up to this many block MRs; the rest of the slots stay
+ * zero-filled (addr == 0 never matches a range lookup). Keep in sync with the vendored copies:
+ * smem_ralloc_aicore_base_rdma.h and smem_shm_aicore_base_rdma.h. */
+constexpr uint32_t MR_SLOTS_PER_RANK = 8;
 
 struct AiQpRMAQueueInfo {
     uint32_t count;
@@ -370,7 +379,7 @@ struct AiQpRMAQueueInfo {
     struct AiQpRMAWQ *rq;
     struct AiQpRMACQ *scq;
     struct AiQpRMACQ *rcq;
-    RdmaMemRegionInfo *mr;
+    RdmaMemRegionInfo *mr; /* array of [rankCount * MR_SLOTS_PER_RANK] */
 };
 
 /**

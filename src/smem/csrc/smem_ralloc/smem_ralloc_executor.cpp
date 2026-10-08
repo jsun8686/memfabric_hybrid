@@ -9,9 +9,12 @@
  * MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
  * See the Mulan PSL v2 for more details.
  */
+#include <chrono>
+#include <mutex>
 #include "smem_ralloc_executor.h"
 
 #include "smem_logger.h"
+#include "mf_env_util.h"
 #include "smem_ralloc_entry.h"
 #include "smem_ralloc_entry_manager.h"
 #include "smem_ralloc_helper.h"
@@ -62,13 +65,69 @@ Result SmemRallocExecutor::OnJoinAlloc(SmemRallocRpcMsg &msg)
         return SM_NOT_SUPPORTED;
     }
 
+    /* serialize same-pool joins on this node (extend / recycle / create phases). A racing
+     * recycle could double-UnInitialize a leftover or slip a second Create past the map
+     * dedup, both landing two Initializations (or an UnInitialize against a running
+     * Initialize) on the same shared hybm entity slot -- observed as a contributor crash
+     * (SIGSEGV) under a 4-client concurrent join. The wait is bounded below the client-side
+     * 180 s JOIN_ALLOC rpc timeout so the 2 AccWrk threads can never both park here forever;
+     * on timeout the client's bounded re-placement retries cover it. */
+    const uint32_t lockWaitSec = mf::MfEnvUtil::GetOptionalUintOrDefault("MF_RALLOC_JOIN_LOCK_WAIT_SEC", 150U);
+    /* defer_lock is mandatory: the plain unique_lock(mutex) ctor already calls lock(), and a
+     * subsequent try_lock_for would re-enter a mutex this thread owns -- undefined behavior
+     * for a non-recursive timed_mutex (observed as the join service stalling: the holder
+     * self-waits the full timeout while every other AccWrk parks unbounded in the ctor). */
+    std::unique_lock<std::timed_mutex> poolJoinLock(manager.PoolJoinLock(msg.poolId), std::defer_lock);
+    if (!poolJoinLock.try_lock_for(std::chrono::seconds(lockWaitSec))) {
+        SM_LOG_ERROR("join alloc timed out waiting for the pool join lock, pool: " << msg.poolId
+                      << " requester: " << msg.reqRank << " waited: " << lockWaitSec << "s");
+        manager.NotifyPlacementFailure(msg);
+        return SM_NOT_INITIALIZED;
+    }
+
     /* extend branch: pool already exists on this node, extend one more block on its local slot */
     SmemRallocEntryPtr existEntry;
+    if (manager.GetEntryById(msg.poolId, existEntry) == SM_OK && existEntry != nullptr) {
+        /* pool-definition consistency: a leftover entry from a previous client (still inside
+         * the reap grace window) must not serve a pool with a different layout -- 56-bit GVA
+         * mismatch would pair a 64P-window joiner with a legacy-window entity */
+        const hybm_options &cur = existEntry->GetCoreOptions();
+        auto wantOp = SmemRallocHelper::TransHybmDataOpType(static_cast<smem_ralloc_data_op_type>(msg.dataOpType));
+        auto wantBt = ((msg.dataOpType & SMEMRA_DATA_OP_DEVICE_SCHEDULE) != 0U) ? HYBM_TYPE_AI_CORE_INITIATE
+                                                                                : HYBM_TYPE_HOST_INITIATE;
+        bool mismatch = (cur.maxDRAMSize != msg.maxDramSize) || (cur.maxHBMSize != msg.maxHbmSize) ||
+                        (cur.bmDataOpType != wantOp) || (cur.bmType != wantBt) ||
+                        (cur.enable56BitsGva != (msg.enable56BitsGva != 0U));
+        if (mismatch) {
+            if (existEntry->PoolEmpty()) {
+                SM_LOG_WARN("join alloc pool-definition mismatch on empty pool: " << msg.poolId
+                              << ", recycling the leftover entry (cur dram:" << cur.maxDRAMSize
+                              << " hbm:" << cur.maxHBMSize << " op:" << cur.bmDataOpType
+                              << " 56bits:" << cur.enable56BitsGva << ", want dram:" << msg.maxDramSize
+                              << " hbm:" << msg.maxHbmSize << " op:" << wantOp
+                              << " 56bits:" << (msg.enable56BitsGva != 0U) << ")");
+                existEntry->UnInitialize();
+                (void)manager.RemoveEntryByPtr(reinterpret_cast<uintptr_t>(existEntry.Get()));
+                existEntry = nullptr; /* fall through to the create branch with the requested params */
+            } else {
+                SM_LOG_ERROR("join alloc rejected: pool-definition mismatch on a pool with live members, pool: "
+                             << msg.poolId << " (cur dram:" << cur.maxDRAMSize << " hbm:" << cur.maxHBMSize
+                             << " op:" << cur.bmDataOpType << " 56bits:" << cur.enable56BitsGva
+                             << ", want dram:" << msg.maxDramSize << " hbm:" << msg.maxHbmSize
+                             << " op:" << wantOp << " 56bits:" << (msg.enable56BitsGva != 0U) << ")");
+                manager.NotifyPlacementFailure(msg);
+                return SM_INVALID_PARAM;
+            }
+        }
+    }
     if (manager.GetEntryById(msg.poolId, existEntry) == SM_OK && existEntry != nullptr) {
         smem_ralloc_mem_info_t info{};
         auto extRet = existEntry->ExtendLocalMem(static_cast<smem_ralloc_mem_type_t>(msg.memType), msg.size, &info);
         if (extRet != SM_OK) {
             SM_LOG_ERROR("join alloc extend failed, pool: " << msg.poolId << " ret: " << extRet);
+            /* release the master's optimistic reservation: this grant will never land,
+             * parking it in the load view until the TTL would skew future placements */
+            manager.NotifyPlacementFailure(msg);
             return extRet;
         }
         /* invariant: reply below is sent strictly after ExtendLocalMem returned. Its internal
@@ -92,6 +151,13 @@ Result SmemRallocExecutor::OnJoinAlloc(SmemRallocRpcMsg &msg)
 
     hybm_options options{};
     options.bmType = HYBM_TYPE_HOST_INITIATE;
+    if ((msg.dataOpType & SMEMRA_DATA_OP_DEVICE_SCHEDULE) != 0U) {
+        if ((msg.dataOpType & SMEMRA_DATA_OP_DEVICE_RDMA) == 0U) {
+            SM_LOG_ERROR("join alloc entry(" << msg.poolId << ") failed, DEVICE_SCHEDULE without DEVICE_RDMA");
+            return SM_INVALID_PARAM;
+        }
+        options.bmType = HYBM_TYPE_AI_CORE_INITIATE;
+    }
     options.memType = SmemRallocHelper::TransHybmMemType(msg.maxDramSize, msg.maxHbmSize);
     options.bmDataOpType = SmemRallocHelper::TransHybmDataOpType(
         static_cast<smem_ralloc_data_op_type>(msg.dataOpType));
@@ -125,9 +191,14 @@ Result SmemRallocExecutor::OnJoinAlloc(SmemRallocRpcMsg &msg)
     options.scene = HYBM_SCENE_DEFAULT;
     options.dramShmFd = -1;
 
+    /* from here on, concurrent extends park in WaitForBootstrap until this branch
+     * finishes, instead of failing fast on the not-yet-inited entry */
+    entry->MarkBootstrapRunning();
     ret = entry->Initialize(options);
     if (ret != SM_OK) {
         SM_LOG_ERROR("join alloc entry init failed, result: " << ret);
+        entry->MarkBootstrapDone(false);
+        manager.NotifyPlacementFailure(msg);
         (void)manager.RemoveEntryByPtr(reinterpret_cast<uintptr_t>(entry.Get()));
         return ret;
     }
@@ -138,6 +209,9 @@ Result SmemRallocExecutor::OnJoinAlloc(SmemRallocRpcMsg &msg)
     ret = entry->Join(0);
     if (ret != SM_OK) {
         SM_LOG_ERROR("join alloc entry join failed, result: " << ret);
+        /* wake parked extends before tearing the entry down under them */
+        entry->MarkBootstrapDone(false);
+        manager.NotifyPlacementFailure(msg);
         entry->UnInitialize();
         (void)manager.RemoveEntryByPtr(reinterpret_cast<uintptr_t>(entry.Get()));
         return ret;
@@ -148,6 +222,8 @@ Result SmemRallocExecutor::OnJoinAlloc(SmemRallocRpcMsg &msg)
     ret = entry->GetLocalMemInfo(&info);
     if (ret != SM_OK || info.gva == nullptr) {
         SM_LOG_ERROR("join alloc get local mem info failed, pool: " << msg.poolId << " ret: " << ret);
+        entry->MarkBootstrapDone(false);
+        manager.NotifyPlacementFailure(msg);
         entry->UnInitialize();
         (void)manager.RemoveEntryByPtr(reinterpret_cast<uintptr_t>(entry.Get()));
         return ret != SM_OK ? ret : SM_ERROR;
@@ -157,6 +233,7 @@ Result SmemRallocExecutor::OnJoinAlloc(SmemRallocRpcMsg &msg)
     msg.ownerRank = manager.GetRankId();
     SM_LOG_INFO("join alloc success, pool: " << msg.poolId << " requester: " << msg.reqRank
                                              << " size: " << msg.size << " gva: " << info.gva);
+    entry->MarkBootstrapDone(true); /* wake extends parked in WaitForBootstrap */
     manager.PokeReporter(); /* refresh master LB view without waiting a full period */
     return SM_OK;
 }

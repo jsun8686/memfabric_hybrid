@@ -89,7 +89,9 @@ Result HybmVmmBasedSegment::ReserveMemorySpace(void **address) noexcept
     auto ret = DlHalApi::HalMemAddressReserve(&base, totalLvaSize, 0,
                                               reinterpret_cast<void *>(gvaInfo.va[HVM_DVA]), flag);
     if (ret != 0 || base != reinterpret_cast<void *>(gvaInfo.va[HVM_DVA])) {
-        BM_LOG_ERROR("prepare virtual memory size(" << totalVirtualSize_ << ") failed. ret: " << ret);
+        BM_LOG_ERROR("prepare virtual memory failed. lvaSize(" << totalLvaSize << ") requestBase("
+                     << VaToStr(gvaInfo.va[HVM_DVA]) << ") returnBase(" << VaToStr(base)
+                     << ") totalVirtualSize(" << totalVirtualSize_ << ") ret: " << ret);
         return BM_MALLOC_FAILED;
     }
     localVirtualAddress_ = (uint8_t *)reinterpret_cast<void *>(gvaInfo.va[HVM_DVA]);

@@ -42,6 +42,7 @@ typedef enum {
     SMEMRA_DATA_OP_DEVICE_RDMA = 1U << 3, /* data operation done by device RDMA */
     SMEMRA_DATA_OP_HOST_URMA = 1U << 4,   /* data operation done by host URMA */
     SMEMRA_DATA_OP_HOST_SHM = 1U << 5,    /* same-node host shared memory (no network transport) */
+    SMEMRA_DATA_OP_DEVICE_SCHEDULE = 1U << 6, /* data operation done by device RDMA and scheduled from the AICore */
     SMEMRA_DATA_OP_BUTT
 } smem_ralloc_data_op_type;
 typedef smem_ralloc_data_op_type smem_ralloc_data_op_type_t;
@@ -124,6 +125,21 @@ typedef struct {
     uint32_t batchSize;        /* number of the copy pairs */
 } smem_ralloc_batch_copy_params;
 typedef smem_ralloc_batch_copy_params smem_ralloc_batch_copy_params_t;
+
+/* routed variant of smem_ralloc_batch_copy_params: the caller asserts per-segment routing
+ * (peer rank and direction) instead of the library deriving it from the addresses, so the
+ * per-segment window/range precheck is skipped entirely. Wrong routing degrades safely:
+ * the kernel-side MR lookup misses and the WQE is skipped (no data corruption), the error
+ * is only visible through data verification. */
+typedef struct {
+    void **sources;            /* array of source addresses, batchSize entries */
+    void **destinations;       /* array of destination addresses, batchSize entries */
+    const uint64_t *dataSizes; /* array of data sizes in byte, batchSize entries */
+    const uint32_t *peerRanks; /* caller-asserted owner rank of the peer endpoint, batchSize entries */
+    const uint32_t *isWrites;  /* caller-asserted direction, 1 = WRITE (local -> peer), batchSize entries */
+    uint32_t batchSize;        /* number of the copy pairs */
+} smem_ralloc_batch_copy_ex_params;
+typedef smem_ralloc_batch_copy_ex_params smem_ralloc_batch_copy_ex_params_t;
 
 /**
  * @brief smem join/leave event type

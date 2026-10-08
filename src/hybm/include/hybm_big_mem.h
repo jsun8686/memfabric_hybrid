@@ -96,6 +96,16 @@ int32_t hybm_free_local_memory(hybm_entity_t e, hybm_mem_slice_t slice, uint32_t
 void* hybm_get_slice_va(hybm_entity_t e, hybm_mem_slice_t slice);
 
 /**
+ * @brief get the global (device-endpoint) virtual address from slice. With 56-bit GVA
+ *        enabled this differs from hybm_get_slice_va's local-access address.
+ *
+ * @param e                [in] entity created by hybm_create_entity
+ * @param slice             [in] mf slice ptr
+ * @return non-null pointer to the global virtual address of the slice or fail
+ */
+void* hybm_get_slice_gva(hybm_entity_t e, hybm_mem_slice_t slice);
+
+/**
  * @brief Query allocated va ranges within [gvaBegin, gvaEnd), ranges of all entities of this
  * process are visible, sorted by gva ascending. Ranges contributed by remote ranks are visible
  * after the local side has imported them.
@@ -192,6 +202,24 @@ int32_t hybm_remove_imported(hybm_entity_t e, uint32_t rank, uint32_t flags);
 int32_t hybm_set_extra_context(hybm_entity_t e, const void *context, uint32_t size);
 
 /**
+ * @brief Query the device-rdma memory key of one registered local memory region
+ *
+ * @param e                [in] entity created by hybm_create_entity
+ * @param addr             [in] registered local memory address
+ * @param mrAddr           [out] device-dma-visible address (gva for pool memory, original
+ *                               address for registered user HBM); usable to match the region
+ * @param size             [out] registered memory region size
+ * @param lkey             [out] local memory key of the region
+ * @param rkey             [out] remote memory key of the region
+ * @param regAddress       [out] device-dma base the MR was registered under: equals mrAddr
+ *                               for HBM registrations, the HalHostRegister iova for host-DRAM
+ *                               ones; the device SGE address derives from it
+ * @return 0 if successful, error code otherwise
+ */
+int32_t hybm_query_memory_key(hybm_entity_t e, uint64_t addr, uint64_t *mrAddr, uint64_t *size, uint32_t *lkey,
+                              uint32_t *rkey, uint64_t *regAddress);
+
+/**
  * @brief Convert GVA (Global Virtual Address) to VA (Virtual Address) with specified memory type
  *
  * @param gva              [in] Global Virtual Address to convert
@@ -200,6 +228,18 @@ int32_t hybm_set_extra_context(hybm_entity_t e, const void *context, uint32_t si
  * @return 0 if successful, error code otherwise
  */
 int32_t hybm_gva_to_va(uint64_t gva, hybm_mem_type vaMemType, uint64_t *va);
+
+/**
+ * @brief Query the device HBM address range of this platform (SVA segment where NPU-managed
+ *        tensors live). Callers outside hybm use it to tell HBM endpoints from host-DRAM
+ *        endpoints: only the former are valid as device-scheduled RDMA user endpoints (P1),
+ *        because their MR registration keeps regAddress == addr.
+ *
+ * @param start            [out] HBM segment start address
+ * @param end              [out] HBM segment end address (exclusive)
+ * @return 0 if successful, error code otherwise
+ */
+int32_t hybm_get_hbm_address_range(uint64_t *start, uint64_t *end);
 
 #ifdef __cplusplus
 }

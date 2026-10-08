@@ -228,6 +228,95 @@ uint32_t smem_ralloc_get_group_ranks(smem_ralloc_t handle, uint32_t *rankIds, ui
  */
 int32_t smem_ralloc_set_group_event_handler(smem_ralloc_t handle, smem_ralloc_group_event_cb cb, void *context);
 
+/**
+ * @brief Get the entity id of the pool inside the fixed device meta window. Kernels included
+ * from smem_ralloc_aicore_base_rdma.h use this id to self-discover the pool context (rank,
+ * QP rings, MR table) from device memory. Only meaningful for device-scheduled pools, i.e.
+ * pools created with SMEMRA_DATA_OP_DEVICE_SCHEDULE | SMEMRA_DATA_OP_DEVICE_RDMA.
+ *
+ * @param handle           [in] ralloc object handle created by <i>smem_ralloc_create</i>
+ * @return entity id, UINT32_MAX if failed
+ */
+uint32_t smem_ralloc_get_entity_id(smem_ralloc_t handle);
+
+/**
+ * @brief Submit a device-scheduled one-sided copy between device window slots, the ralloc
+ * counterpart of <i>smem_ralloc_copy</i> for pools created with SMEMRA_DATA_OP_DEVICE_SCHEDULE |
+ * SMEMRA_DATA_OP_DEVICE_RDMA. The direction is derived from the addresses: src in the local
+ * slot and dest in a peer slot issues an AICore RDMA WRITE, src in a peer slot and dest in
+ * the local slot issues an AICore RDMA READ; any other combination is rejected (the host
+ * engine is not available on such pools, see the pool type selection). The launcher only
+ * enqueues the kernel on the given stream and contains no host synchronization, so the whole
+ * job (one-sided copy + connection quiet) is NPU graph capturable. The kernel library
+ * (libmf_smem_ralloc_device_rdma.so) is built at install time, the call fails if it is
+ * missing. Completion is observed by synchronizing the stream (or replaying the graph).
+ *
+ * @param handle           [in] ralloc object handle created by <i>smem_ralloc_create</i> with
+ *                            SMEMRA_DATA_OP_DEVICE_SCHEDULE | SMEMRA_DATA_OP_DEVICE_RDMA
+ * @param src              [in] source address, must fall into a committed device window slot
+ * @param dest             [in] destination address, must fall into a committed device window slot
+ * @param size             [in] bytes to copy
+ * @param stream           [in] aclrt stream, null uses the default stream
+ * @return 0 if successful
+ */
+int32_t smem_ralloc_device_copy(smem_ralloc_t handle, const void *src, void *dest, uint64_t size, void *stream);
+
+/**
+ * @brief Submit a device-scheduled batch of one-sided copies, the ralloc counterpart of
+ * <i>smem_ralloc_copy_batch</i> for device-scheduled pools. Same address semantics and
+ * graph-capture properties as <i>smem_ralloc_device_copy</i>, applied per segment: the
+ * direction of every segment is derived from its own addresses and mixed WRITE/READ
+ * segments are allowed within one batch. All segments are prechecked before anything is
+ * enqueued; they are then driven by at most SMEM_RALLOC_DEVICE_COPY_BATCH_SEG_MAX segments
+ * per kernel launch (see smem_ralloc_device_launch_def.h), each launch quiets every peer it
+ * touched exactly once.
+ *
+ * @param handle           [in] ralloc object handle created by <i>smem_ralloc_create</i> with
+ *                            SMEMRA_DATA_OP_DEVICE_SCHEDULE | SMEMRA_DATA_OP_DEVICE_RDMA
+ * @param params           [in] batch description, same layout as <i>smem_ralloc_copy_batch</i>
+ * @param stream           [in] aclrt stream, null uses the default stream
+ * @return 0 if successful
+ */
+int32_t smem_ralloc_device_copy_batch(smem_ralloc_t handle, smem_ralloc_batch_copy_params_t *params, void *stream);
+
+/**
+ * @brief Routed variant of <i>smem_ralloc_device_copy</i>: the caller asserts the routing
+ *        (peer rank and direction) instead of the library deriving it from the addresses,
+ *        skipping the whole per-call window/range precheck (multiple full alloc-range
+ *        queries per call on the checked path). Address semantics and graph-capture
+ *        properties are unchanged. Wrong routing degrades safely: the kernel-side MR
+ *        lookup misses and the WQE is skipped (no data corruption), the error is only
+ *        visible through data verification.
+ *
+ * @param handle           [in] ralloc object handle created by <i>smem_ralloc_create</i> with
+ *                            SMEMRA_DATA_OP_DEVICE_SCHEDULE | SMEMRA_DATA_OP_DEVICE_RDMA
+ * @param src              [in] source address, write: local (slot or registered user memory),
+ *                            read: peer pool slot
+ * @param dest             [in] destination address, write: peer pool slot, read: local
+ * @param size             [in] bytes to copy, (0, 4G]
+ * @param peerRank         [in] caller-asserted owner rank of the peer endpoint
+ * @param isWrite          [in] 1 = WRITE (local -> peer), 0 = READ (peer -> local)
+ * @param stream           [in] aclrt stream, null uses the default stream
+ * @return 0 if successful
+ */
+int32_t smem_ralloc_device_copy_ex(smem_ralloc_t handle, const void *src, void *dest, uint64_t size,
+                                   uint32_t peerRank, uint32_t isWrite, void *stream);
+
+/**
+ * @brief Routed variant of <i>smem_ralloc_device_copy_batch</i>: per-segment routing
+ *        (peer rank, direction) is caller-asserted via <i>smem_ralloc_batch_copy_ex_params</i>,
+ *        skipping the per-segment precheck of the checked path. Chunking (SEG_MAX segments
+ *        per kernel launch, one quiet per touched peer) is identical to the checked path.
+ *        Wrong routing degrades safely, see <i>smem_ralloc_device_copy_ex</i>.
+ *
+ * @param handle           [in] ralloc object handle
+ * @param params           [in] routed batch description
+ * @param stream           [in] aclrt stream, null uses the default stream
+ * @return 0 if successful
+ */
+int32_t smem_ralloc_device_copy_batch_ex(smem_ralloc_t handle, smem_ralloc_batch_copy_ex_params_t *params,
+                                         void *stream);
+
 #ifdef __cplusplus
 }
 #endif

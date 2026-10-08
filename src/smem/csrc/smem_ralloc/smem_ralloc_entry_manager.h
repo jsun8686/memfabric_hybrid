@@ -14,6 +14,9 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include "smem_net_common.h"
@@ -44,6 +47,13 @@ public:
     Result GetEntryByPtr(uintptr_t ptr, SmemRallocEntryPtr &entry);
     Result GetEntryById(uint32_t id, SmemRallocEntryPtr &entry);
     Result RemoveEntryByPtr(uintptr_t ptr);
+
+    /* per-pool timed lock serializing OnJoinAlloc's extend / recycle / create phases on one
+     * node: concurrent joins for the SAME pool used to race the leftover-recycle branch into
+     * a double UnInitialize / double Create onto one shared hybm entity slot and crash the
+     * contributor (SIGSEGV in MemEntityDefault::Initialize). A join may queue behind a
+     * 100 GB bootstrap plus prior extends, so callers must use the bounded try_lock_for. */
+    std::timed_mutex &PoolJoinLock(uint32_t poolId);
 
     void Destroy();
 
@@ -101,6 +111,15 @@ public:
     /* wake the reporter for an immediate committed-bytes report (master change / join alloc / reap) */
     void PokeReporter();
 
+    /* best-effort GRANT_FAIL to the master: a granted block failed to land on this node,
+     * release its optimistic reservation so the load view recovers before the TTL */
+    void NotifyPlacementFailure(const SmemRallocRpcMsg &req);
+
+    /* a rank's store link broke (watch callback): mark it departed on every FAR entry so
+     * a phantom member of a failed join stops blocking the pool-empty reap, then wake
+     * the reporter for the fast path; erase-only semantics, no rpc on the caller thread */
+    void OnRankLinkDown(uint32_t rank);
+
 private:
     int32_t PrepareStore();
     int32_t RacingForStoreServer();
@@ -122,11 +141,16 @@ private:
     void OnMasterKeyChanged(int result, const std::vector<uint8_t> &value);
     bool ReportCommittedBytes(uint32_t retry);
     void ReapEmptyPools();
+    /* seconds until the nearest pending pool-empty mark expires (ceil), SMEMRA_REAP_NO_PENDING
+     * when nothing is pending: lets the reporter sleep to the boundary instead of a full
+     * period, so a pool left empty self-tears-down ~grace seconds after the leave */
+    uint32_t NextReapLeadSec();
 
 private:
     std::mutex entryMutex_;
     std::map<uintptr_t, SmemRallocEntryPtr> ptr2EntryMap_; /* lookup entry by ptr */
     std::map<uint32_t, SmemRallocEntryPtr> entryIdMap_;    /* deduplicate entry by id */
+    std::map<uint32_t, std::unique_ptr<std::timed_mutex>> poolJoinLocks_; /* per-pool join serialization */
     smem_ralloc_config_t config_{};
     std::string storeURL_;
     uint32_t worldSize_{0};

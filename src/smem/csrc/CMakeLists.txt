@@ -11,6 +11,7 @@
 
 include_directories(
         ${PROJECT_SMEM_SRC_BASE}/include/host
+        ${PROJECT_SMEM_SRC_BASE}/include/device
         ${PROJECT_SMEM_SRC_BASE}/csrc/common
         ${PROJECT_SMEM_SRC_BASE}/csrc/net
         ${PROJECT_SMEM_SRC_BASE}/csrc/smem_shm

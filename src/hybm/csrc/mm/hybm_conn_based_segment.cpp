@@ -485,6 +485,7 @@ Result HybmConnBasedSegment::ReserveMemorySpace(void **address) noexcept
         if (mapped == MAP_FAILED || (uint64_t)mapped != (uint64_t)startAddr) {
             BM_LOG_ERROR("Failed to mmap size:" << totalSize << " addr:" << startAddr << " ret:" << mapped
                                                 << " error: " << errno);
+            HybmVaManager::GetInstance().FreeReserveGva(reinterpret_cast<uintptr_t>(startAddr));
             return BM_ERROR;
         }
     }
@@ -694,13 +695,7 @@ bool HybmConnBasedSegment::MemoryInRange(const void *begin, uint64_t size) const
 void HybmConnBasedSegment::FreeMemory() noexcept
 {
     while (!slices_.empty()) {
-        auto slice = slices_.begin()->second.slice;
-        // Only pool slices own backing memory; user-registered slices point to caller-owned HVA.
-        const bool ownsBackingMemory = (slice->gva_ != 0U);
-        ReleaseSliceMemory(slice);
-        if (ownsBackingMemory) {
-            FreeAllocatedMemory(reinterpret_cast<void *>(slice->vAddress_), slice->size_, slice->allocMethod_);
-        }
+        ReleaseSliceMemory(slices_.begin()->second.slice);
     }
     Unmap();
 
@@ -711,6 +706,14 @@ void HybmConnBasedSegment::FreeMemory() noexcept
     }
 
     if (options_.enable56BitsGva) {
+        if (globalVirtualAddress_ != nullptr) {
+            /* 56-bit keeps GVA != LVA and no whole-window mmap exists (slices were freed
+             * above), but the reserve books must still be released: FreeReserveGva drops
+             * the GVA-window record AND the local-size LVA record in one call. Skipping it
+             * leaked both entries, so the process LVA first-fit permanently skipped the
+             * local-size range and every later entity's window base drifted upward. */
+            HybmVaManager::GetInstance().FreeReserveGva(reinterpret_cast<uintptr_t>(globalVirtualAddress_));
+        }
         globalVirtualAddress_ = localVirtualBase_ = nullptr;
     } else if (globalVirtualAddress_ != nullptr) {
         if (munmap(globalVirtualAddress_, totalVirtualSize_) != 0) {
@@ -930,7 +933,11 @@ Result HybmConnBasedSegment::ReleaseSliceMemory(const MemSlicePtr &slice) noexce
     slices_.erase(pos);
 
 #if defined(ASCEND_NPU)
-    const bool needUnregister = (options_.dataOpType & HYBM_DOP_TYPE_DEVICE_RDMA) != 0U;
+    /* symmetric with RegisterMemCommon: only host-dram slices register a hal mapping
+     * (HalHostRegister); hbm slices never do, so their release must not unregister either.
+     * Same guard as HybmVmmBasedSegment::ReleaseSliceMemory. */
+    const bool needUnregister = (options_.dataOpType & HYBM_DOP_TYPE_DEVICE_RDMA) != 0U &&
+                                slice->memType_ == HYBM_MEM_TYPE_HOST;
     if (needUnregister) {
         auto unregRet = DlHalApi::HalHostUnregisterEx(reinterpret_cast<void *>(slice->vAddress_),
                                                       logicDeviceId_, HOST_MEM_MAP_DEV);
@@ -940,6 +947,10 @@ Result HybmConnBasedSegment::ReleaseSliceMemory(const MemSlicePtr &slice) noexce
         }
     }
 #endif
+
+    if (slice->gva_ != 0U) {
+        FreeAllocatedMemory(reinterpret_cast<void *>(slice->vAddress_), slice->size_, slice->allocMethod_);
+    }
 
     return BM_OK;
 }

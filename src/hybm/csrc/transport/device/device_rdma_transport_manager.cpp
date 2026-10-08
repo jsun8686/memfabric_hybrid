@@ -19,7 +19,7 @@
 
 #include "hybm_common_include.h"
 #include "dl_acl_api.h"
-#include "dl_hal_api.h"
+#include "dl_hccp_def.h"
 #include "dl_hccp_api.h"
 #include "dl_hccl_api.h"
 #include "hybm_ptracer.h"
@@ -173,12 +173,9 @@ Result RdmaTransportManager::UnregisterMemoryRegion(uint64_t addr)
         return BM_DL_FUNCTION_FAILED;
     }
 
-    if (pos->second.address != pos->second.regAddress) {
-        ret = DlHalApi::HalHostUnregisterEx((void *)(ptrdiff_t)pos->second.address, deviceId_, HOST_MEM_MAP_DEV);
-        if (ret != 0) {
-            BM_LOG_ERROR("HalHostUnregister failed: " << ret);
-        }
-    }
+    /* the hal mapping (HalHostRegister, host-dram only) is NOT unregistered here: its
+     * lifecycle belongs to the segment layer (ReleaseSliceMemory) which registered it --
+     * unregistering on both sides double-freed the mapping (HalHostUnregisterEx ret:38) */
 
     registerMRS_.erase(pos);
     return BM_OK;
@@ -227,6 +224,43 @@ void RdmaTransportManager::UpdateMemoryKey(TransportMemoryKey &key, void *addr)
     }
 }
 
+/* ralloc dynamic groups import remote ranks incrementally and never import the local rank
+ * itself, but FixedRanksQpManager fills the device-side QP/MR table (qpInfo->mr[rankId]) from
+ * currentRanksInfo_, so the local entry must exist. Synthesize it from the locally registered
+ * MRs and our own nic when the caller did not provide it. */
+void RdmaTransportManager::SynthesizeSelfRankInfo(std::unordered_map<uint32_t, ConnectRankInfo> &rankInfo)
+{
+    if (rankInfo.find(rankId_) != rankInfo.end()) {
+        return;
+    }
+
+    sockaddr_in deviceNetwork{};
+    auto ret = ParseDeviceNic(nicInfo_, deviceNetwork);
+    if (ret != BM_OK) {
+        BM_LOG_ERROR("parse self nic(" << nicInfo_ << ") failed: " << ret);
+        return;
+    }
+
+    ConnectRankInfo selfInfo{role_, deviceNetwork, std::vector<TransportMemoryKey>{}};
+    {
+        ReadGuard lockGuard(lock_);
+        for (auto it = registerMRS_.begin(); it != registerMRS_.end(); ++it) {
+            RegMemKeyUnion keyUnion{};
+            keyUnion.deviceKey = it->second;
+            uint64_t gva = HybmVaManager::GetInstance().TransformVa(keyUnion.deviceKey.address, HVM_HVA, HVM_GVA);
+            keyUnion.deviceKey.address = (gva != 0) ? gva : keyUnion.deviceKey.address;
+            /* keep the self entry in GVA semantics, same as the remote memKeys path: the device
+             * WQE/SGE addresses are derived as regAddress + (gva - addr), so mr.addr must be the
+             * GVA base -- overwriting it with the DVA here breaks the kernel-side range check on
+             * DRAM pools where DVA != GVA */
+            keyUnion.deviceKey.notifyAddr = notifyInfo_.srcAddr;
+            keyUnion.deviceKey.notifyRkey = notifyInfo_.srcRkey;
+            selfInfo.memoryMap.emplace(keyUnion.deviceKey.address, keyUnion.deviceKey);
+        }
+    }
+    rankInfo.emplace(rankId_, std::move(selfInfo));
+}
+
 Result RdmaTransportManager::Prepare(const HybmTransPrepareOptions &options)
 {
     int ret;
@@ -246,6 +280,7 @@ Result RdmaTransportManager::Prepare(const HybmTransPrepareOptions &options)
         rankInfo.emplace(it->first, ConnectRankInfo{it->second.role, deviceNetwork, it->second.memKeys});
     }
 
+    SynthesizeSelfRankInfo(rankInfo);
     ret = qpManager_->SetRemoteRankInfo(rankInfo);
     if (ret != BM_OK) {
         BM_LOG_ERROR("qp manager set remote rank info failed: " << ret);
@@ -382,6 +417,7 @@ Result RdmaTransportManager::UpdateRankOptions(const HybmTransPrepareOptions &op
         ranksInfo.emplace(it->first, ConnectRankInfo{it->second.role, deviceNetwork, it->second.memKeys});
     }
 
+    SynthesizeSelfRankInfo(ranksInfo);
     auto ret = qpManager_->SetRemoteRankInfo(ranksInfo);
     if (ret != BM_OK) {
         BM_LOG_ERROR("update rank options failed: " << ret);
@@ -531,6 +567,16 @@ bool RdmaTransportManager::GetRdmaHandleAfterInitHccl(uint32_t device, in_addr &
 bool RdmaTransportManager::PrepareOpenDevice(uint32_t userId, uint32_t device, uint32_t rankCount, in_addr &deviceIp,
                                              void *&rdmaHandle)
 {
+    /* entities of one process may open the same device concurrently (e.g. two pool
+     * entries created by back-to-back JOIN_ALLOCs): the loser's reuse check below runs
+     * before the winner's RaRdevInit registered the handle, its RaInit then hits the
+     * libra double-init rejection and the hccl-group fallback fails. Serialize the
+     * whole prepare per process (cold path, once per entity): the late opener waits,
+     * re-runs the reuse check and takes the "Had prepared device" path; the member
+     * mutex_ guards one manager only and cannot serialize cross-entity callers */
+    static std::mutex prepareMutex;
+    std::lock_guard<std::mutex> guard(prepareMutex);
+
     // If can get rdmaHandle, maybe the device has been opened, can try get rdmaHandle directly.
     if (DlHccpApi::RaRdevGetHandle(device, rdmaHandle) == 0) {
         if (rdmaHandle != nullptr) {

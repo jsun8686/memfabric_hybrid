@@ -73,6 +73,9 @@ public:
 
     int32_t SetExtraContext(const void *context, uint32_t size) noexcept override;
 
+    int32_t QueryMemoryKey(uint64_t addr, uint64_t &mrAddr, uint64_t &size, uint32_t &lkey,
+                           uint32_t &rkey, uint64_t &regAddress) noexcept override;
+
     int32_t Mmap() noexcept override;
     void Unmap() noexcept override;
 
@@ -86,6 +89,7 @@ public:
     bool SdmaReaches(uint32_t remoteRank) const noexcept override;
     hybm_data_op_type CanReachDataOperators(uint32_t remoteRank) const noexcept override;
     void *GetSliceVa(hybm_mem_slice_t slice);
+    void *GetSliceGva(hybm_mem_slice_t slice);
 
 private:
     static int CheckOptions(const hybm_options *options) noexcept;
@@ -112,6 +116,10 @@ private:
 private:
     static thread_local bool isSetDevice_;
     bool initialized_{false};
+    /* serializes Initialize/UnInitialize on one entity: a same-pool concurrent join could
+     * race a recycle's UnInitialize against a running Initialize (or two Initializations)
+     * on the shared entity slot and tear its members (observed SIGSEGV in InitTransManager) */
+    std::mutex initMutex_;
     const int32_t id_; /* id of the engine */
     hybm_options options_{};
     void *hbmGva_{nullptr};  // the hbm medium, started gva, no rankId offset
@@ -120,6 +128,7 @@ private:
     std::shared_ptr<MemSegment> dramSegment_{nullptr};
     std::shared_ptr<DataOperator> dataOperator_;
     bool transportPrepared_{false};
+    uint32_t extraCtxSize_{0}; /* last extra-context size, to re-publish device meta after QP setup */
     std::mutex importMutex_;
     transport::TransManagerPtr transportManager_;
     std::unordered_map<uint32_t, EntityExportInfo> importedRanks_;

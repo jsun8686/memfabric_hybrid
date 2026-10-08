@@ -484,6 +484,64 @@ public:
         return ptr == nullptr ? 0 : (uint64_t)(ptrdiff_t)ptr;
     }
 
+    uint32_t GetEntityId() noexcept
+    {
+        return smem_ralloc_get_entity_id(handle_);
+    }
+
+    int32_t DeviceCopy(uint64_t src, uint64_t dst, uint64_t size, uintptr_t stream, uint32_t peerRank = UINT32_MAX,
+                       uint32_t isWrite = UINT32_MAX) noexcept
+    {
+        if (peerRank != UINT32_MAX || isWrite != UINT32_MAX) {
+            /* routed fast path: caller asserts both the peer rank and the direction, the whole
+             * per-call address precheck is skipped */
+            if (peerRank == UINT32_MAX || isWrite == UINT32_MAX) {
+                return SMEM_INVALID_PARAM;
+            }
+            return smem_ralloc_device_copy_ex(handle_, reinterpret_cast<const void *>(src),
+                                              reinterpret_cast<void *>(dst), size, peerRank, isWrite,
+                                              reinterpret_cast<void *>(stream));
+        }
+        return smem_ralloc_device_copy(handle_, reinterpret_cast<const void *>(src), reinterpret_cast<void *>(dst),
+                                       size, reinterpret_cast<void *>(stream));
+    }
+
+    int32_t DeviceCopyBatch(std::vector<uintptr_t> srcs, std::vector<uintptr_t> dsts, std::vector<uint64_t> sizes,
+                            uintptr_t stream, std::vector<uint32_t> peerRanks = {},
+                            std::vector<uint32_t> isWrites = {})
+    {
+        auto count = srcs.size();
+        if (count == 0 || dsts.size() != count || sizes.size() != count) {
+            return SMEM_INVALID_PARAM;
+        }
+        bool routed = !peerRanks.empty() || !isWrites.empty();
+        if (routed && (peerRanks.size() != count || isWrites.size() != count)) {
+            return SMEM_INVALID_PARAM;
+        }
+        void **ptr = new void *[count + count];
+        if (ptr == nullptr) {
+            throw std::runtime_error(std::string("alloc mem failed."));
+        }
+
+        void **sources = ptr;
+        void **destinations = ptr + count;
+        for (uint64_t i = 0; i < count; ++i) {
+            sources[i] = reinterpret_cast<void *>(srcs[i]);
+            destinations[i] = reinterpret_cast<void *>(dsts[i]);
+        }
+        int32_t ret;
+        if (routed) {
+            smem_ralloc_batch_copy_ex_params params = {sources, destinations, sizes.data(), peerRanks.data(),
+                                                       isWrites.data(), static_cast<uint32_t>(count)};
+            ret = smem_ralloc_device_copy_batch_ex(handle_, &params, reinterpret_cast<void *>(stream));
+        } else {
+            smem_ralloc_batch_copy_params params = {sources, destinations, sizes.data(), static_cast<uint32_t>(count)};
+            ret = smem_ralloc_device_copy_batch(handle_, &params, reinterpret_cast<void *>(stream));
+        }
+        delete[] ptr;
+        return ret;
+    }
+
     std::vector<uint32_t> GetGroupRanks()
     {
         auto count = smem_ralloc_get_group_ranks(handle_, nullptr, 0);
@@ -1047,7 +1105,9 @@ void DefineRallocConfig(py::module_ &m)
         .value("HOST_TCP", SMEMRA_DATA_OP_HOST_TCP, "data operation done by host TCP")
         .value("DEVICE_RDMA", SMEMRA_DATA_OP_DEVICE_RDMA, "data operation done by device RDMA")
         .value("HOST_URMA", SMEMRA_DATA_OP_HOST_URMA, "data operation done by host URMA")
-        .value("HOST_SHM", SMEMRA_DATA_OP_HOST_SHM, "same-node host shared memory (no network transport)");
+        .value("HOST_SHM", SMEMRA_DATA_OP_HOST_SHM, "same-node host shared memory (no network transport)")
+        .value("DEVICE_SCHEDULE", SMEMRA_DATA_OP_DEVICE_SCHEDULE,
+               "ralloc-only modifier: pool is scheduled from the AICore, combine with DEVICE_RDMA");
 
     py::enum_<smem_ralloc_group_event_t>(m, "RallocGroupEvent")
         .value("JOIN_EVENT", SMEM_RALLOC_GROUP_EVENT_JOIN, "join event")
@@ -1216,12 +1276,76 @@ Returns:
         .def("get_mem_ptr_by_rank", &RallocPool::GetMemPtrByRank, py::call_guard<py::gil_scoped_release>(),
              py::arg("rank"), py::arg("mem_type") = SMEM_RALLOC_MEM_TYPE_HOST, R"(
 Get slot base address of one rank, paired with get_mem_size_by_rank.
+The returned GVA forms device-copy endpoints only (src/dst of device_copy/copy_data);
+never dereference it on the CPU -- with 56-bit GVA enabled the address lives above
+2^55 and is not CPU mapped (CPU-side data goes through registered user memory).
 
 Arguments:
     rank(int):                rank id of the slot
     mem_type(RallocMemType): memory type of the window the slot belongs to, default HOST
 Returns:
     slot base address, 0 if failed)")
+        .def("get_entity_id", &RallocPool::GetEntityId, py::call_guard<py::gil_scoped_release>(), R"(
+Get the entity id of the pool inside the fixed device meta window. Kernels included from
+smem_ralloc_aicore_base_rdma.h use this id to self-discover the pool context (rank, QP
+rings, MR table) from device memory. Only meaningful for device-scheduled pools.
+
+Returns:
+    entity id, UINT32_MAX if failed)")
+        .def("device_copy", &RallocPool::DeviceCopy, py::call_guard<py::gil_scoped_release>(), py::arg("src_ptr"),
+             py::arg("dst_ptr"), py::arg("size"), py::arg("stream") = 0, py::arg("peer_rank") = UINT32_MAX,
+             py::arg("is_write") = UINT32_MAX, R"(
+Submit a device-scheduled one-sided copy between device window slots, the counterpart of
+copy_data for pools created with DEVICE_RDMA | DEVICE_SCHEDULE. The direction is derived
+from the addresses: local -> peer issues an AICore RDMA WRITE, peer -> local issues an
+AICore RDMA READ. A local endpoint may also be user HBM registered via register() on this
+pool (P1): the registered region's lkey is looked up on device from the user MR table, so
+NPU-managed tensors can be DMA sources/sinks without a card-internal staging copy. The
+launcher only enqueues the kernel, no host synchronization is involved, so the whole job
+is NPU graph capturable. Completion is observed by synchronizing the stream (or replaying
+the graph). The pool must be created with DEVICE_SCHEDULE | DEVICE_RDMA. register()/
+unregister() must happen before graph capture (the MR table is frozen as a snapshot).
+
+Routed fast path: pass both peer_rank and is_write (1 = WRITE local->peer, 0 = READ
+peer->local) to assert the routing yourself and skip the per-call address precheck
+(multiple alloc-range queries otherwise). Wrong routing degrades safely: the kernel-side
+MR lookup misses and the WQE is skipped (no data corruption), the error is only visible
+through data verification. Pass neither to keep the checked auto-derived behavior.
+
+Arguments:
+    src_ptr(int):  source address, local or peer device window slot, or registered user HBM
+    dst_ptr(int):  destination address, peer or local device window slot, or registered user HBM
+    size(int):     bytes to copy
+    stream(int):   aclrt stream pointer, 0 uses the default stream, default 0
+    peer_rank(int): routed fast path only, owner rank of the peer endpoint, default UINT32_MAX
+    is_write(int): routed fast path only, 1 = WRITE (local -> peer), 0 = READ, default UINT32_MAX
+Returns:
+    0 if successful)")
+        .def("device_copy_batch", &RallocPool::DeviceCopyBatch, py::call_guard<py::gil_scoped_release>(),
+             py::arg("src_addrs"), py::arg("dst_addrs"), py::arg("sizes"), py::arg("stream") = 0,
+             py::arg("peer_ranks") = std::vector<uint32_t>(), py::arg("is_writes") = std::vector<uint32_t>(), R"(
+Submit a batch of device-scheduled one-sided copies, the counterpart of copy_data_batch
+for device-scheduled pools. Same address semantics as device_copy (including registered
+user HBM endpoints, P1), applied per segment:
+the direction of every segment is derived from its own addresses and mixed WRITE/READ
+segments are allowed. All segments are prechecked before anything is enqueued, then
+driven in chunks of at most 64 segments per kernel launch, each chunk quiets every peer
+it touched exactly once. register()/unregister() must happen before graph capture.
+
+Routed fast path: pass both peer_ranks and is_writes (lists parallel to the address
+lists, 1 = WRITE local->peer, 0 = READ peer->local) to assert the routing yourself and
+skip the per-segment precheck. Wrong routing degrades safely, see device_copy. Pass
+neither to keep the checked auto-derived behavior.
+
+Arguments:
+    src_addrs(list[int]): source addresses, local or peer device window slots
+    dst_addrs(list[int]): destination addresses, peer or local device window slots
+    sizes(list[int]):     sizes of the segments
+    stream(int):          aclrt stream pointer, 0 uses the default stream, default 0
+    peer_ranks(list[int]): routed fast path only, owner rank per segment, default []
+    is_writes(list[int]):  routed fast path only, direction per segment, default []
+Returns:
+    0 if successful)")
         .def("get_group_ranks", &RallocPool::GetGroupRanks, py::call_guard<py::gil_scoped_release>(), R"(
 Get the ranks currently in the pool's dynamic group, a snapshot including the local rank.
 Members joined before the event handler registration are only discoverable this way.

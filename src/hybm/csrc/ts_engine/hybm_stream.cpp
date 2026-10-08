@@ -409,7 +409,7 @@ int64_t GetStreamSpinBudgetUs()
 int HybmStream::Synchronize(uint32_t task) noexcept
 {
     BM_ASSERT_LOG_AND_RETURN(inited_, "stream not init!", BM_NOT_INITIALIZED);
-    constexpr uint64_t SYNC_TIMEOUT_NS = 10000000000ULL; // 10s, must cover the 5s notify hw timeout
+    constexpr uint64_t SYNC_TIMEOUT_NS = 60000000000ULL; // 60s, must cover the 5s notify hw timeout
     const int64_t spinBudgetUs = GetStreamSpinBudgetUs();
     const bool sleepAllowed = spinBudgetUs >= 0;
     const auto startTime = std::chrono::steady_clock::now();

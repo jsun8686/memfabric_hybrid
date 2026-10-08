@@ -15,6 +15,7 @@
 #include "dl_hal_api.h"
 #include "hybm_ex_info_transfer.h"
 #include "hybm_va_manager.h"
+#include "hybm_define.h"
 
 using namespace ock::mf;
 
@@ -78,6 +79,14 @@ HYBM_API void *hybm_get_slice_va(hybm_entity_t e, hybm_mem_slice_t slice)
     auto entity = MemEntityFactory::Instance().FindEngineByPtr(e);
     BM_ASSERT_RETURN(entity != nullptr, nullptr);
     return entity->GetSliceVa(slice);
+}
+
+HYBM_API void *hybm_get_slice_gva(hybm_entity_t e, hybm_mem_slice_t slice)
+{
+    BM_ASSERT_RETURN(e != nullptr, nullptr);
+    auto entity = MemEntityFactory::Instance().FindEngineByPtr(e);
+    BM_ASSERT_RETURN(entity != nullptr, nullptr);
+    return entity->GetSliceGva(slice);
 }
 
 HYBM_API int32_t hybm_query_alloc_ranges(hybm_entity_t e, uint64_t gvaBegin, uint64_t gvaEnd,
@@ -230,10 +239,42 @@ HYBM_API int32_t hybm_set_extra_context(hybm_entity_t e, const void *context, ui
     return entity->SetExtraContext(context, size);
 }
 
+HYBM_API int32_t hybm_query_memory_key(hybm_entity_t e, uint64_t addr, uint64_t *mrAddr, uint64_t *size,
+                                        uint32_t *lkey, uint32_t *rkey, uint64_t *regAddress)
+{
+    BM_ASSERT_RETURN(e != nullptr, BM_INVALID_PARAM);
+    auto entity = MemEntityFactory::Instance().FindEngineByPtr(e);
+    BM_ASSERT_RETURN(entity != nullptr, BM_INVALID_PARAM);
+    BM_ASSERT_RETURN(mrAddr != nullptr && size != nullptr && lkey != nullptr && rkey != nullptr
+                         && regAddress != nullptr, BM_INVALID_PARAM);
+    uint64_t mr = 0;
+    uint64_t sz = 0;
+    uint64_t regAddr = 0;
+    uint32_t lk = 0;
+    uint32_t rk = 0;
+    auto ret = entity->QueryMemoryKey(addr, mr, sz, lk, rk, regAddr);
+    if (ret == BM_OK) {
+        *mrAddr = mr;
+        *size = sz;
+        *lkey = lk;
+        *rkey = rk;
+        *regAddress = regAddr;
+    }
+    return ret;
+}
+
 HYBM_API void hybm_unmap(hybm_entity_t e, uint32_t flags)
 {
     BM_ASSERT_RET_VOID(e != nullptr);
     auto entity = MemEntityFactory::Instance().FindEngineByPtr(e);
     BM_ASSERT_RET_VOID(entity != nullptr);
     entity->Unmap();
+}
+
+HYBM_API int32_t hybm_get_hbm_address_range(uint64_t *start, uint64_t *end)
+{
+    BM_ASSERT_RETURN(start != nullptr && end != nullptr, BM_INVALID_PARAM);
+    *start = HYBM_HBM_START_ADDR;
+    *end = HYBM_HBM_END_ADDR;
+    return BM_OK;
 }

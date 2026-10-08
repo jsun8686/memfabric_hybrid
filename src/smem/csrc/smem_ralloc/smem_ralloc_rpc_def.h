@@ -31,6 +31,7 @@ enum SmemRallocRpcOp : uint16_t {
     SMEMRA_RPC_OP_REGISTER = 1,    /* node -> master: register as placement candidate, carries committed bytes */
     SMEMRA_RPC_OP_PLACEMENT = 2,   /* requester -> master: pick one node for a block */
     SMEMRA_RPC_OP_JOIN_ALLOC = 3,  /* requester -> contributor: contribute and join pool, return gva */
+    SMEMRA_RPC_OP_GRANT_FAIL = 4,  /* contributor -> master: granted block failed to land, release the reservation */
     SMEMRA_RPC_OP_PING = 5,        /* health check */
     SMEMRA_RPC_OP_BUTT
 };

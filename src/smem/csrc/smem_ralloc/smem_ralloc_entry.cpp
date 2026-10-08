@@ -116,6 +116,10 @@ int32_t SmemRallocEntry::Initialize(const hybm_options &options)
 
 void SmemRallocEntry::UnInitialize()
 {
+    {
+        std::lock_guard<std::mutex> guard(roleMutex_);
+        tearingDown_ = true; /* new joins fail fast instead of hanging on the teardown */
+    }
     if (!inited_) {
         return;
     }
@@ -179,9 +183,31 @@ Result SmemRallocEntry::GroupOpBarrier(int32_t input)
     return SM_OK;
 }
 
+namespace {
+/* RAII: every JoinHandle exit path (early return, goto rollback, success) releases the
+ * join-active claim; the gotos below jump forward past this declaration inside one scope */
+class JoinActiveRaii {
+public:
+    explicit JoinActiveRaii(SmemRallocEntry *entry) : entry_(entry) {}
+    ~JoinActiveRaii()
+    {
+        entry_->EndJoinActive();
+    }
+
+private:
+    SmemRallocEntry *entry_;
+};
+} // namespace
+
 Result SmemRallocEntry::JoinHandle(uint32_t rk)
 {
     SM_ASSERT_RETURN(inited_, SM_NOT_INITIALIZED);
+    if (!BeginJoinActive()) {
+        SM_LOG_ERROR("join rejected: entry is tearing down, receive_rk: " << rk
+                       << ", pool: " << options_.id << " (retry after the stale entry is reaped)");
+        return SM_NOT_SUPPORTED;
+    }
+    JoinActiveRaii joinGuard(this);
     SM_LOG_INFO("do join func, local_rk: " << options_.rank << " receive_rk: " << rk
                                            << ", rank size is: " << globalGroup_->GetRankSize());
 
@@ -400,13 +426,19 @@ void SmemRallocEntry::UpdateMemberRole(uint32_t rk)
         }
         std::lock_guard<std::mutex> guard(roleMutex_);
         memberRoles_ = roles;
-        poolEmptySinceUs_.store(0);
+        departedRanks_.clear(); /* own (re)join: the whole member view was just refreshed */
+        if (poolEmptySinceUs_.exchange(0) != 0) {
+            SM_LOG_INFO("pool-empty mark cancelled by own join, id: " << options_.id);
+        }
         return;
     }
     auto role = ReadRoleKey(rk);
     std::lock_guard<std::mutex> guard(roleMutex_);
     memberRoles_[rk] = role;
-    poolEmptySinceUs_.store(0);
+    departedRanks_.erase(rk); /* the rank demonstrably produced a group event: alive again */
+    if (poolEmptySinceUs_.exchange(0) != 0) {
+        SM_LOG_INFO("pool-empty mark cancelled by member event, rank: " << rk << " id: " << options_.id);
+    }
 }
 
 void SmemRallocEntry::EvaluatePoolEmpty()
@@ -417,8 +449,13 @@ void SmemRallocEntry::EvaluatePoolEmpty()
     std::vector<uint32_t> ranks;
     globalGroup_->GetMemberRanks(ranks);
     std::lock_guard<std::mutex> guard(roleMutex_);
+    if (joinActive_) {
+        /* an in-flight join owns the mark lifecycle: BeginJoinActive cleared it and
+         * EndJoinActive re-evaluates -- setting it here would race the joiner away */
+        return;
+    }
     for (auto r : ranks) {
-        if (r == options_.rank) {
+        if (r == options_.rank || departedRanks_.count(r) != 0) {
             continue;
         }
         auto it = memberRoles_.find(r);
@@ -439,6 +476,102 @@ bool SmemRallocEntry::IsPoolEmptyExpired(uint64_t graceSec) const
         return false;
     }
     return (mf::MonotonicTime::TimeUs() - marked) >= graceSec * 1000000ULL;
+}
+
+void SmemRallocEntry::MarkMemberDeparted(uint32_t rk)
+{
+    if (rk == options_.rank) {
+        return; /* own link state is not observed here */
+    }
+    {
+        std::lock_guard<std::mutex> guard(roleMutex_);
+        if (departedRanks_.insert(rk).second) {
+            SM_LOG_INFO("member rank departed (store link down), rank: " << rk << " id: " << options_.id);
+        }
+        memberRoles_.erase(rk);
+    }
+    /* evaluate outside roleMutex_ (EvaluatePoolEmpty takes it): a departing last NEAR
+     * member may now complete the pool-empty mark; deferred without loss when a join
+     * is in flight -- EndJoinActive re-evaluates with the same departed set */
+    EvaluatePoolEmpty();
+}
+
+void SmemRallocEntry::RefreshPoolEmpty()
+{
+    EvaluatePoolEmpty();
+}
+
+bool SmemRallocEntry::PoolEmptyMarked() const
+{
+    return poolEmptySinceUs_.load() != 0;
+}
+
+uint32_t SmemRallocEntry::PoolEmptyRemainingSec(uint64_t graceSec) const
+{
+    auto marked = poolEmptySinceUs_.load();
+    if (marked == 0) {
+        return 0;
+    }
+    auto elapsedUs = mf::MonotonicTime::TimeUs() - marked;
+    auto graceUs = graceSec * 1000000ULL;
+    if (elapsedUs >= graceUs) {
+        return 0;
+    }
+    return static_cast<uint32_t>((graceUs - elapsedUs + 999999ULL) / 1000000ULL); /* ceil */
+}
+
+bool SmemRallocEntry::BeginJoinActive()
+{
+    std::lock_guard<std::mutex> guard(roleMutex_);
+    if (tearingDown_) {
+        return false;
+    }
+    joinActive_ = true;
+    /* cancel the pending reap at join start (not after the join completes): the reaper
+     * re-checks under roleMutex_ and skips, instead of tearing the entry under this join */
+    poolEmptySinceUs_.store(0);
+    return true;
+}
+
+void SmemRallocEntry::EndJoinActive()
+{
+    {
+        std::lock_guard<std::mutex> guard(roleMutex_);
+        joinActive_ = false;
+    }
+    /* a failed/rolled-back join may have left the pool empty again: re-mark so the
+     * reaper still converges (the vanished joiner may never produce a leave event) */
+    EvaluatePoolEmpty();
+}
+
+bool SmemRallocEntry::MarkTearingDownIfIdle()
+{
+    std::lock_guard<std::mutex> guard(roleMutex_);
+    if (joinActive_ || !inited_) {
+        return false;
+    }
+    tearingDown_ = true;
+    return true;
+}
+
+bool SmemRallocEntry::PoolEmpty() const
+{
+    if (globalGroup_ == nullptr) {
+        return true;
+    }
+    std::vector<uint32_t> ranks;
+    globalGroup_->GetMemberRanks(ranks);
+    std::lock_guard<std::mutex> guard(roleMutex_);
+    for (auto r : ranks) {
+        if (r == options_.rank || departedRanks_.count(r) != 0) {
+            continue;
+        }
+        auto it = memberRoles_.find(r);
+        if (it == memberRoles_.end() || it->second != SMEM_RALLOC_ROLE_FAR) {
+            return false; /* a live NEAR member (or unknown role) is still around */
+        }
+    }
+    return true;
 }
 
 Result SmemRallocEntry::Join(uint32_t flags)
@@ -468,8 +601,54 @@ Result SmemRallocEntry::Join(uint32_t flags)
     }
 }
 
+void SmemRallocEntry::MarkBootstrapRunning()
+{
+    {
+        std::lock_guard<std::mutex> lock(bsMutex_);
+        bsState_ = BootstrapState::RUNNING;
+    }
+    bsCv_.notify_all();
+}
+
+void SmemRallocEntry::MarkBootstrapDone(bool ok)
+{
+    {
+        std::lock_guard<std::mutex> lock(bsMutex_);
+        bsState_ = ok ? BootstrapState::READY : BootstrapState::FAILED;
+    }
+    bsCv_.notify_all();
+}
+
+Result SmemRallocEntry::WaitForBootstrap()
+{
+    /* bounded by the client-side JOIN_ALLOC rpc timeout (180s), so the wait must stay
+     * below it: 90s covers a 100 GB bootstrap with headroom while still failing the
+     * caller in finite time when the builder thread died silently */
+    const uint32_t waitSec =
+        mf::MfEnvUtil::GetOptionalUintOrDefault("MF_RALLOC_BOOTSTRAP_WAIT_SEC", 90U);
+    std::unique_lock<std::mutex> lock(bsMutex_);
+    if (bsState_ != BootstrapState::RUNNING) {
+        /* NONE: entry built by the synchronous create path, no concurrent bootstrap;
+         * READY / FAILED: a bootstrap already finished */
+        return bsState_ == BootstrapState::FAILED ? SM_NOT_INITIALIZED : SM_OK;
+    }
+    bool finished = bsCv_.wait_for(lock, std::chrono::seconds(waitSec),
+                                   [this]() { return bsState_ != BootstrapState::RUNNING; });
+    if (!finished) {
+        return SM_NOT_INITIALIZED;
+    }
+    return bsState_ == BootstrapState::READY ? SM_OK : SM_NOT_INITIALIZED;
+}
+
 Result SmemRallocEntry::ExtendLocalMem(smem_ralloc_mem_type_t memType, uint64_t size, smem_ralloc_mem_info_t *info)
 {
+    /* a concurrent first JOIN_ALLOC may still be building this pool (a 100 GB slice
+     * bootstrap takes tens of seconds): park until it finishes instead of failing fast,
+     * so the master's grant reservation lands on a slice that really exists */
+    auto bootRet = WaitForBootstrap();
+    if (bootRet != SM_OK) {
+        return bootRet;
+    }
     SM_ASSERT_RETURN(inited_, SM_NOT_INITIALIZED);
     SM_ASSERT_RETURN(memType == SMEM_RALLOC_MEM_TYPE_HOST || memType == SMEM_RALLOC_MEM_TYPE_DEVICE,
         SM_NOT_SUPPORTED);
@@ -506,8 +685,10 @@ Result SmemRallocEntry::ExtendLocalMem(smem_ralloc_mem_type_t memType, uint64_t 
         }
         SM_LOG_ERROR_RETURN_IT_IF_NOT_OK(updateRet, "update failed, ret: " << updateRet);
         SM_LOG_DEBUG("update success. rank:" << options_.rank);
-        // 4.fill info with the new block (mutex_ already held, do not call other locking methods)
-        auto newGva = hybm_get_slice_va(entity_, slice);
+        // 4.fill info with the new block (mutex_ already held, do not call other locking methods);
+        // the block address crosses ranks as a device endpoint: with 56-bit GVA enabled the
+        // slice's local-access va differs from its gva -- take the gva
+        auto newGva = hybm_get_slice_gva(entity_, slice);
         if (newGva == nullptr) {
             SM_LOG_ERROR("Failed to get slice va, slice:" << slice);
             return SM_ERROR;
@@ -544,8 +725,9 @@ Result SmemRallocEntry::GetLocalMemInfo(smem_ralloc_mem_info_t *info)
     if (slices_.empty()) {
         return SM_OK;
     }
-    /* first local block = own slot base, not the window base (rank0 slot base) */
-    auto gva = hybm_get_slice_va(entity_, slices_[0]);
+    /* first local block = own slot base, not the window base (rank0 slot base); the gva is
+     * the cross-rank device endpoint -- with 56-bit GVA it differs from the local-access va */
+    auto gva = hybm_get_slice_gva(entity_, slices_[0]);
     if (gva == nullptr) {
         SM_LOG_ERROR("Failed to get first slice va, slice:" << slices_[0]);
         return SM_ERROR;
@@ -555,57 +737,93 @@ Result SmemRallocEntry::GetLocalMemInfo(smem_ralloc_mem_info_t *info)
     return SM_OK;
 }
 
-uint64_t SmemRallocEntry::GetMemSizeByRank(uint32_t rank, smem_ralloc_mem_type_t memType)
+bool SmemRallocEntry::QueryWindowRanges(smem_ralloc_mem_type_t memType, std::vector<hybm_va_range> &ranges)
 {
-    SM_ASSERT_RETURN(inited_, 0);
+    ranges.clear();
     const bool deviceMedia = memType == SMEM_RALLOC_MEM_TYPE_DEVICE;
     auto base = reinterpret_cast<uint64_t>(deviceMedia ? deviceGva_ : hostGva_);
     auto slotSize = deviceMedia ? coreOptions_.maxHBMSize : coreOptions_.maxDRAMSize;
-    if (rank >= coreOptions_.rankCount || base == 0 || slotSize == 0) {
-        return 0;
+    if (!inited_ || entity_ == nullptr || base == 0 || slotSize == 0 || coreOptions_.rankCount == 0) {
+        return false;
     }
-    /* the window base is the rank0 slot base, identical in every process view, slot of rank r
-     * spans [base + r * slotSize, +slotSize), same as GetMemPtrByRank */
-    auto slotBase = base + static_cast<uint64_t>(rank) * slotSize;
-    auto slotEnd = slotBase + slotSize;
-
-    uint32_t count = 0;
-    std::vector<hybm_va_range> ranges;
+    /* persistent per-thread scratch: its capacity survives across calls, so the query fills in
+     * one round trip in steady state instead of re-probing with an empty buffer (guaranteed
+     * BUFFER_TOO_SMALL) on every call; thread_local keeps it race-free without a lock */
+    static thread_local std::vector<hybm_va_range> scratch;
+    uint32_t count = static_cast<uint32_t>(scratch.size());
+    bool filled = false;
     for (uint32_t attempt = 0; attempt < 3U; attempt++) {
-        auto queryRet = hybm_query_alloc_ranges(entity_, slotBase, slotEnd, ranges.data(), &count);
+        auto queryRet = hybm_query_alloc_ranges(entity_, base, base + slotSize * coreOptions_.rankCount,
+                                                scratch.data(), &count);
         if (queryRet == BM_OK) {
+            filled = true;
             break;
         }
         if (queryRet != BM_BUFFER_TOO_SMALL) {
             SM_LOG_ERROR("query alloc ranges failed, ret: " << queryRet);
-            return 0;
+            return false;
         }
         /* count may grow again during concurrent extend, retry with the new capacity */
-        ranges.assign(count, hybm_va_range{});
+        scratch.resize(count);
     }
-    if (ranges.size() < count) {
-        SM_LOG_ERROR("query alloc ranges keeps growing, give up this snapshot");
-        return 0;
+    if (!filled || scratch.size() < count) {
+        SM_LOG_ERROR("query alloc ranges not filled, count: " << count);
+        return false;
     }
+    ranges.assign(scratch.begin(), scratch.begin() + count);
+    return true;
+}
 
-    uint64_t extent = 0;
-    for (uint32_t i = 0; i < count; i++) {
-        if (ranges[i].ownerRank == rank && ranges[i].gva >= slotBase) {
-            extent = std::max(extent, ranges[i].gva + ranges[i].size - slotBase);
+bool SmemRallocEntry::QueryRankSlot(uint32_t rank, smem_ralloc_mem_type_t memType, uint64_t &baseOut,
+                                    uint64_t &extentOut)
+{
+    if (rank >= coreOptions_.rankCount) {
+        return false;
+    }
+    std::vector<hybm_va_range> ranges;
+    if (!QueryWindowRanges(memType, ranges)) {
+        return false;
+    }
+    baseOut = 0;
+    uint64_t end = 0;
+    for (const auto &r : ranges) {
+        if (r.ownerRank != rank) {
+            continue;
+        }
+        if (baseOut == 0 || r.gva < baseOut) {
+            baseOut = r.gva;
+        }
+        if (r.gva + r.size > end) {
+            end = r.gva + r.size;
         }
     }
+    if (baseOut == 0) {
+        return false; /* nothing committed for this rank (yet) */
+    }
+    extentOut = end - baseOut;
+    return true;
+}
+
+uint64_t SmemRallocEntry::GetMemSizeByRank(uint32_t rank, smem_ralloc_mem_type_t memType)
+{
+    SM_ASSERT_RETURN(inited_, 0);
+    /* truth from the committed ranges: the arithmetic slot window [base + r * maxSize)
+     * only holds while every member's window layout is unperturbed, which a peer-side
+     * LVA drift breaks (observed after a 56-bit entity lifetime leaked its reserves) */
+    uint64_t base = 0;
+    uint64_t extent = 0;
+    (void)QueryRankSlot(rank, memType, base, extent);
     return extent;
 }
 
 void *SmemRallocEntry::GetMemPtrByRank(uint32_t rank, smem_ralloc_mem_type_t memType)
 {
-    const bool deviceMedia = memType == SMEM_RALLOC_MEM_TYPE_DEVICE;
-    auto base = deviceMedia ? deviceGva_ : hostGva_;
-    auto slotSize = deviceMedia ? coreOptions_.maxHBMSize : coreOptions_.maxDRAMSize;
-    if (!inited_ || base == nullptr || slotSize == 0 || rank >= coreOptions_.rankCount) {
-        return nullptr;
+    uint64_t base = 0;
+    uint64_t extent = 0;
+    if (!QueryRankSlot(rank, memType, base, extent)) {
+        return nullptr; /* slot not committed: no address to hand out */
     }
-    return static_cast<char *>(base) + static_cast<uint64_t>(rank) * slotSize;
+    return reinterpret_cast<void *>(base);
 }
 
 std::vector<uint32_t> SmemRallocEntry::GetGroupRanks()
@@ -656,6 +874,22 @@ Result SmemRallocEntry::Wait()
 Result SmemRallocEntry::RegisterMem(uint64_t addr, uint64_t size)
 {
     SM_ASSERT_RETURN(inited_, SM_NOT_INITIALIZED);
+    /* endpoint classification: NPU HBM keeps regAddress == addr (identity SGE), while
+     * host-DRAM goes through HalHostRegister and carries a distinct iova in regAddress --
+     * the kernel user-MR table (v2) translates both, so host-DRAM is accepted too, but
+     * it must be 4K aligned (page granularity of the iova mapping). */
+    uint64_t hbmStart = 0;
+    uint64_t hbmEnd = 0;
+    const bool hbmKnown = (hybm_get_hbm_address_range(&hbmStart, &hbmEnd) == 0);
+    const bool isHbm = hbmKnown && addr >= hbmStart && addr < hbmEnd;
+    if (!isHbm) {
+        constexpr uint64_t dramAlign = 4096;
+        if (addr % dramAlign != 0 || size % dramAlign != 0) {
+            SM_LOG_ERROR("RegisterMem reject_unaligned_dram: addr=0x" << std::hex << addr << std::dec
+                << " size=" << size << " -- host-DRAM endpoints must be 4K aligned");
+            return SM_INVALID_PARAM;
+        }
+    }
     std::lock_guard<std::mutex> lock(mutex_);
     auto iter = registedSlice_.find(addr);
     if (iter != registedSlice_.end()) {
@@ -669,6 +903,32 @@ Result SmemRallocEntry::RegisterMem(uint64_t addr, uint64_t size)
     }
     auto slice = hybm_register_local_memory(entity_, reinterpret_cast<void *>(addr), size, 0);
     if (slice != nullptr) {
+        constexpr uint64_t publishCapacity = 2040;
+        if (userMrs_.size() >= publishCapacity) {
+            SM_LOG_ERROR("RegisterMem user_mr_table_full: count=" << userMrs_.size());
+            (void)hybm_free_local_memory(entity_, slice, 1, 0);
+            return SM_NOT_SUPPORTED;
+        }
+        uint64_t devAddr = 0;
+        uint64_t mrSize = 0;
+        uint64_t regAddr = 0;
+        uint32_t lkey = 0;
+        uint32_t rkey = 0;
+        auto keyRet = hybm_query_memory_key(entity_, addr, &devAddr, &mrSize, &lkey, &rkey, &regAddr);
+        if (keyRet != 0) {
+            SM_LOG_WARN("RegisterMem query_key_fail: addr=0x" << std::hex << addr << std::dec
+                                                               << " ret=" << keyRet
+                                                               << " (device-scheduled use disabled)");
+        } else {
+            /* devAddr field carries the registration key (== the address the kernel will
+             * match localAddr against); regAddr carries the device-dma base (iova for DRAM) */
+            userMrs_.emplace(addr, UserMrInfo{addr, regAddr, size, lkey, rkey});
+            auto pubRet = PublishUserMrTable();
+            if (pubRet != SM_OK) {
+                SM_LOG_WARN("RegisterMem publish_user_mr_table_fail: ret=" << pubRet
+                                                                           << " (device-scheduled use degraded)");
+            }
+        }
         registedSlice_.emplace(addr, std::make_pair(size, slice));
         SM_LOG_INFO("RegisterMem ok: addr=0x" << std::hex << addr << std::dec << " size=" << size);
         return SM_OK;
@@ -694,7 +954,64 @@ Result SmemRallocEntry::UnRegisterMem(uint64_t addr)
         return SM_ERROR;
     }
     registedSlice_.erase(iter);
+    userMrs_.erase(addr);
+    auto pubRet = PublishUserMrTable();
+    if (pubRet != SM_OK) {
+        SM_LOG_WARN("UnRegisterMem publish_user_mr_table_fail: ret=" << pubRet);
+    }
     SM_LOG_INFO("UnRegisterMem ok: addr=0x" << std::hex << addr << std::dec << " size=" << sz);
+    return SM_OK;
+}
+
+bool SmemRallocEntry::IsUserRegistered(uint64_t addr, uint64_t size)
+{
+    SM_ASSERT_RETURN(inited_, false);
+    std::lock_guard<std::mutex> lock(mutex_);
+    for (const auto &item : userMrs_) {
+        if (addr >= item.first && addr + size <= item.first + item.second.size) {
+            return true;
+        }
+    }
+    return false;
+}
+
+Result SmemRallocEntry::PublishUserMrTable()
+{
+    constexpr uint32_t tableMagic = 0x31524D53;
+    constexpr uint32_t tableVersion = 2; /* v2: entry word 4 carries the device-dma base */
+    constexpr uint64_t tableHeaderSize = 64;
+    constexpr uint64_t tableEntrySize = 32;
+
+    std::vector<uint8_t> buf(tableHeaderSize + tableEntrySize * userMrs_.size(), 0);
+    auto *header = reinterpret_cast<uint32_t *>(buf.data());
+    header[0] = tableMagic;
+    header[1] = tableVersion;
+    header[2] = static_cast<uint32_t>(userMrs_.size());
+    header[3] = 0;
+
+    uint64_t offset = tableHeaderSize;
+    for (auto iter = userMrs_.rbegin(); iter != userMrs_.rend(); ++iter) {
+        auto *entry = reinterpret_cast<uint64_t *>(buf.data() + offset);
+        entry[0] = iter->second.devAddr;
+        entry[1] = iter->second.size;
+        *(reinterpret_cast<uint32_t *>(buf.data() + offset + 16)) = iter->second.lkey;
+        *(reinterpret_cast<uint32_t *>(buf.data() + offset + 20)) = iter->second.rkey;
+        /* device-dma base of the MR: equals devAddr for HBM registrations, the
+         * HalHostRegister iova for host-DRAM ones -- the kernel derives the SGE address
+         * as regAddress + (localAddr - devAddr). Byte layout must match the kernel
+         * SmemRallocUserMrEntry exactly: addr +0, size +8, lkey +16, rkey +20,
+         * regAddress +24 (uint64_t index 3). Writing at index 4 (+32) leaves the kernel
+         * reading 0 and falling back to the raw user VA, which only works for HBM. */
+        entry[3] = iter->second.regAddress;
+        offset += tableEntrySize;
+    }
+
+    auto ret = hybm_set_extra_context(entity_, buf.data(), static_cast<uint32_t>(buf.size()));
+    if (ret != 0) {
+        SM_LOG_ERROR("PublishUserMrTable set_extra_context_fail: count=" << userMrs_.size() << " ret=" << ret);
+        return SM_ERROR;
+    }
+    SM_LOG_INFO("PublishUserMrTable ok: count=" << userMrs_.size());
     return SM_OK;
 }
 
@@ -710,6 +1027,24 @@ Result SmemRallocEntry::SetGroupEventHandler(smem_ralloc_group_event_cb cb, void
 
 uint32_t SmemRallocEntry::GetRankIdByGva(void *gva)
 {
+    /* committed-range lookup first: a peer slice may sit off its arithmetic position when
+     * the peer's window layout drifted, and the arithmetic answer would then blame a wrong
+     * rank (e.g. classify a peer slot as local and reject a legal copy) */
+    auto addr = reinterpret_cast<uint64_t>(gva);
+    for (auto memType : {SMEM_RALLOC_MEM_TYPE_HOST, SMEM_RALLOC_MEM_TYPE_DEVICE}) {
+        std::vector<hybm_va_range> ranges;
+        if (!QueryWindowRanges(memType, ranges)) {
+            continue;
+        }
+        for (const auto &r : ranges) {
+            if (addr >= r.gva && addr < r.gva + r.size) {
+                return r.ownerRank;
+            }
+        }
+    }
+    /* uncommitted hole inside a window: keep the legacy arithmetic answer so callers
+     * still get a rank to reject with (slot-not-ready / out-of-range), never UINT32_MAX
+     * for an address that does live inside one of our windows */
     if (AddrInHostGva(gva, 1UL)) {
         return ((uint64_t)gva - (uint64_t)hostGva_) / coreOptions_.maxDRAMSize;
     }
