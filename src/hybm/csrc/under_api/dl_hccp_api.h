@@ -49,6 +49,7 @@ using raMrRegFunc = int (*)(void *, HccpMrInfo *);
 using raMrDeregFunc = int (*)(void *, HccpMrInfo *);
 using raSendWrFunc = int (*)(void *, send_wr *, send_wr_rsp *);
 using raSendWrV2Func = int (*)(void *, send_wr_v2 *, send_wr_rsp *);
+using raSendWrlistExtFunc = int (*)(void *, send_wrlist_data_ext *, send_wr_rsp *, uint32_t, uint32_t *);
 using tsdOpenFunc = uint32_t (*)(uint32_t, uint32_t);
 using raPollCqFunc = int (*)(void *, bool, uint32_t, void *);
 using raGetNotifyBaseAddrFunc = int (*)(void *, uint64_t *, uint64_t *);
@@ -251,6 +252,20 @@ public:
         return gRaSendWrV2(qp_handle, wr, op_rsp);
     }
 
+    static inline bool RaSendWrlistExtAvailable()
+    {
+        return gRaSendWrlistExt != nullptr;
+    }
+
+    static inline int RaSendWrlistExt(void *qp_handle, struct send_wrlist_data_ext wr[], struct send_wr_rsp op_rsp[],
+                                      uint32_t send_num, uint32_t *complete_num)
+    {
+        if (gRaSendWrlistExt == nullptr) {
+            return BM_UNDER_API_UNLOAD;
+        }
+        return gRaSendWrlistExt(qp_handle, wr, op_rsp, send_num, complete_num);
+    }
+
     static inline uint32_t TsdOpen(uint32_t deviceId, uint32_t rankSize)
     {
         if (gTsdOpen == nullptr) {
@@ -307,6 +322,7 @@ private:
     static raDeregisterMrFunc gRaDeregisterMR;
     static raSendWrFunc gRaSendWr;
     static raSendWrV2Func gRaSendWrV2;
+    static raSendWrlistExtFunc gRaSendWrlistExt;
     static raGetNotifyBaseAddrFunc gRaGetNotifyBaseAddr;
     static raGetNotifyMrInfoFunc gRaGetNotifyMrInfo;
 

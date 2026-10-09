@@ -14,6 +14,7 @@
 #include <unistd.h>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <thread>
 
@@ -835,6 +836,143 @@ int RdmaTransportManager::RemoteIO(uint32_t rankId, uint64_t lAddr, uint64_t rAd
     }
     qpManager_->PutQpHandle(qp);
     return ret;
+}
+
+Result RdmaTransportManager::ReadRemoteBatchAsync(uint32_t rankId, const CopyDescriptor &descriptor)
+{
+    return RemoteIOBatch(rankId, descriptor, false);
+}
+
+Result RdmaTransportManager::WriteRemoteBatchAsync(uint32_t rankId, const CopyDescriptor &descriptor)
+{
+    return RemoteIOBatch(rankId, descriptor, true);
+}
+
+int RdmaTransportManager::RemoteIOBatch(uint32_t rankId, const CopyDescriptor &descriptor, bool write)
+{
+    const size_t total = descriptor.localAddrs.size();
+    if (total == 0) {
+        return BM_OK;
+    }
+
+    /* MF_HOST_WRLIST=0 forces the legacy per-WQE path (A/B comparison); a driver package without
+     * RaSendWrlistExt also falls back automatically */
+    static const bool wrlistEnabled = []() {
+        const char *env = getenv("MF_HOST_WRLIST");
+        return (env == nullptr) || (strcmp(env, "0") != 0);
+    }();
+    if (!wrlistEnabled || !DlHccpApi::RaSendWrlistExtAvailable()) {
+        for (size_t i = 0; i < total; ++i) {
+            auto lAddr = reinterpret_cast<uint64_t>(descriptor.localAddrs[i]);
+            auto rAddr = reinterpret_cast<uint64_t>(descriptor.globalAddrs[i]);
+            uint64_t size = descriptor.counts[i];
+            auto ret = write ? WriteRemoteAsync(rankId, lAddr, rAddr, size) : ReadRemoteAsync(rankId, lAddr, rAddr,
+                size);
+            if (ret != BM_OK) {
+                BM_LOG_ERROR("RemoteIOBatch legacy path failed at index " << i << ", ret: " << ret);
+                return ret;
+            }
+        }
+        return BM_OK;
+    }
+
+    if (qpManager_ == nullptr) {
+        BM_LOG_ERROR("RemoteIOBatch(): connection manager not created.");
+        return BM_ERROR;
+    }
+    auto qp = qpManager_->GetQpHandleWithRankId(rankId);
+    if (qp == nullptr) {
+        BM_LOG_ERROR("no qp to rankId: " << rankId);
+        return BM_ERROR;
+    }
+    auto hStream = HybmStreamManager::GetThreadHybmStream(HybmGetInitedLogicDeviceId());
+    if (hStream == nullptr) {
+        qpManager_->PutQpHandle(qp);
+        return BM_ERROR;
+    }
+
+    /* translate MR addresses once for the whole batch (lkey explicit; rkey resolved by libra
+     * from the QP/rdev MR tables, same contract as HCCL's wrlist wiring) */
+    std::vector<send_wrlist_data_ext> wrVec(total);
+    std::vector<send_wr_rsp> rspVec(total);
+    {
+        ReadGuard lockGuard(lock_);
+        if (rankId >= ranksMRs_.size() || ranksMRs_[rankId].empty()) {
+            BM_LOG_ERROR("input rankId: " << rankId << " not found.");
+            qpManager_->PutQpHandle(qp);
+            return BM_INVALID_PARAM;
+        }
+        auto &rankMr = ranksMRs_[rankId];
+        for (size_t i = 0; i < total; ++i) {
+            auto lAddr = reinterpret_cast<uint64_t>(descriptor.localAddrs[i]);
+            auto rAddr = reinterpret_cast<uint64_t>(descriptor.globalAddrs[i]);
+            uint64_t size = descriptor.counts[i];
+            uint32_t rkey = 0;
+            auto &wr = wrVec[i];
+            auto ret = GetRegAddress(registerMRS_, lAddr, size, true, wr.mem_list.addr, wr.mem_list.lkey);
+            if (ret != BM_OK) {
+                BM_LOG_ERROR("lAddr not register: size: " << size << " " << std::hex << lAddr);
+                qpManager_->PutQpHandle(qp);
+                return ret;
+            }
+            ret = GetRegAddress(rankMr, rAddr, size, false, wr.dst_addr, rkey);
+            if (ret != BM_OK) {
+                BM_LOG_ERROR("rAddr not register: size: " << size << " " << std::hex << rAddr);
+                qpManager_->PutQpHandle(qp);
+                return ret;
+            }
+            wr.op = write ? 0U : 4U; /* RDMA_WRITE: 0  RDMA_READ: 4 */
+            wr.send_flag = RA_SEND_SIGNALED;
+        }
+    }
+
+    /* whole-batch submission with partial-progress retry (SOCK_ENOENT/ROCE_EAGAIN, HCCL wiring) */
+    constexpr uint32_t WRLIST_RETRY_TIMEOUT_MS = 1000U;
+    size_t sent = 0;
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(WRLIST_RETRY_TIMEOUT_MS);
+    while (sent < total) {
+        uint32_t completeNum = 0;
+        TP_TRACE_BEGIN(TP_HYBM_RDMA_WRLIST_SUBMIT);
+        auto ret = DlHccpApi::RaSendWrlistExt(qp->qpHandle, wrVec.data() + sent, rspVec.data() + sent,
+                                              static_cast<uint32_t>(total - sent), &completeNum);
+        TP_TRACE_END(TP_HYBM_RDMA_WRLIST_SUBMIT, ret);
+        if (completeNum > total - sent) {
+            completeNum = static_cast<uint32_t>(total - sent);
+        }
+        if (ret == 0) {
+            completeNum = static_cast<uint32_t>(total - sent); /* success means the whole slice is out */
+        }
+        /* stream completion tracking per sent WQE (same semantics as the per-WQE path) */
+        for (uint32_t i = 0; i < completeNum; ++i) {
+            StreamTask task;
+            task.type = STREAM_TASK_TYPE_WRITE_VAL;
+            ConstructSqeNoSinkModeForRdmaDbSendTask(rspVec[sent + i], task.sqe, hStream);
+            auto subRet = hStream->SubmitTasks(task);
+            if (subRet != BM_OK) {
+                BM_LOG_ERROR("SubmitTasks(task) failed : " << subRet);
+                qpManager_->PutQpHandle(qp);
+                return subRet;
+            }
+        }
+        sent += completeNum;
+        if (ret == 0) {
+            break;
+        }
+        if (ret != SOCK_ENOENT && ret != ROCE_EAGAIN) {
+            BM_LOG_ERROR("RaSendWrlistExt failed : " << ret << ", sent " << sent << "/" << total);
+            qpManager_->PutQpHandle(qp);
+            return ret;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            BM_LOG_ERROR("RaSendWrlistExt retry timeout, sent " << sent << "/" << total);
+            qpManager_->PutQpHandle(qp);
+            return BM_ERROR;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    qpManager_->PutQpHandle(qp);
+    return BM_OK;
 }
 
 int RdmaTransportManager::GetRegAddress(const MemoryRegionMap &map, uint64_t inputAddr, uint64_t size, bool isLocal,

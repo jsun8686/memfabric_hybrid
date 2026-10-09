@@ -58,33 +58,8 @@ public:
     Result ReadRemoteAsync(uint32_t rankId, uint64_t lAddr, uint64_t rAddr, uint64_t size) override;
     Result WriteRemoteAsync(uint32_t rankId, uint64_t lAddr, uint64_t rAddr, uint64_t size) override;
     Result Synchronize(uint32_t rankId) override;
-    Result ReadRemoteBatchAsync(uint32_t rankId, const CopyDescriptor &descriptor) override
-    {
-        for (size_t i = 0; i < descriptor.localAddrs.size(); ++i) {
-            auto lAddr = reinterpret_cast<uint64_t>(descriptor.localAddrs[i]);
-            auto rAddr = reinterpret_cast<uint64_t>(descriptor.globalAddrs[i]);
-            uint64_t size = descriptor.counts[i];
-            if (auto ret = ReadRemoteAsync(rankId, lAddr, rAddr, size); ret != BM_OK) {
-                BM_LOG_ERROR("ReadRemoteBatchAsync failed at index " << i << ", ret: " << ret);
-                return ret;
-            }
-        }
-        return BM_OK;
-    }
-
-    Result WriteRemoteBatchAsync(uint32_t rankId, const CopyDescriptor &descriptor) override
-    {
-        for (size_t i = 0; i < descriptor.localAddrs.size(); ++i) {
-            auto lAddr = reinterpret_cast<uint64_t>(descriptor.localAddrs[i]);
-            auto rAddr = reinterpret_cast<uint64_t>(descriptor.globalAddrs[i]);
-            uint64_t size = descriptor.counts[i];
-            if (auto ret = WriteRemoteAsync(rankId, lAddr, rAddr, size); ret != BM_OK) {
-                BM_LOG_ERROR("WriteRemoteBatchAsync failed at index " << i << ", ret: " << ret);
-                return ret;
-            }
-        }
-        return BM_OK;
-    }
+    Result ReadRemoteBatchAsync(uint32_t rankId, const CopyDescriptor &descriptor) override;
+    Result WriteRemoteBatchAsync(uint32_t rankId, const CopyDescriptor &descriptor) override;
 
 private:
     static bool PrepareOpenDevice(uint32_t userId, uint32_t device, uint32_t rankCount, in_addr &deviceIp,
@@ -96,6 +71,7 @@ private:
     void ClearAllRegisterMRs();
     int CheckPrepareOptions(const HybmTransPrepareOptions &options);
     int RemoteIO(uint32_t rankId, uint64_t lAddr, uint64_t rAddr, uint64_t size, bool write, bool sync);
+    int RemoteIOBatch(uint32_t rankId, const CopyDescriptor &descriptor, bool write);
     int CorrectHostRegWr(uint32_t rankId, uint64_t lAddr, uint64_t rAddr, uint64_t size, send_wr_v2 &wr);
     int ConvertHccpMrInfo(const TransportMemoryRegion &mr, HccpMrInfo &info);
     void OptionsToRankMRs(const HybmTransPrepareOptions &options);
