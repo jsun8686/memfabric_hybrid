@@ -174,6 +174,12 @@ Result RdmaTransportManager::UnregisterMemoryRegion(uint64_t addr)
         return BM_DL_FUNCTION_FAILED;
     }
 
+    /* drop QP-level tracking for this window: rdev-level MR is gone, the window must
+     * re-register on next use; driver-side QP tables are reclaimed at QP destroy */
+    for (auto &entry : qpRegisteredMrs_) {
+        entry.second.erase(pos->second.regAddress);
+    }
+
     /* the hal mapping (HalHostRegister, host-dram only) is NOT unregistered here: its
      * lifecycle belongs to the segment layer (ReleaseSliceMemory) which registered it --
      * unregistering on both sides double-freed the mapping (HalHostUnregisterEx ret:38) */
@@ -751,6 +757,7 @@ void RdmaTransportManager::ClearAllRegisterMRs()
         }
     }
     registerMRS_.clear();
+    qpRegisteredMrs_.clear();
 }
 
 int RdmaTransportManager::CheckPrepareOptions(const ock::mf::transport::HybmTransPrepareOptions &options)
@@ -861,7 +868,7 @@ int RdmaTransportManager::RemoteIOBatch(uint32_t rankId, const CopyDescriptor &d
         const char *env = getenv("MF_HOST_WRLIST");
         return (env == nullptr) || (strcmp(env, "0") != 0);
     }();
-    if (!wrlistEnabled || !DlHccpApi::RaSendWrlistExtAvailable()) {
+    if (!wrlistEnabled || !DlHccpApi::RaSendWrlistExtAvailable() || !DlHccpApi::RaMrRegAvailable()) {
         for (size_t i = 0; i < total; ++i) {
             auto lAddr = reinterpret_cast<uint64_t>(descriptor.localAddrs[i]);
             auto rAddr = reinterpret_cast<uint64_t>(descriptor.globalAddrs[i]);
@@ -891,10 +898,12 @@ int RdmaTransportManager::RemoteIOBatch(uint32_t rankId, const CopyDescriptor &d
         return BM_ERROR;
     }
 
-    /* translate MR addresses once for the whole batch (lkey explicit; rkey resolved by libra
-     * from the QP/rdev MR tables, same contract as HCCL's wrlist wiring) */
+    /* translate MR addresses once for the whole batch; wrlist resolves keys from the QP-level
+     * MR table (lkey=0, HCCL wiring), so lkey is left zero on purpose */
     std::vector<send_wrlist_data_ext> wrVec(total);
     std::vector<send_wr_rsp> rspVec(total);
+    std::set<uint64_t> localQuery;
+    std::set<uint64_t> remoteQuery;
     {
         ReadGuard lockGuard(lock_);
         if (rankId >= ranksMRs_.size() || ranksMRs_[rankId].empty()) {
@@ -921,8 +930,59 @@ int RdmaTransportManager::RemoteIOBatch(uint32_t rankId, const CopyDescriptor &d
                 qpManager_->PutQpHandle(qp);
                 return ret;
             }
+            wr.mem_list.lkey = 0;
             wr.op = write ? 0U : 4U; /* RDMA_WRITE: 0  RDMA_READ: 4 */
             wr.send_flag = RA_SEND_SIGNALED;
+            localQuery.insert(lAddr);
+            remoteQuery.insert(rAddr);
+        }
+    }
+
+    /* ensure every window referenced by this batch is QP-level registered (lazy, deduplicated);
+     * local windows carry lkey/rkey zero (driver fills), remote windows carry the exchanged rkey */
+    {
+        WriteGuard lockGuard(lock_);
+        auto &tracked = qpRegisteredMrs_[qp->qpHandle];
+        for (auto queryAddr : localQuery) {
+            auto pos = registerMRS_.lower_bound(queryAddr);
+            if (pos == registerMRS_.end() || pos->first + pos->second.size < queryAddr) {
+                continue;
+            }
+            if (tracked.count(pos->second.regAddress) != 0) {
+                continue;
+            }
+            HccpMrInfo info{reinterpret_cast<void *>(pos->second.regAddress), pos->second.size, RA_ACCESS_NORMAL, 0,
+                            0};
+            auto ret = DlHccpApi::RaMrReg(qp->qpHandle, &info);
+            if (ret != 0) {
+                BM_LOG_ERROR("RaMrReg local window failed : " << ret << ", addr: 0x" << std::hex
+                                                              << pos->second.regAddress << ", size: 0x"
+                                                              << pos->second.size);
+                qpManager_->PutQpHandle(qp);
+                return ret;
+            }
+            tracked.insert(pos->second.regAddress);
+        }
+        auto &rankMr = ranksMRs_[rankId];
+        for (auto queryAddr : remoteQuery) {
+            auto pos = rankMr.lower_bound(queryAddr);
+            if (pos == rankMr.end() || pos->first + pos->second.size < queryAddr) {
+                continue;
+            }
+            if (tracked.count(pos->second.regAddress) != 0) {
+                continue;
+            }
+            HccpMrInfo info{reinterpret_cast<void *>(pos->second.regAddress), pos->second.size, RA_ACCESS_NORMAL, 0,
+                            pos->second.rkey};
+            auto ret = DlHccpApi::RaMrReg(qp->qpHandle, &info);
+            if (ret != 0) {
+                BM_LOG_ERROR("RaMrReg remote window failed : " << ret << ", addr: 0x" << std::hex
+                                                               << pos->second.regAddress << ", size: 0x"
+                                                               << pos->second.size << ", rkey: " << pos->second.rkey);
+                qpManager_->PutQpHandle(qp);
+                return ret;
+            }
+            tracked.insert(pos->second.regAddress);
         }
     }
 

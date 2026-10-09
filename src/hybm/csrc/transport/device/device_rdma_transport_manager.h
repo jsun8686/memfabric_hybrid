@@ -20,6 +20,7 @@
 #include <map>
 #include <mutex>
 #include <memory>
+#include <set>
 #include <unordered_map>
 #include "hybm_define.h"
 #include "hybm_stream_manager.h"
@@ -103,6 +104,7 @@ private:
     std::string nicInfo_;
     MemoryRegionMap registerMRS_; // key: hostVa, value: regMR
     std::vector<MemoryRegionMap> ranksMRs_;
+    std::unordered_map<void *, std::set<uint64_t>> qpRegisteredMrs_; // qp handle -> QP-level registered window bases
     std::shared_ptr<DeviceQpManager> qpManager_;
     std::vector<std::pair<uint64_t, uint32_t>> notifyRemoteInfo_;
     std::shared_ptr<DeviceChipInfo> deviceChipInfo_;

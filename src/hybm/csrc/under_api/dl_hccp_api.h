@@ -266,6 +266,19 @@ public:
         return gRaSendWrlistExt(qp_handle, wr, op_rsp, send_num, complete_num);
     }
 
+    static inline bool RaMrRegAvailable()
+    {
+        return gRaMrReg != nullptr;
+    }
+
+    static inline int RaMrReg(void *qp_handle, HccpMrInfo *info)
+    {
+        if (gRaMrReg == nullptr) {
+            return BM_UNDER_API_UNLOAD;
+        }
+        return gRaMrReg(qp_handle, info);
+    }
+
     static inline uint32_t TsdOpen(uint32_t deviceId, uint32_t rankSize)
     {
         if (gTsdOpen == nullptr) {
@@ -323,6 +336,7 @@ private:
     static raSendWrFunc gRaSendWr;
     static raSendWrV2Func gRaSendWrV2;
     static raSendWrlistExtFunc gRaSendWrlistExt;
+    static raMrRegFunc gRaMrReg;
     static raGetNotifyBaseAddrFunc gRaGetNotifyBaseAddr;
     static raGetNotifyMrInfoFunc gRaGetNotifyMrInfo;
 

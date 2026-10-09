@@ -48,6 +48,7 @@ raDeregisterMrFunc DlHccpApi::gRaDeregisterMR;
 raSendWrFunc DlHccpApi::gRaSendWr;
 raSendWrV2Func DlHccpApi::gRaSendWrV2;
 raSendWrlistExtFunc DlHccpApi::gRaSendWrlistExt;
+raMrRegFunc DlHccpApi::gRaMrReg;
 raGetNotifyBaseAddrFunc DlHccpApi::gRaGetNotifyBaseAddr;
 raGetNotifyMrInfoFunc DlHccpApi::gRaGetNotifyMrInfo;
 
@@ -114,7 +115,9 @@ Result DlHccpApi::LoadLibrary()
     DL_LOAD_SYM_ALT(gRaDeregisterMR, raDeregisterMrFunc, raHandle, "ra_deregister_mr", "RaDeregisterMr");
     DL_LOAD_SYM_ALT(gRaSendWr, raSendWrFunc, raHandle, "ra_send_wr", "RaSendWr");
     DL_LOAD_SYM_ALT(gRaSendWrV2, raSendWrV2Func, raHandle, "ra_send_wr_v2", "RaSendWrV2");
+    /* optional: old driver packages without RaSendWrlistExt/RaMrReg keep the per-WQE host batch path */
     DL_LOAD_SYM_OPTIONAL(gRaSendWrlistExt, raSendWrlistExtFunc, raHandle, "RaSendWrlistExt");
+    DL_LOAD_SYM_OPTIONAL(gRaMrReg, raMrRegFunc, raHandle, "RaMrReg");
     DL_LOAD_SYM_ALT(gRaGetNotifyBaseAddr, raGetNotifyBaseAddrFunc, raHandle,
         "ra_get_notify_base_addr", "RaGetNotifyBaseAddr");
     DL_LOAD_SYM_ALT(gRaGetNotifyMrInfo, raGetNotifyMrInfoFunc, raHandle, "ra_get_notify_mr_info", "RaGetNotifyMrInfo");
@@ -157,6 +160,7 @@ void DlHccpApi::CleanupLibrary()
     gRaSendWr = nullptr;
     gRaSendWrV2 = nullptr;
     gRaSendWrlistExt = nullptr;
+    gRaMrReg = nullptr;
     gRaGetNotifyBaseAddr = nullptr;
     gRaGetNotifyMrInfo = nullptr;
     gRaQpCreateWithAttrs = nullptr;
