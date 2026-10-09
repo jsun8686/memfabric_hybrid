@@ -859,8 +859,9 @@ Result SmemRallocEntry::DataCopyBatch(smem_ralloc_batch_copy_params *params, uin
     SM_ASSERT_RETURN(inited_, SM_NOT_INITIALIZED);
     SM_RETURN_IT_IF_NOT_OK(CheckJoined());
 
-    hybm_batch_copy_params copyParams = {params->sources, params->destinations, params->dataSizes,
-                                         params->batchSize};
+    hybm_batch_copy_params copyParams = {reinterpret_cast<void **>(const_cast<uint64_t *>(params->sources)),
+                                         reinterpret_cast<void **>(const_cast<uint64_t *>(params->destinations)),
+                                         params->dataSizes, params->batchSize};
     auto ret = hybm_data_batch_copy(entity_, &copyParams, HYBM_DATA_COPY_DIRECTION_AUTO, nullptr, flags);
     return ret == BM_NOT_CONNECTED ? SMEM_NOT_CONNECTED : ret;
 }

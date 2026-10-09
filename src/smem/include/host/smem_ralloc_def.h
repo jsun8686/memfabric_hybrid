@@ -119,27 +119,31 @@ typedef struct {
 typedef smem_ralloc_mem_info smem_ralloc_mem_info_t;
 
 typedef struct {
-    void **sources;            /* array of source addresses, local or global, batchSize entries */
-    void **destinations;       /* array of destination addresses, local or global, batchSize entries */
-    const uint64_t *dataSizes; /* array of data sizes in byte, batchSize entries */
-    uint32_t batchSize;        /* number of the copy pairs */
+    const uint64_t *sources;       /* array of source addresses, local or global, batchSize entries */
+    const uint64_t *destinations;  /* array of destination addresses, local or global, batchSize entries */
+    const uint64_t *dataSizes;     /* array of data sizes in byte, batchSize entries */
+    uint32_t batchSize;            /* number of the copy pairs */
 } smem_ralloc_batch_copy_params;
 typedef smem_ralloc_batch_copy_params smem_ralloc_batch_copy_params_t;
 
-/* routed variant of smem_ralloc_batch_copy_params: the caller asserts per-segment routing
- * (peer rank and direction) instead of the library deriving it from the addresses, so the
- * per-segment window/range precheck is skipped entirely. Wrong routing degrades safely:
- * the kernel-side MR lookup misses and the WQE is skipped (no data corruption), the error
- * is only visible through data verification. */
+/* routed DVA variant of smem_ralloc_batch_copy_params (consumed by
+ * smem_ralloc_device_copy_batch_v2): the caller asserts per-segment routing (peer rank
+ * and direction) instead of the library deriving it from the addresses, so the
+ * per-segment window/range precheck is skipped entirely. The five descriptor arrays are
+ * DEVICE (HBM) addresses (DVA) -- the host side never dereferences them, the kernel reads
+ * them from global memory directly and the whole batch is driven by ONE kernel launch
+ * (no SEG_MAX chunking). All five arrays must live in device memory; mixing host pointers
+ * in is undefined. Wrong routing degrades safely: the kernel-side MR lookup misses and the
+ * WQE is skipped (no data corruption), the error is only visible through data verification. */
 typedef struct {
-    void **sources;            /* array of source addresses, batchSize entries */
-    void **destinations;       /* array of destination addresses, batchSize entries */
-    const uint64_t *dataSizes; /* array of data sizes in byte, batchSize entries */
-    const uint32_t *peerRanks; /* caller-asserted owner rank of the peer endpoint, batchSize entries */
-    const uint32_t *isWrites;  /* caller-asserted direction, 1 = WRITE (local -> peer), batchSize entries */
-    uint32_t batchSize;        /* number of the copy pairs */
-} smem_ralloc_batch_copy_ex_params;
-typedef smem_ralloc_batch_copy_ex_params smem_ralloc_batch_copy_ex_params_t;
+    uint64_t srcArray;   /* DVA of the const uint64 sources[batchSize] */
+    uint64_t dstArray;   /* DVA of the const uint64 destinations[batchSize] */
+    uint64_t sizeArray;  /* DVA of the const uint64 dataSizes[batchSize] */
+    uint64_t rankArray;  /* DVA of the const uint32 peerRanks[batchSize] */
+    uint64_t writeArray; /* DVA of the const uint32 isWrites[batchSize], 1 = WRITE */
+    uint32_t batchSize;  /* number of the copy pairs, (0, SMEM_RALLOC_DEVICE_BATCH_MAX_COUNT] */
+} smem_ralloc_batch_copy_v2_params;
+typedef smem_ralloc_batch_copy_v2_params smem_ralloc_batch_copy_v2_params_t;
 
 /**
  * @brief smem join/leave event type

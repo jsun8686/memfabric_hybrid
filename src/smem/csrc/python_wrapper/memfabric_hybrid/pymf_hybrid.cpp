@@ -441,21 +441,11 @@ public:
         if (count == 0 || srcs.size() != count || dsts.size() != count || sizes.size() != count) {
             return SMEM_INVALID_PARAM;
         }
-        void **ptr = new void *[count + count];
-        if (ptr == nullptr) {
-            throw std::runtime_error(std::string("alloc mem failed."));
-        }
 
-        void **sources = ptr;
-        void **destinations = ptr + count;
-        for (uint64_t i = 0; i < count; ++i) {
-            sources[i] = reinterpret_cast<void *>(srcs[i]);
-            destinations[i] = reinterpret_cast<void *>(dsts[i]);
-        }
-        smem_ralloc_batch_copy_params batch_params = {sources, destinations, sizes.data(), count};
-        auto ret = smem_ralloc_copy_batch(handle_, &batch_params, flags);
-        delete[] ptr;
-        return ret;
+        smem_ralloc_batch_copy_params batch_params = {reinterpret_cast<const uint64_t *>(srcs.data()),
+                                                      reinterpret_cast<const uint64_t *>(dsts.data()),
+                                                      reinterpret_cast<const uint64_t *>(sizes.data()), count};
+        return smem_ralloc_copy_batch(handle_, &batch_params, flags);
     }
 
     int32_t Wait()
@@ -498,7 +488,7 @@ public:
             if (peerRank == UINT32_MAX || isWrite == UINT32_MAX) {
                 return SMEM_INVALID_PARAM;
             }
-            return smem_ralloc_device_copy_ex(handle_, reinterpret_cast<const void *>(src),
+            return smem_ralloc_device_copy_v2(handle_, reinterpret_cast<const void *>(src),
                                               reinterpret_cast<void *>(dst), size, peerRank, isWrite,
                                               reinterpret_cast<void *>(stream));
         }
@@ -514,32 +504,23 @@ public:
         if (count == 0 || dsts.size() != count || sizes.size() != count) {
             return SMEM_INVALID_PARAM;
         }
-        bool routed = !peerRanks.empty() || !isWrites.empty();
-        if (routed && (peerRanks.size() != count || isWrites.size() != count)) {
-            return SMEM_INVALID_PARAM;
+        if (!peerRanks.empty() || !isWrites.empty()) {
+            std::cerr << "device_copy_batch with host-side routed arrays is no longer supported; "
+                      << "stage the descriptors into device memory and use device_copy_batch_v2" << std::endl;
+            return SMEM_ERROR;
         }
-        void **ptr = new void *[count + count];
-        if (ptr == nullptr) {
-            throw std::runtime_error(std::string("alloc mem failed."));
-        }
+        smem_ralloc_batch_copy_params params = {reinterpret_cast<const uint64_t *>(srcs.data()),
+                                                reinterpret_cast<const uint64_t *>(dsts.data()), sizes.data(),
+                                                static_cast<uint32_t>(count)};
+        return smem_ralloc_device_copy_batch(handle_, &params, reinterpret_cast<void *>(stream));
+    }
 
-        void **sources = ptr;
-        void **destinations = ptr + count;
-        for (uint64_t i = 0; i < count; ++i) {
-            sources[i] = reinterpret_cast<void *>(srcs[i]);
-            destinations[i] = reinterpret_cast<void *>(dsts[i]);
-        }
-        int32_t ret;
-        if (routed) {
-            smem_ralloc_batch_copy_ex_params params = {sources, destinations, sizes.data(), peerRanks.data(),
-                                                       isWrites.data(), static_cast<uint32_t>(count)};
-            ret = smem_ralloc_device_copy_batch_ex(handle_, &params, reinterpret_cast<void *>(stream));
-        } else {
-            smem_ralloc_batch_copy_params params = {sources, destinations, sizes.data(), static_cast<uint32_t>(count)};
-            ret = smem_ralloc_device_copy_batch(handle_, &params, reinterpret_cast<void *>(stream));
-        }
-        delete[] ptr;
-        return ret;
+
+    int32_t DeviceCopyBatchV2(uint64_t srcArray, uint64_t dstArray, uint64_t sizeArray, uint64_t rankArray,
+                              uint64_t writeArray, uint32_t count, uintptr_t stream)
+    {
+        smem_ralloc_batch_copy_v2_params params = {srcArray, dstArray, sizeArray, rankArray, writeArray, count};
+        return smem_ralloc_device_copy_batch_v2(handle_, &params, reinterpret_cast<void *>(stream));
     }
 
     std::vector<uint32_t> GetGroupRanks()
@@ -1324,26 +1305,47 @@ Returns:
         .def("device_copy_batch", &RallocPool::DeviceCopyBatch, py::call_guard<py::gil_scoped_release>(),
              py::arg("src_addrs"), py::arg("dst_addrs"), py::arg("sizes"), py::arg("stream") = 0,
              py::arg("peer_ranks") = std::vector<uint32_t>(), py::arg("is_writes") = std::vector<uint32_t>(), R"(
-Submit a batch of device-scheduled one-sided copies, the counterpart of copy_data_batch
-for device-scheduled pools. Same address semantics as device_copy (including registered
-user HBM endpoints, P1), applied per segment:
-the direction of every segment is derived from its own addresses and mixed WRITE/READ
-segments are allowed. All segments are prechecked before anything is enqueued, then
-driven in chunks of at most 64 segments per kernel launch, each chunk quiets every peer
-it touched exactly once. register()/unregister() must happen before graph capture.
+Submit a batch of device-scheduled one-sided copies (checked path), the counterpart of
+copy_data_batch for device-scheduled pools. Same address semantics as device_copy
+(including registered user HBM endpoints), applied per segment: the direction of every
+segment is derived from its own addresses and mixed WRITE/READ segments are allowed. All
+segments are prechecked before anything is enqueued, then driven in chunks of at most 64
+segments per kernel launch. register()/unregister() must happen before graph capture.
 
-Routed fast path: pass both peer_ranks and is_writes (lists parallel to the address
-lists, 1 = WRITE local->peer, 0 = READ peer->local) to assert the routing yourself and
-skip the per-segment precheck. Wrong routing degrades safely, see device_copy. Pass
-neither to keep the checked auto-derived behavior.
+For the routed fast path use device_copy_batch_v2: stage the five descriptor arrays into
+device memory and get one kernel launch for the whole batch.
 
 Arguments:
     src_addrs(list[int]): source addresses, local or peer device window slots
     dst_addrs(list[int]): destination addresses, peer or local device window slots
     sizes(list[int]):     sizes of the segments
     stream(int):          aclrt stream pointer, 0 uses the default stream, default 0
-    peer_ranks(list[int]): routed fast path only, owner rank per segment, default []
-    is_writes(list[int]):  routed fast path only, direction per segment, default []
+    peer_ranks(list[int]): obsolete, must stay empty
+    is_writes(list[int]):  obsolete, must stay empty
+Returns:
+    0 if successful)")
+        .def("device_copy_batch_v2", &RallocPool::DeviceCopyBatchV2, py::call_guard<py::gil_scoped_release>(),
+             py::arg("src_array"), py::arg("dst_array"), py::arg("size_array"), py::arg("rank_array"),
+             py::arg("write_array"), py::arg("count"), py::arg("stream") = 0, R"(
+Routed DVA single-submit: the five descriptor arrays must already live in device memory
+(HBM). Layout per array, count entries each: src_array/dst_array/size_array are uint64,
+rank_array/write_array are uint32 (1 = WRITE local->peer). The kernel reads the
+descriptors from global memory and drives the whole batch with ONE kernel launch -- no
+per-chunk pipeline drain -- keeping the per-lane send queue bounded with in-kernel
+sub-batch quiets. Stage the arrays with an async H2D copy on the same stream before this
+call (stream ordering then makes buffer reuse race-free), and keep the backing buffer
+alive across the call and across graph replays when captured. Routing is a caller trust
+contract: wrong peer ranks degrade safely (kernel-side MR lookup miss, segment skipped),
+errors are only visible through data verification.
+
+Arguments:
+    src_array(int):   device address of the uint64 source array
+    dst_array(int):   device address of the uint64 destination array
+    size_array(int):  device address of the uint64 size array
+    rank_array(int):  device address of the uint32 peer rank array
+    write_array(int): device address of the uint32 is_write array
+    count(int):       number of segments, (0, 1048576]
+    stream(int):      aclrt stream pointer, 0 uses the default stream, default 0
 Returns:
     0 if successful)")
         .def("get_group_ranks", &RallocPool::GetGroupRanks, py::call_guard<py::gil_scoped_release>(), R"(

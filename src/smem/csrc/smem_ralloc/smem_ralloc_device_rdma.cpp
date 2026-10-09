@@ -25,6 +25,7 @@ void *DlSmemRallocDeviceApi::libHandle = nullptr;
 SmemRallocDeviceWriteRunFunc DlSmemRallocDeviceApi::pWriteRunSubmit = nullptr;
 SmemRallocDeviceReadRunFunc DlSmemRallocDeviceApi::pReadRunSubmit = nullptr;
 SmemRallocDeviceBatchRunFunc DlSmemRallocDeviceApi::pBatchRunSubmit = nullptr;
+SmemRallocDeviceBatchV2RunFunc DlSmemRallocDeviceApi::pBatchV2RunSubmit = nullptr;
 
 static const char *SMEM_RALLOC_DEVICE_LIB_NAME = "libmf_smem_ralloc_device_rdma.so";
 
@@ -66,7 +67,10 @@ bool DlSmemRallocDeviceApi::TryLoadLibrary()
         dlsym(libHandle, "smem_ralloc_device_read_run_submit"));
     pBatchRunSubmit = reinterpret_cast<SmemRallocDeviceBatchRunFunc>(
         dlsym(libHandle, "smem_ralloc_device_batch_run_submit"));
-    if (pWriteRunSubmit == nullptr || pReadRunSubmit == nullptr || pBatchRunSubmit == nullptr) {
+    pBatchV2RunSubmit = reinterpret_cast<SmemRallocDeviceBatchV2RunFunc>(
+        dlsym(libHandle, "smem_ralloc_device_batch_v2_run_submit"));
+    if (pWriteRunSubmit == nullptr || pReadRunSubmit == nullptr || pBatchRunSubmit == nullptr ||
+        pBatchV2RunSubmit == nullptr) {
         SM_LOG_WARN("Failed to load symbol smem_ralloc_device_run_submit, error: " << dlerror());
         dlclose(libHandle);
         libHandle = nullptr;
@@ -87,6 +91,7 @@ void DlSmemRallocDeviceApi::CleanupLibrary()
     pWriteRunSubmit = nullptr;
     pReadRunSubmit = nullptr;
     pBatchRunSubmit = nullptr;
+    pBatchV2RunSubmit = nullptr;
     if (libHandle != nullptr) {
         dlclose(libHandle);
         libHandle = nullptr;

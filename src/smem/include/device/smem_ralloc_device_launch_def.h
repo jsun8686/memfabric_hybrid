@@ -52,6 +52,25 @@ struct smem_ralloc_device_batch_args {
     uint32_t entityId; /* ralloc pool entity id in the device meta window */
 };
 
+/* DVA single-submit variant of the routed batch: the five descriptor arrays (SoA layout,
+ * see smem_ralloc_batch_copy_v2_params) live in DEVICE memory; the host passes their
+ * device addresses and the kernel loads each segment's fields from global memory. One
+ * launch covers the whole batch regardless of count -- there is no SEG_MAX chunking and
+ * no per-chunk pipeline drain, the per-lane SQ is kept safe by an in-kernel sub-batch
+ * quiet every SMEM_RALLOC_DEVICE_DVA_LANE_BUDGET segments (the SQ ring depth is 8192). */
+#define SMEM_RALLOC_DEVICE_BATCH_MAX_COUNT (1U << 20) /* descriptor count hard bound */
+#define SMEM_RALLOC_DEVICE_DVA_LANE_BUDGET 2048U      /* segments per lane between quiets */
+
+struct smem_ralloc_device_batch_dva_args {
+    uint64_t srcArray;   /* device address of the const uint64 sources[count] */
+    uint64_t dstArray;   /* device address of the const uint64 destinations[count] */
+    uint64_t sizeArray;  /* device address of the const uint64 dataSizes[count] */
+    uint64_t rankArray;  /* device address of the const uint32 peerRanks[count] */
+    uint64_t writeArray; /* device address of the const uint32 isWrites[count] */
+    uint32_t count;      /* valid segments, 1 .. SMEM_RALLOC_DEVICE_BATCH_MAX_COUNT */
+    uint32_t entityId;   /* ralloc pool entity id in the device meta window */
+};
+
 #ifdef __cplusplus
 }
 #endif

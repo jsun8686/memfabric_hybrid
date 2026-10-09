@@ -299,22 +299,31 @@ int32_t smem_ralloc_device_copy_batch(smem_ralloc_t handle, smem_ralloc_batch_co
  * @param stream           [in] aclrt stream, null uses the default stream
  * @return 0 if successful
  */
-int32_t smem_ralloc_device_copy_ex(smem_ralloc_t handle, const void *src, void *dest, uint64_t size,
+int32_t smem_ralloc_device_copy_v2(smem_ralloc_t handle, const void *src, void *dest, uint64_t size,
                                    uint32_t peerRank, uint32_t isWrite, void *stream);
 
 /**
- * @brief Routed variant of <i>smem_ralloc_device_copy_batch</i>: per-segment routing
- *        (peer rank, direction) is caller-asserted via <i>smem_ralloc_batch_copy_ex_params</i>,
- *        skipping the per-segment precheck of the checked path. Chunking (SEG_MAX segments
- *        per kernel launch, one quiet per touched peer) is identical to the checked path.
- *        Wrong routing degrades safely, see <i>smem_ralloc_device_copy_ex</i>.
+ * @brief Routed DVA single-submit variant of <i>smem_ralloc_device_copy_batch</i>: the five
+ *        descriptor array addresses carried by <i>smem_ralloc_batch_copy_v2_params</i>
+ *        (srcArray/dstArray/sizeArray -> uint64 element arrays, rankArray/writeArray ->
+ *        uint32 element arrays, batchSize entries each) are DEVICE addresses (DVA) of
+ *        arrays living in HBM -- the host never dereferences them and the kernel reads
+ *        them from global memory directly, so the whole batch is driven by ONE kernel
+ *        launch with no SEG_MAX chunking and no per-chunk pipeline drain. Per-segment
+ *        values are a caller trust contract (sizes within (0, 4G], peer ranks within
+ *        rankCount); wrong routing degrades safely: the kernel-side MR lookup misses and
+ *        the WQE is skipped (no data corruption), the error is only visible through data
+ *        verification. Stage the arrays with an async H2D on the same stream before this
+ *        call (stream ordering then makes device-buffer reuse race-free) and keep the
+ *        backing buffer alive across the call, and across graph replays when captured.
  *
- * @param handle           [in] ralloc object handle
- * @param params           [in] routed batch description
+ * @param handle           [in] ralloc object handle created by <i>smem_ralloc_create</i> with
+ *                            SMEMRA_DATA_OP_DEVICE_SCHEDULE | SMEMRA_DATA_OP_DEVICE_RDMA
+ * @param params           [in] routed batch description, plain device addresses (never host pointers)
  * @param stream           [in] aclrt stream, null uses the default stream
  * @return 0 if successful
  */
-int32_t smem_ralloc_device_copy_batch_ex(smem_ralloc_t handle, smem_ralloc_batch_copy_ex_params_t *params,
+int32_t smem_ralloc_device_copy_batch_v2(smem_ralloc_t handle, smem_ralloc_batch_copy_v2_params_t *params,
                                          void *stream);
 
 #ifdef __cplusplus

@@ -180,3 +180,95 @@ extern "C" void smem_ralloc_device_batch_run_submit(const struct smem_ralloc_dev
      * block per QP lane so the kernel's block-to-lane mapping has a 1:1 producer */
     smem_ralloc_device_batch_run_kernel<<<smem_ralloc_device_qps_per_peer(), nullptr, stream>>>(*args);
 }
+
+/* distinct-peer tracking for the DVA kernel: one bit per peer rank, 8 words cover 512
+ * ranks (today's pool worlds are far below that); an out-of-mask rank is quieted
+ * immediately after its WQE -- correctness over batching for exotic world sizes */
+#define SMEM_RALLOC_DVA_PEER_MASK_WORDS 8U
+
+__aicore__ static void smem_ralloc_device_dva_quiet_mask(uint32_t entityId, const uint64_t *peerMask, uint32_t lane,
+                                                         AscendC::LocalTensor<uint64_t> &ubLocal64,
+                                                         AscendC::LocalTensor<uint32_t> &ubLocal32)
+{
+    for (uint32_t w = 0; w < SMEM_RALLOC_DVA_PEER_MASK_WORDS; w++) {
+        const uint64_t m = peerMask[w];
+        for (uint32_t b = 0; b < 64U; b++) {
+            if (((m >> b) & 1ULL) != 0ULL) {
+                (void)smem_ralloc_roce_quiet(entityId, (w << 6) | b, lane, ubLocal64, ubLocal32);
+            }
+        }
+    }
+}
+
+extern "C" __global__ __aicore__ void smem_ralloc_device_batch_v2_run_kernel(
+    struct smem_ralloc_device_batch_dva_args args)
+{
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+    /* same lane discipline as the chunked batch kernel: one block per QP lane, block b
+     * exclusively owns lane b; blocks beyond the table's lane count exit */
+    __gm__ void *qpInfoVa = smem_ralloc_get_qp_info_address(args.entityId);
+    uint32_t laneNum = ((__gm__ SmemRallocRdmaInfo *)qpInfoVa)->qpNum;
+    uint32_t blockIdx = AscendC::GetBlockIdx();
+    if (laneNum == 0 || blockIdx >= laneNum) {
+        return;
+    }
+
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, 1> que64;
+    AscendC::TQue<AscendC::TPosition::VECIN, 1> que32;
+    AscendC::LocalTensor<uint64_t> ubLocal64;
+    AscendC::LocalTensor<uint32_t> ubLocal32;
+    smem_ralloc_device_ub_alloc(pipe, que64, que32, ubLocal64, ubLocal32);
+
+    /* SoA descriptor arrays in global memory: strided even distribution as before, the
+     * only difference is where each segment's five fields are loaded from */
+    __gm__ const uint64_t *srcArr = (__gm__ const uint64_t *)args.srcArray;
+    __gm__ const uint64_t *dstArr = (__gm__ const uint64_t *)args.dstArray;
+    __gm__ const uint64_t *sizeArr = (__gm__ const uint64_t *)args.sizeArray;
+    __gm__ const uint32_t *rankArr = (__gm__ const uint32_t *)args.rankArray;
+    __gm__ const uint32_t *writeArr = (__gm__ const uint32_t *)args.writeArray;
+
+    uint64_t peerMask[SMEM_RALLOC_DVA_PEER_MASK_WORDS] = {0};
+    uint32_t lanePosted = 0;
+    for (uint32_t i = blockIdx; i < args.count; i += laneNum) {
+        const uint64_t src = srcArr[i];
+        const uint64_t dst = dstArr[i];
+        const uint64_t size = sizeArr[i];
+        const uint32_t peer = rankArr[i];
+        const uint32_t isWrite = writeArr[i];
+        if (isWrite != 0U) {
+            smem_ralloc_roce_write(args.entityId, (__gm__ uint8_t *)src, (__gm__ uint8_t *)dst, peer, blockIdx, size,
+                                   ubLocal64, ubLocal32);
+        } else {
+            smem_ralloc_roce_read(args.entityId, (__gm__ uint8_t *)src, (__gm__ uint8_t *)dst, peer, blockIdx, size,
+                                  ubLocal64, ubLocal32);
+        }
+        if (peer < SMEM_RALLOC_DVA_PEER_MASK_WORDS * 64U) {
+            peerMask[peer >> 6] |= 1ULL << (peer & 63U);
+        } else {
+            (void)smem_ralloc_roce_quiet(args.entityId, peer, blockIdx, ubLocal64, ubLocal32);
+        }
+        lanePosted++;
+        if (lanePosted >= SMEM_RALLOC_DEVICE_DVA_LANE_BUDGET) {
+            /* in-kernel sub-batch drain: bounds the per-lane outstanding WQEs well below
+             * the SQ ring depth (8192) so arbitrary counts are safe without host chunking */
+            smem_ralloc_device_dva_quiet_mask(args.entityId, peerMask, blockIdx, ubLocal64, ubLocal32);
+            for (uint32_t w = 0; w < SMEM_RALLOC_DVA_PEER_MASK_WORDS; w++) {
+                peerMask[w] = 0;
+            }
+            lanePosted = 0;
+        }
+    }
+    smem_ralloc_device_dva_quiet_mask(args.entityId, peerMask, blockIdx, ubLocal64, ubLocal32);
+
+    que32.FreeTensor(ubLocal32);
+    que64.FreeTensor(ubLocal64);
+}
+
+extern "C" void smem_ralloc_device_batch_v2_run_submit(const struct smem_ralloc_device_batch_dva_args *args,
+                                                        void *stream)
+{
+    /* host side: only the seven scalars travel in the launch parameter area; the descriptor
+     * arrays stay in device memory and are read by the kernel directly */
+    smem_ralloc_device_batch_v2_run_kernel<<<smem_ralloc_device_qps_per_peer(), nullptr, stream>>>(*args);
+}

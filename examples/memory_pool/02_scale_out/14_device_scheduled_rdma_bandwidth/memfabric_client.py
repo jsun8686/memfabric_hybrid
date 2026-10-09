@@ -21,11 +21,14 @@ copies at offsets (i % slots) * size):
   --graph:               capture ONE full NPUGraph per direction holding the whole rotated
                          sequence (single-copy kernels), replay it --replays times — the
                          real-world shape of a complete graph embedding the communication
-  --batch:               one direct device_copy_batch submit (the whole matrix, internally
-                         chunked into 64-segment kernel launches with one quiet per peer)
-  --graph --batch:       capture the single device_copy_batch submit and replay it
-                         --replays times — zero host work per replay AND amortized
-                         completion
+  --batch:               one direct device_copy_batch submit (the whole matrix). +fast
+                          stages the five descriptor arrays into HBM (stage_batch_desc)
+                          and submits ONE DVA kernel launch; without fast the checked
+                          path chunks by 64 segments per launch
+  --graph --batch:       capture the single batch submit and replay it --replays times —
+                          zero host work per replay AND amortized completion; +fast
+                          captures only the DVA submit (descriptor staging happens once,
+                          before capture)
 
 Output lines match 08's format so runs are directly comparable.
 """
@@ -63,6 +66,26 @@ def _log(msg):
     print(msg, flush=True)
     if _term_fd is not None:
         os.write(_term_fd, (msg + "\n").encode("utf-8", "replace"))
+
+
+def stage_batch_desc(srcs, dsts, sizes, ranks, writes):
+    """Pack the five SoA descriptor arrays into ONE contiguous device buffer (H2D) and
+    return (tensor, src_va, dst_va, size_va, rank_va, write_va). The tensor must stay
+    alive as long as the descriptors are consumed (graph replays included): the DVA
+    batch kernel reads it from device memory at launch/replay time. Layout:
+    [src u64 n][dst u64 n][size u64 n][rank u32 n][write u32 n] = 32B/segment."""
+    import numpy as np
+    import torch
+    n = len(srcs)
+    host = np.empty(n * 32, dtype=np.uint8)
+    host[0:n * 8] = np.asarray(srcs, dtype=np.uint64).view(np.uint8)
+    host[n * 8:n * 16] = np.asarray(dsts, dtype=np.uint64).view(np.uint8)
+    host[n * 16:n * 24] = np.asarray(sizes, dtype=np.uint64).view(np.uint8)
+    host[n * 24:n * 28] = np.asarray(ranks, dtype=np.uint32).view(np.uint8)
+    host[n * 28:n * 32] = np.asarray(writes, dtype=np.uint32).view(np.uint8)
+    dev = torch.from_numpy(host).to("npu")
+    base = dev.data_ptr()
+    return dev, base, base + n * 8, base + n * 16, base + n * 24, base + n * 28
 
 
 def _wait_tcp(url, timeout_sec):
@@ -130,15 +153,16 @@ def main():
                              f"= replays x batch-size per direction (default {DEFAULT_REPLAYS})")
     parser.add_argument("--batch", action="store_true",
                         help="time device_copy_batch submits (whole rotated matrix in one call; "
-                             "64-segment kernel launches, one quiet per distinct peer); alone it is "
-                             "one direct submit, combined with --graph the submit is captured and "
-                             "replayed (graph-batch)")
+                             "+fast stages descriptors to HBM and drives ONE DVA kernel launch, "
+                             "without fast the checked path uses 64-segment launches); alone it "
+                             "is one direct submit, combined with --graph the submit is captured "
+                             "and replayed (graph-batch)")
     parser.add_argument("--fast", action="store_true",
-                        help="routed fast path: timed copies pass peer_rank/is_write (batch: "
-                             "peer_ranks/is_writes) so the C layer skips the per-call address "
-                             "precheck; warmup stays on the checked path as the correctness gate; "
-                             "wrong routing degrades to a skipped WQE caught by the round-trip "
-                             "check, not corruption")
+                        help="routed fast path: direct copies pass peer_rank/is_write (batch: "
+                             "descriptors staged to HBM, see stage_batch_desc) so the C layer "
+                             "skips the per-call address precheck; warmup stays on the checked "
+                             "path as the correctness gate; wrong routing degrades to a skipped "
+                             "WQE caught by the round-trip check, not corruption")
     parser.add_argument("--world", type=int, default=DEFAULT_WORLD,
                         help=f"declared world capacity (default {DEFAULT_WORLD})")
     parser.add_argument("--rpc-port-base", type=int, default=RPC_PORT_BASE,
@@ -289,11 +313,16 @@ def main():
             elif mode == "batch":
                 dst.zero_()
                 torch.npu.synchronize()
+                if args.fast:
+                    # static descriptors: stage to HBM once, OUTSIDE the timed submit
+                    wdesc = stage_batch_desc([src_addr] * blocks, dst_offs, [size] * blocks,
+                                             [far_rank] * blocks, [1] * blocks)
+                    rdesc = stage_batch_desc(dst_offs, [dst_addr] * blocks, [size] * blocks,
+                                             [far_rank] * blocks, [0] * blocks)
                 t0 = time.perf_counter()
                 if args.fast:
-                    assert handle.device_copy_batch([src_addr] * blocks, dst_offs, [size] * blocks, 0,
-                                                    peer_ranks=[far_rank] * blocks,
-                                                    is_writes=[1] * blocks) == 0, "batch L2G failed"
+                    assert handle.device_copy_batch_v2(wdesc[1], wdesc[2], wdesc[3], wdesc[4], wdesc[5],
+                                                       blocks, 0) == 0, "batch L2G failed"
                 else:
                     assert handle.device_copy_batch([src_addr] * blocks, dst_offs, [size] * blocks, 0) == 0, \
                         "batch L2G failed"
@@ -302,9 +331,8 @@ def main():
                 tw = time.perf_counter() - t0
                 t0 = time.perf_counter()
                 if args.fast:
-                    assert handle.device_copy_batch(dst_offs, [dst_addr] * blocks, [size] * blocks, 0,
-                                                    peer_ranks=[far_rank] * blocks,
-                                                    is_writes=[0] * blocks) == 0, "batch G2L failed"
+                    assert handle.device_copy_batch_v2(rdesc[1], rdesc[2], rdesc[3], rdesc[4], rdesc[5],
+                                                       blocks, 0) == 0, "batch G2L failed"
                 else:
                     assert handle.device_copy_batch(dst_offs, [dst_addr] * blocks, [size] * blocks, 0) == 0, \
                         "batch G2L failed"
@@ -316,14 +344,21 @@ def main():
                 timed_blocks = blocks
             elif mode == "graph-batch":
                 torch.npu.synchronize()
+                if args.fast:
+                    # stage BEFORE capture: the H2D must complete before the first replay
+                    # reads it, and the graph then contains ONLY the single DVA submit
+                    wdesc = stage_batch_desc([src_addr] * blocks, dst_offs, [size] * blocks,
+                                             [far_rank] * blocks, [1] * blocks)
+                    rdesc = stage_batch_desc(dst_offs, [dst_addr] * blocks, [size] * blocks,
+                                             [far_rank] * blocks, [0] * blocks)
+                    torch.npu.synchronize()
                 wgraph = torch.npu.NPUGraph()
                 with torch.npu.stream(side):
                     stream_ptr = torch.npu.current_stream().npu_stream
                     wgraph.capture_begin()
                     if args.fast:
-                        assert handle.device_copy_batch([src_addr] * blocks, dst_offs, [size] * blocks,
-                                                        stream_ptr, peer_ranks=[far_rank] * blocks,
-                                                        is_writes=[1] * blocks) == 0, \
+                        assert handle.device_copy_batch_v2(wdesc[1], wdesc[2], wdesc[3], wdesc[4], wdesc[5],
+                                                           blocks, stream_ptr) == 0, \
                             "captured batch write submit failed"
                     else:
                         assert handle.device_copy_batch([src_addr] * blocks, dst_offs, [size] * blocks,
@@ -337,9 +372,8 @@ def main():
                     stream_ptr = torch.npu.current_stream().npu_stream
                     rgraph.capture_begin()
                     if args.fast:
-                        assert handle.device_copy_batch(dst_offs, [dst_addr] * blocks, [size] * blocks,
-                                                        stream_ptr, peer_ranks=[far_rank] * blocks,
-                                                        is_writes=[0] * blocks) == 0, \
+                        assert handle.device_copy_batch_v2(rdesc[1], rdesc[2], rdesc[3], rdesc[4], rdesc[5],
+                                                           blocks, stream_ptr) == 0, \
                             "captured batch read submit failed"
                     else:
                         assert handle.device_copy_batch(dst_offs, [dst_addr] * blocks, [size] * blocks,
@@ -358,6 +392,9 @@ def main():
                 torch.npu.synchronize()
                 tr = time.perf_counter() - t0
                 del wgraph, rgraph
+                if args.fast:
+                    # descriptor tensors must outlive the graphs' last replay
+                    del wdesc, rdesc
                 phase = f"{blocks} blocks/graph x {args.replays} replays (graph-batch{' fast' if args.fast else ''})"
                 moved = args.replays * one_way
                 timed_blocks = args.replays * blocks
