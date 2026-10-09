@@ -407,6 +407,9 @@ void JoinableRanksQpManager::MakeQpConnections(const std::set<uint32_t> &newRank
         }
 
         if (!connections_[rankId].qpConnectCalled) {
+            if (preConnectMrRegHook_ != nullptr) {
+                preConnectMrRegHook_(connections_[rankId].qpHandle);
+            }
             auto ret = DlHccpApi::RaQpConnectAsync(connections_[rankId].qpHandle, connections_[rankId].socketFd);
             if (ret != 0) {
                 BM_LOG_ERROR("create QP from " << rankId_ << " to " << rankId << " failed: " << ret);

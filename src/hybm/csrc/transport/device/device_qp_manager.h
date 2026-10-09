@@ -15,6 +15,7 @@
 
 #include <netinet/in.h>
 #include <cstdint>
+#include <functional>
 #include <unordered_set>
 #include <unordered_map>
 #include <atomic>
@@ -70,6 +71,13 @@ public:
     virtual void PutQpHandle(UserQpInfo *qp) const noexcept = 0;
     virtual bool CheckQpReady(const std::vector<uint32_t> &rankIds) const noexcept;
 
+    /* registers all transport-level MR windows into a freshly created QP before connect;
+     * wrlist resolution requires per-QP MR tables on both ends (HCCL RegUserMem wiring) */
+    void SetPreConnectMrRegHook(std::function<void(void *)> hook) noexcept
+    {
+        preConnectMrRegHook_ = std::move(hook);
+    }
+
 protected:
     void *CreateLocalSocket() noexcept;
     int CreateServerSocket() noexcept;
@@ -82,6 +90,7 @@ protected:
     const hybm_role_type rankRole_;
     sockaddr_in deviceAddress_;
     void *serverSocketHandle_{nullptr};
+    std::function<void(void *)> preConnectMrRegHook_;
 };
 } // namespace device
 } // namespace transport
