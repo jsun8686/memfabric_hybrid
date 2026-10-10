@@ -43,6 +43,26 @@ static uint32_t smem_ralloc_device_qps_per_peer()
     return (uint32_t)v;
 }
 
+/* host-side doorbell batch size for the DVA kernel (MF_DVA_DB_BATCH): publish every K WQEs
+ * with one SQ doorbell. Default 1 keeps the historical per-WQE doorbell; clamped to the
+ * lane budget so a pending batch never exceeds the outstanding-WQE bound of the in-kernel
+ * quiet. Host-only: kernels cannot getenv, the value travels in the launch args. */
+static uint32_t smem_ralloc_device_db_batch()
+{
+    const char *env = getenv("MF_DVA_DB_BATCH");
+    if (env == nullptr) {
+        return 1;
+    }
+    long v = atol(env);
+    if (v < 1) {
+        v = 1;
+    }
+    if (v > (long)SMEM_RALLOC_DEVICE_DVA_LANE_BUDGET) {
+        v = (long)SMEM_RALLOC_DEVICE_DVA_LANE_BUDGET;
+    }
+    return (uint32_t)v;
+}
+
 /* must carry __aicore__: helpers without it compile as host functions and cannot be called
  * from __global__ __aicore__ kernels, nor use aicore-only TPipe/TQue APIs inside */
 __aicore__ static void smem_ralloc_device_ub_alloc(AscendC::TPipe &pipe,
@@ -55,6 +75,18 @@ __aicore__ static void smem_ralloc_device_ub_alloc(AscendC::TPipe &pipe,
     pipe.InitBuffer(que32, 1, 32);
     ubLocal64 = que64.AllocTensor<uint64_t>();
     ubLocal32 = que32.AllocTensor<uint32_t>();
+}
+
+/* flush the pending (peer, head) doorbell batch of one lane, if any */
+__aicore__ static void smem_ralloc_device_dva_flush_pending(uint32_t entityId, uint32_t lane, uint32_t &pendPeer,
+                                                            uint32_t &pendHead, uint32_t &pendCnt,
+                                                            AscendC::LocalTensor<uint64_t> &ubLocal64,
+                                                            AscendC::LocalTensor<uint32_t> &ubLocal32)
+{
+    if (pendCnt != 0U) {
+        smem_ralloc_rdma_post_send_flush(entityId, pendPeer, lane, pendHead, ubLocal64, ubLocal32);
+        pendCnt = 0U;
+    }
 }
 
 extern "C" __global__ __aicore__ void smem_ralloc_device_write_run_kernel(GM_ADDR dst, GM_ADDR src, uint64_t len,
@@ -228,6 +260,19 @@ extern "C" __global__ __aicore__ void smem_ralloc_device_batch_v2_run_kernel(
     __gm__ const uint32_t *rankArr = (__gm__ const uint32_t *)args.rankArray;
     __gm__ const uint32_t *writeArr = (__gm__ const uint32_t *)args.writeArray;
 
+    /* doorbell batching: WQEs accumulate on the per-(peer, lane) SQ ring and one doorbell
+     * publishes every dbBatch of them (PI semantics). The pending batch is flushed on peer
+     * switch, at the lane-budget quiet, at dbBatch and at the end -- quiet polls the CQ up
+     * to the flushed head, so an unflushed post would hang it. dbBatch = 1 reproduces the
+     * historical per-WQE doorbell. Outstanding WQEs per peer stay bounded by
+     * LANE_BUDGET (2048) << SQ depth (8192), so the near-full CQ poll of the single-shot
+     * path is not needed here. The K schedule is a pure function of the descriptor array,
+     * so a graph replay issues the identical doorbell sequence. */
+    const uint32_t dbBatch = (args.dbBatch == 0U) ? 1U : args.dbBatch;
+    uint32_t pendPeer = 0xFFFFFFFFU;
+    uint32_t pendHead = 0;
+    uint32_t pendCnt = 0;
+
     uint64_t peerMask[SMEM_RALLOC_DVA_PEER_MASK_WORDS] = {0};
     uint32_t lanePosted = 0;
     for (uint32_t i = blockIdx; i < args.count; i += laneNum) {
@@ -236,19 +281,34 @@ extern "C" __global__ __aicore__ void smem_ralloc_device_batch_v2_run_kernel(
         const uint64_t size = sizeArr[i];
         const uint32_t peer = rankArr[i];
         const uint32_t isWrite = writeArr[i];
-        if (isWrite != 0U) {
-            smem_ralloc_roce_write(args.entityId, (__gm__ uint8_t *)src, (__gm__ uint8_t *)dst, peer, blockIdx, size,
-                                   ubLocal64, ubLocal32);
-        } else {
-            smem_ralloc_roce_read(args.entityId, (__gm__ uint8_t *)src, (__gm__ uint8_t *)dst, peer, blockIdx, size,
-                                  ubLocal64, ubLocal32);
+        if (peer != pendPeer) {
+            smem_ralloc_device_dva_flush_pending(args.entityId, blockIdx, pendPeer, pendHead, pendCnt, ubLocal64,
+                                                 ubLocal32);
+            /* first post on this peer since its last flush: pick up its SQ producer head
+             * (after a flush without a peer change the register copy is still current) */
+            pendHead = smem_ralloc_rdma_read_sq_head(args.entityId, peer, blockIdx);
+            pendPeer = peer;
         }
+        if (isWrite != 0U) {
+            smem_ralloc_rdma_post_send_nowait(args.entityId, (__gm__ uint8_t *)dst, (__gm__ uint8_t *)src, peer,
+                                              blockIdx, SmemRallocOpcode::OP_RDMA_WRITE, size, pendHead);
+        } else {
+            smem_ralloc_rdma_post_send_nowait(args.entityId, (__gm__ uint8_t *)src, (__gm__ uint8_t *)dst, peer,
+                                              blockIdx, SmemRallocOpcode::OP_RDMA_READ, size, pendHead);
+        }
+        pendCnt++;
         if (peer < SMEM_RALLOC_DVA_PEER_MASK_WORDS * 64U) {
             peerMask[peer >> 6] |= 1ULL << (peer & 63U);
         } else {
+            smem_ralloc_device_dva_flush_pending(args.entityId, blockIdx, pendPeer, pendHead, pendCnt, ubLocal64,
+                                                 ubLocal32);
             (void)smem_ralloc_roce_quiet(args.entityId, peer, blockIdx, ubLocal64, ubLocal32);
         }
         lanePosted++;
+        if (pendCnt >= dbBatch || lanePosted >= SMEM_RALLOC_DEVICE_DVA_LANE_BUDGET) {
+            smem_ralloc_device_dva_flush_pending(args.entityId, blockIdx, pendPeer, pendHead, pendCnt, ubLocal64,
+                                                 ubLocal32);
+        }
         if (lanePosted >= SMEM_RALLOC_DEVICE_DVA_LANE_BUDGET) {
             /* in-kernel sub-batch drain: bounds the per-lane outstanding WQEs well below
              * the SQ ring depth (8192) so arbitrary counts are safe without host chunking */
@@ -259,6 +319,7 @@ extern "C" __global__ __aicore__ void smem_ralloc_device_batch_v2_run_kernel(
             lanePosted = 0;
         }
     }
+    smem_ralloc_device_dva_flush_pending(args.entityId, blockIdx, pendPeer, pendHead, pendCnt, ubLocal64, ubLocal32);
     smem_ralloc_device_dva_quiet_mask(args.entityId, peerMask, blockIdx, ubLocal64, ubLocal32);
 
     que32.FreeTensor(ubLocal32);
@@ -268,7 +329,12 @@ extern "C" __global__ __aicore__ void smem_ralloc_device_batch_v2_run_kernel(
 extern "C" void smem_ralloc_device_batch_v2_run_submit(const struct smem_ralloc_device_batch_dva_args *args,
                                                         void *stream)
 {
-    /* host side: only the seven scalars travel in the launch parameter area; the descriptor
-     * arrays stay in device memory and are read by the kernel directly */
-    smem_ralloc_device_batch_v2_run_kernel<<<smem_ralloc_device_qps_per_peer(), nullptr, stream>>>(*args);
+    /* host side: only the scalars travel in the launch parameter area; the descriptor
+     * arrays stay in device memory and are read by the kernel directly. dbBatch == 0 (the
+     * C layer leaves it unset) selects the MF_DVA_DB_BATCH default. */
+    struct smem_ralloc_device_batch_dva_args local = *args;
+    if (local.dbBatch == 0U) {
+        local.dbBatch = smem_ralloc_device_db_batch();
+    }
+    smem_ralloc_device_batch_v2_run_kernel<<<smem_ralloc_device_qps_per_peer(), nullptr, stream>>>(local);
 }

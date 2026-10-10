@@ -404,24 +404,39 @@ SMEM_RALLOC_INLINE_AICORE uint32_t smem_ralloc_roce_poll_cq(uint32_t entityId, u
 }
 
 /**
- * @brief Post one RDMA work request: build the WQE+SGE in the send queue, flush cache and
- *        ring the HW doorbell. Polls the CQ first when the send queue is nearly full.
- *
- * @param entityId               [in] ralloc pool entity id
- * @param remoteAddr             [in] address in the remote rank pool block (GVA)
- * @param localAddr              [in] address in the local rank pool block (GVA)
- * @param destRankId             [in] destination rank id
- * @param qpIdx                  [in] QP index in multi-QP scenario, 0 today
- * @param opcode                 [in] SmemRallocOpcode, RDMA_WRITE / RDMA_READ today
- * @param messageLen             [in] message length in bytes
- * @param ubLocal64              [in] UB workspace of uint64_t (1 element)
- * @param ubLocal32              [in] UB workspace of uint32_t (1 element)
+ * @brief Read the SQ producer head of one connection (software shadow in HBM). Batched
+ *        posters call this once per peer switch; single-shot posts call it per WQE.
  */
-SMEM_RALLOC_INLINE_AICORE void smem_ralloc_rdma_post_send(uint32_t entityId, __gm__ uint8_t *remoteAddr,
-                                                          __gm__ uint8_t *localAddr, uint32_t destRankId,
-                                                          uint32_t qpIdx, SmemRallocOpcode opcode,
-                                                          uint64_t messageLen, AscendC::LocalTensor<uint64_t> ubLocal64,
-                                                          AscendC::LocalTensor<uint32_t> ubLocal32)
+SMEM_RALLOC_INLINE_AICORE uint32_t smem_ralloc_rdma_read_sq_head(uint32_t entityId, uint32_t destRankId,
+                                                                 uint32_t qpIdx)
+{
+    __gm__ void *qpInfoVa = smem_ralloc_get_qp_info_address(entityId);
+    __gm__ SmemRallocRdmaInfo *rdmaInfo = (__gm__ SmemRallocRdmaInfo *)qpInfoVa;
+    uint32_t qpNum = rdmaInfo->qpNum;
+    __gm__ SmemRallocWQCtx *qpCtxEntry =
+        (__gm__ SmemRallocWQCtx *)(rdmaInfo->sqPtr + (destRankId * qpNum + qpIdx) * sizeof(SmemRallocWQCtx));
+    auto curHardwareHeadAddr = qpCtxEntry->headAddr;
+    smem_ralloc_cache_write_through((__gm__ uint8_t *)curHardwareHeadAddr, 8);
+    uint32_t curHead = *(__gm__ uint32_t *)(curHardwareHeadAddr);
+    AscendC::PipeBarrier<PIPE_ALL>();
+    return curHead;
+}
+
+/**
+ * @brief Build one WQE+SGE on the send queue WITHOUT ringing the SQ doorbell. curHead is
+ *        the caller-owned producer index for (destRankId, qpIdx): it enters pointing at
+ *        the next free slot and leaves advanced by one, so consecutive nowait posts
+ *        accumulate on the ring and one smem_ralloc_rdma_post_send_flush publishes them
+ *        with a single doorbell (PI semantics). The HBM head shadow is NOT updated here --
+ *        only the flush writes it back, so an unflushed ring must never be quieted (quiet
+ *        polls the CQ up to the flushed head) nor read from another core.
+ *
+ *         Same params as smem_ralloc_rdma_post_send plus curHead [in,out].
+ */
+SMEM_RALLOC_INLINE_AICORE void smem_ralloc_rdma_post_send_nowait(uint32_t entityId, __gm__ uint8_t *remoteAddr,
+                                                                 __gm__ uint8_t *localAddr, uint32_t destRankId,
+                                                                 uint32_t qpIdx, SmemRallocOpcode opcode,
+                                                                 uint64_t messageLen, uint32_t &curHead)
 {
     __gm__ void *qpInfoVa = smem_ralloc_get_qp_info_address(entityId);
     __gm__ SmemRallocRdmaInfo *rdmaInfo = (__gm__ SmemRallocRdmaInfo *)qpInfoVa;
@@ -431,21 +446,8 @@ SMEM_RALLOC_INLINE_AICORE void smem_ralloc_rdma_post_send(uint32_t entityId, __g
     auto memInfoTable = rdmaInfo->memPtr;
     auto sqBaseAddr = qpCtxEntry->bufAddr;
     auto wqeSize = qpCtxEntry->wqeSize;
-    auto curHardwareHeadAddr = qpCtxEntry->headAddr;
-    smem_ralloc_cache_write_through((__gm__ uint8_t *)curHardwareHeadAddr, 8);
-    uint32_t curHead = *(__gm__ uint32_t *)(curHardwareHeadAddr);
-    auto curHardwareTailAddr = qpCtxEntry->tailAddr;
     auto depth = qpCtxEntry->depth;
     auto shift = 13; /* owner bit period = depth (8192 today, keep in sync with trans layer) */
-    AscendC::PipeBarrier<PIPE_ALL>();
-
-    /* poll CQ if the send queue is nearly full */
-    smem_ralloc_cache_write_through((__gm__ uint8_t *)curHardwareTailAddr, 8);
-    if ((curHead + 10) % depth == (*(__gm__ uint32_t *)(curHardwareTailAddr)) % depth) {
-        (void)smem_ralloc_roce_poll_cq(entityId, destRankId, qpIdx,
-                                       *(__gm__ uint32_t *)(curHardwareTailAddr) + SMEM_RALLOC_NUM_CQE_PER_POLL_CQ,
-                                       ubLocal64, ubLocal32);
-    }
 
     /* write WQE to HBM */
     __gm__ uint8_t *wqeAddr = (__gm__ uint8_t *)(sqBaseAddr + wqeSize * (curHead % depth));
@@ -509,13 +511,32 @@ SMEM_RALLOC_INLINE_AICORE void smem_ralloc_rdma_post_send(uint32_t entityId, __g
     smem_ralloc_cache_write_through(wqeAddr, sizeof(SmemRallocWqeCtx) + sizeof(SmemRallocSegCtx));
     AscendC::PipeBarrier<PIPE_ALL>();
     curHead++;
+}
+
+/**
+ * @brief Publish every WQE posted (but not yet flushed) on one connection: ring the SQ
+ *        doorbell with PI = curHead, then write the advanced producer head back to its
+ *        HBM shadow (via the copy pipe, so the next kernel launch sees it even when its
+ *        blocks land on other cores -- plain stores would stay in L1).
+ */
+SMEM_RALLOC_INLINE_AICORE void smem_ralloc_rdma_post_send_flush(uint32_t entityId, uint32_t destRankId,
+                                                                uint32_t qpIdx, uint32_t curHead,
+                                                                AscendC::LocalTensor<uint64_t> ubLocal64,
+                                                                AscendC::LocalTensor<uint32_t> ubLocal32)
+{
+    __gm__ void *qpInfoVa = smem_ralloc_get_qp_info_address(entityId);
+    __gm__ SmemRallocRdmaInfo *rdmaInfo = (__gm__ SmemRallocRdmaInfo *)qpInfoVa;
+    uint32_t qpNum = rdmaInfo->qpNum;
+    __gm__ SmemRallocWQCtx *qpCtxEntry =
+        (__gm__ SmemRallocWQCtx *)(rdmaInfo->sqPtr + (destRankId * qpNum + qpIdx) * sizeof(SmemRallocWQCtx));
+    auto curHardwareHeadAddr = qpCtxEntry->headAddr;
 
     /* ring SQ doorbell (HW mode today, set by the transport layer) */
     uint64_t doorBellInfo = 0;
-    doorBellInfo |= qpCtxEntry->wqn;                   /* [0:23] DB_TAG = qp num */
-    doorBellInfo |= 0 << 24;                           /* [24:27] DB_CMD = HNS_ROCE_V2_SQ_DB */
-    doorBellInfo |= ((uint64_t)curHead % 65536) << 32; /* [32:47] DB_PI = sq head */
-    doorBellInfo |= (uint64_t)(qpCtxEntry->sl) << 48;  /* [48:50] DB_SL */
+    doorBellInfo |= qpCtxEntry->wqn;                     /* [0:23] DB_TAG = qp num */
+    doorBellInfo |= 0 << 24;                             /* [24:27] DB_CMD = HNS_ROCE_V2_SQ_DB */
+    doorBellInfo |= ((uint64_t)(curHead % 65536)) << 32; /* [32:47] DB_PI = sq head */
+    doorBellInfo |= (uint64_t)(qpCtxEntry->sl) << 48;    /* [48:50] DB_SL */
 
     __gm__ uint64_t *doorBellAddr = (__gm__ uint64_t *)(qpCtxEntry->dbAddr);
     AscendC::PipeBarrier<PIPE_ALL>();
@@ -536,6 +557,49 @@ SMEM_RALLOC_INLINE_AICORE void smem_ralloc_rdma_post_send(uint32_t entityId, __g
     AscendC::PipeBarrier<PIPE_ALL>();
     AscendC::DataCopyPad(headGlobalTensor, ubLocal32, copyParamsHead);
     AscendC::PipeBarrier<PIPE_ALL>();
+}
+
+/**
+ * @brief Post one RDMA work request: build the WQE+SGE in the send queue, flush cache and
+ *        ring the HW doorbell. Polls the CQ first when the send queue is nearly full.
+ *        (Composed of nowait + immediate flush: the historical per-WQE doorbell behavior,
+ *        used by the single-copy and chunked-batch kernels.)
+ *
+ * @param entityId               [in] ralloc pool entity id
+ * @param remoteAddr             [in] address in the remote rank pool block (GVA)
+ * @param localAddr              [in] address in the local rank pool block (GVA)
+ * @param destRankId             [in] destination rank id
+ * @param qpIdx                  [in] QP index in multi-QP scenario, 0 today
+ * @param opcode                 [in] SmemRallocOpcode, RDMA_WRITE / RDMA_READ today
+ * @param messageLen             [in] message length in bytes
+ * @param ubLocal64              [in] UB workspace of uint64_t (1 element)
+ * @param ubLocal32              [in] UB workspace of uint32_t (1 element)
+ */
+SMEM_RALLOC_INLINE_AICORE void smem_ralloc_rdma_post_send(uint32_t entityId, __gm__ uint8_t *remoteAddr,
+                                                          __gm__ uint8_t *localAddr, uint32_t destRankId,
+                                                          uint32_t qpIdx, SmemRallocOpcode opcode,
+                                                          uint64_t messageLen, AscendC::LocalTensor<uint64_t> ubLocal64,
+                                                          AscendC::LocalTensor<uint32_t> ubLocal32)
+{
+    __gm__ void *qpInfoVa = smem_ralloc_get_qp_info_address(entityId);
+    __gm__ SmemRallocRdmaInfo *rdmaInfo = (__gm__ SmemRallocRdmaInfo *)qpInfoVa;
+    uint32_t qpNum = rdmaInfo->qpNum;
+    __gm__ SmemRallocWQCtx *qpCtxEntry =
+        (__gm__ SmemRallocWQCtx *)(rdmaInfo->sqPtr + (destRankId * qpNum + qpIdx) * sizeof(SmemRallocWQCtx));
+    auto curHardwareTailAddr = qpCtxEntry->tailAddr;
+    auto depth = qpCtxEntry->depth;
+    uint32_t curHead = smem_ralloc_rdma_read_sq_head(entityId, destRankId, qpIdx);
+
+    /* poll CQ if the send queue is nearly full */
+    smem_ralloc_cache_write_through((__gm__ uint8_t *)curHardwareTailAddr, 8);
+    if ((curHead + 10) % depth == (*(__gm__ uint32_t *)(curHardwareTailAddr)) % depth) {
+        (void)smem_ralloc_roce_poll_cq(entityId, destRankId, qpIdx,
+                                       *(__gm__ uint32_t *)(curHardwareTailAddr) + SMEM_RALLOC_NUM_CQE_PER_POLL_CQ,
+                                       ubLocal64, ubLocal32);
+    }
+
+    smem_ralloc_rdma_post_send_nowait(entityId, remoteAddr, localAddr, destRankId, qpIdx, opcode, messageLen, curHead);
+    smem_ralloc_rdma_post_send_flush(entityId, destRankId, qpIdx, curHead, ubLocal64, ubLocal32);
 }
 
 /**
