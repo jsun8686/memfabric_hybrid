@@ -9,6 +9,7 @@
  * MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
  * See the Mulan PSL v2 for more details.
 */
+#include <cstdlib>
 #include "hybm_logger.h"
 #include "dl_hccp_api.h"
 #include "device_qp_manager.h"
@@ -25,6 +26,22 @@ sockaddr_in Ip2Net(in_addr ip)
     in.sin_addr = ip;
     in.sin_port = 0;
     return in;
+}
+
+uint32_t DeviceQpManager::ResolveQpsPerPeer() noexcept
+{
+    const char *env = getenv("MF_QPS_PER_PEER");
+    if (env == nullptr) {
+        return 1;
+    }
+    auto n = static_cast<uint32_t>(atoi(env));
+    if (n < 1U) {
+        n = 1U;
+    }
+    if (n > MAX_QP_LANES) {
+        n = MAX_QP_LANES;
+    }
+    return n;
 }
 
 DeviceQpManager::DeviceQpManager(uint32_t deviceId, uint32_t rankId, uint32_t rankCount, sockaddr_in devNet,

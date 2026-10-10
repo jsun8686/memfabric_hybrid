@@ -36,11 +36,6 @@ public:
     void PutQpHandle(UserQpInfo *qp) const noexcept override;
 
 private:
-    /* upper bound of QP lanes per peer (MF_QPS_PER_PEER, clamped); lane 0 is the legacy
-     * empty-tag primary connection, lanes 1..N-1 carry tagged connections
-     * "mf_q2_<clientRank>_<lane>" multiplexing the same (ip, port) endpoint */
-    static constexpr uint32_t MAX_QP_LANES = 4;
-
     struct AiCoreConnChannel {
         in_addr remoteIp;
         void *socketHandle;
@@ -53,7 +48,8 @@ private:
         AiCoreConnChannel(in_addr ip, void *sock) : remoteIp{ip}, socketHandle{sock} {}
     };
 
-    static uint32_t ResolveQpsPerPeer() noexcept;
+    /* lane 0 is the legacy empty-tag primary connection, lanes 1..N-1 carry tagged
+     * connections "mf_q2_<clientRank>_<lane>" multiplexing the same (ip, port) endpoint */
     static void MakeLaneTag(char *buf, size_t bufSize, uint32_t clientRank, uint32_t lane) noexcept;
     bool ReserveQpInfoSpace() noexcept;
     void ReleaseQpInfoSpace() noexcept;

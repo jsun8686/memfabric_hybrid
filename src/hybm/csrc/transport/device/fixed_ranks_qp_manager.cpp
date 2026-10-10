@@ -32,22 +32,6 @@ constexpr uint32_t MAX_SEND_WR = 8192;
 constexpr uint32_t CQ_CUSTOM_FLAG = 1;
 constexpr int COPY_INFO_SL = 4;
 
-uint32_t FixedRanksQpManager::ResolveQpsPerPeer() noexcept
-{
-    const char *env = getenv("MF_QPS_PER_PEER");
-    if (env == nullptr) {
-        return 1;
-    }
-    auto n = static_cast<uint32_t>(atoi(env));
-    if (n < 1U) {
-        n = 1U;
-    }
-    if (n > MAX_QP_LANES) {
-        n = MAX_QP_LANES;
-    }
-    return n;
-}
-
 void FixedRanksQpManager::MakeLaneTag(char *buf, size_t bufSize, uint32_t clientRank, uint32_t lane) noexcept
 {
     /* derived from the CLIENT's rank so both ends derive the same string (same scheme as

@@ -141,16 +141,16 @@ TEST_F(BipartiteRanksQpManagerTest, RemoveRanks)
     ip2.sin_port = htons(K_PORT_9001); // 如果需要不同端口
     
     ConnectionChannel ch1{ip1, ToVoidPtr(0x1000)};
-    ch1.socketFd = ToVoidPtr(0x2000);
-    ch1.qpHandle = ToVoidPtr(0x3000);
-    ch1.qpConnectCalled = true;
-    ch1.qpStatus = 0;
+    ch1.socketFd[0] = ToVoidPtr(0x2000);
+    ch1.qpHandle[0] = ToVoidPtr(0x3000);
+    ch1.qpConnectCalled[0] = true;
+    ch1.qpStatus[0] = 0;
     
     ConnectionChannel ch2{ip2, ToVoidPtr(0x1100)};
-    ch2.socketFd = ToVoidPtr(0x2100);
-    ch2.qpHandle = ToVoidPtr(0x3100);
-    ch2.qpConnectCalled = false;
-    ch2.qpStatus = -1;
+    ch2.socketFd[0] = ToVoidPtr(0x2100);
+    ch2.qpHandle[0] = ToVoidPtr(0x3100);
+    ch2.qpConnectCalled[0] = false;
+    ch2.qpStatus[0] = -1;
 
     sockaddr_in devNet{};
     devNet.sin_family = AF_INET;
@@ -288,7 +288,7 @@ TEST_F(BipartiteRanksQpManagerTest, ProcessQueryQpStateTask)
     manager->connectionTasks_.queryQpStateTask.status.exist = true;
     manager->connectionTasks_.queryQpStateTask.ranks.insert(1);
     manager->connections_.emplace(1, ConnectionChannel{});
-    manager->connections_.at(1).qpHandle = ToVoidPtr(0x1234);
+    manager->connections_.at(1).qpHandle[0] = ToVoidPtr(0x1234);
 
     int ret = manager->ProcessQueryQpStateTask();
     EXPECT_NE(ret, 0);
@@ -494,8 +494,8 @@ TEST_F(BipartiteRanksQpManagerTest, ProcessSocketConnectionsByIP)
 TEST_F(BipartiteRanksQpManagerTest, ProcessRankRemoval)
 {
     manager->connections_.emplace(K_RANK_6, ConnectionChannel{Ip2Net({htonl(INADDR_LOOPBACK)}), ToVoidPtr(0x1111)});
-    manager->connections_.at(K_RANK_6).qpHandle = ToVoidPtr(0x2222);
-    manager->connections_.at(K_RANK_6).socketFd = ToVoidPtr(0x3333);
+    manager->connections_.at(K_RANK_6).qpHandle[0] = ToVoidPtr(0x2222);
+    manager->connections_.at(K_RANK_6).socketFd[0] = ToVoidPtr(0x3333);
 
     std::vector<HccpSocketCloseInfo> socketCloseInfos;
     std::vector<HccpSocketWhiteListInfo> whitelist;

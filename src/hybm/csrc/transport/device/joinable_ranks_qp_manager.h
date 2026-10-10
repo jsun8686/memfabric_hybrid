@@ -13,6 +13,7 @@
 #ifndef MF_HYBRID_JOINABLE_RANKS_QP_MANAGER_H
 #define MF_HYBRID_JOINABLE_RANKS_QP_MANAGER_H
 
+#include <array>
 #include <set>
 #include <mutex>
 #include <condition_variable>
@@ -36,6 +37,8 @@ public:
     int Startup(void *rdma) noexcept override;
     void Shutdown() noexcept override;
     UserQpInfo *GetQpHandleWithRankId(uint32_t rankId) noexcept override;
+    UserQpInfo *GetLaneQpHandleWithRankId(uint32_t rankId, uint32_t lane) noexcept override;
+    uint32_t GetQpLaneCount(uint32_t rankId) noexcept override;
     void PutQpHandle(UserQpInfo *qp) const noexcept override;
     bool CheckQpReady(const std::vector<uint32_t> &rankIds) const noexcept override;
 
@@ -52,6 +55,12 @@ private:
     int GenerateWhiteList(const std::set<uint32_t> &newClients) noexcept;
     int CreateConnectionToServers(const std::set<uint32_t> &newServers) noexcept;
     void RemoveRanksProcess(const std::set<uint32_t> &ranks) noexcept;
+    /* all-or-nothing cleanup of one rank's channel: destroy its lane QPs, close lane fds,
+     * drop whitelist entries (server side) / deinit socket handle (client side) so the next
+     * retry round rebuilds the channel from scratch; connections_[rankId] must be owned by
+     * the caller (mutex_ held, or the rank belongs to this thread's run loop) */
+    void TeardownRankConnection(uint32_t rankId) noexcept;
+    static void MakeLaneTag(char *buf, size_t bufSize, uint32_t clientRank, uint32_t lane) noexcept;
 
 private:
     std::atomic<bool> started_{false};
@@ -60,7 +69,7 @@ private:
     std::shared_ptr<std::thread> serverConnectThread_;
     void *rdmaHandle_{nullptr};
     MemoryRegionMap currentLocalMrs_;
-    std::vector<UserQpInfo *> qpArray_;
+    std::vector<std::array<UserQpInfo *, MAX_QP_LANES>> qpArray_;
     ReadWriteLock qpLock_;
     std::vector<ConnectionChannel> connections_; // connections_操作由mutex_保证不并发
     std::mutex mutex_;
@@ -69,6 +78,7 @@ private:
     std::set<uint32_t> newServers_;
     std::set<uint32_t> removedClientRanks_;
     std::set<uint32_t> removedServerRanks_;
+    uint32_t qpsPerPeer_{1};
     uint32_t userDeviceId_{0};
 };
 

@@ -29,6 +29,10 @@ namespace device {
 
 sockaddr_in Ip2Net(in_addr ip);
 
+/* upper bound of QP lanes per peer for BOTH the device plane (FixedRanks) and the host plane
+ * (JoinableRanks); resolved from MF_QPS_PER_PEER, clamped to [1, MAX_QP_LANES] */
+constexpr uint32_t MAX_QP_LANES = 4;
+
 struct UserQpInfo {
     void *qpHandle{nullptr};
     std::atomic<uint32_t> ref{0};
@@ -41,15 +45,17 @@ struct UserQpInfo {
     }
 };
 
+/* one rank-pair channel: a single socket handle shared by all lanes (hccp multiplexes the
+ * (ip, port) endpoint by tag), lane 0 is the legacy empty-tag primary connection */
 struct ConnectionChannel {
-    sockaddr_in remoteNet;
-    void *socketHandle;
-    void *socketFd{nullptr};
-    void *qpHandle{nullptr};
-    bool qpConnectCalled{false};
-    int qpStatus{-1};
+    sockaddr_in remoteNet{};
+    void *socketHandle{nullptr};
+    void *socketFd[MAX_QP_LANES]{};
+    void *qpHandle[MAX_QP_LANES]{};
+    bool qpConnectCalled[MAX_QP_LANES]{false};
+    int qpStatus[MAX_QP_LANES]{-1, -1, -1, -1};
 
-    ConnectionChannel() : remoteNet{}, socketHandle{nullptr} {}
+    ConnectionChannel() = default;
     explicit ConnectionChannel(sockaddr_in net) : ConnectionChannel{std::move(net), nullptr} {}
     ConnectionChannel(sockaddr_in net, void *sock) : remoteNet{std::move(net)}, socketHandle{sock} {}
 };
@@ -68,12 +74,26 @@ public:
     virtual const void *GetQpInfoAddress() const noexcept;
     virtual UserQpInfo *GetQpHandleWithRankId(uint32_t rankId) noexcept = 0;
     virtual void PutQpHandle(UserQpInfo *qp) const noexcept = 0;
+    /* lane-aware accessors: managers without lane support fall back to lane 0 / single lane,
+     * so callers can shard batches uniformly without knowing the manager type */
+    virtual UserQpInfo *GetLaneQpHandleWithRankId(uint32_t rankId, uint32_t lane) noexcept
+    {
+        return lane == 0U ? GetQpHandleWithRankId(rankId) : nullptr;
+    }
+    /* ready lane count for the rank (>=1 when lane 0 is usable); used by the batch path to
+     * decide the shard width */
+    virtual uint32_t GetQpLaneCount(uint32_t rankId) noexcept
+    {
+        (void)rankId;
+        return 1U;
+    }
     virtual bool CheckQpReady(const std::vector<uint32_t> &rankIds) const noexcept;
 
 protected:
     void *CreateLocalSocket() noexcept;
     int CreateServerSocket() noexcept;
     void DestroyServerSocket() noexcept;
+    static uint32_t ResolveQpsPerPeer() noexcept;
 
 protected:
     const uint32_t deviceId_;

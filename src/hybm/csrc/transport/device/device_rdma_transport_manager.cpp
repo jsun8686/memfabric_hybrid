@@ -53,6 +53,7 @@ thread_local HybmStreamNotifyPtr RdmaTransportManager::notify_ = nullptr;
 
 RdmaTransportManager::~RdmaTransportManager()
 {
+    StopLaneWorkers();
     ClearAllRegisterMRs();
 }
 
@@ -73,6 +74,7 @@ Result RdmaTransportManager::OpenDevice(const TransportOptions &options)
                              BM_DL_FUNCTION_FAILED);
 
     deviceId_ = static_cast<uint32_t>(logicId);
+    userDeviceId_ = static_cast<uint32_t>(userId);
     rankId_ = options.rankId;
     rankCount_ = options.rankCount;
     role_ = options.role;
@@ -118,6 +120,7 @@ Result RdmaTransportManager::OpenDevice(const TransportOptions &options)
 Result RdmaTransportManager::CloseDevice()
 {
     std::unique_lock<std::mutex> unique_lock(mutex_);
+    StopLaneWorkers();
     if (qpManager_ != nullptr) {
         qpManager_->Shutdown();
         qpManager_ = nullptr;
@@ -494,15 +497,190 @@ Result RdmaTransportManager::WriteRemoteAsync(uint32_t rankId, uint64_t lAddr, u
 Result RdmaTransportManager::Synchronize(uint32_t rankId)
 {
     BM_ASSERT_RETURN(qpManager_ != nullptr, BM_MALLOC_FAILED);
-    auto qp = qpManager_->GetQpHandleWithRankId(rankId);
-    if (qp == nullptr) {
-        BM_LOG_ERROR("no qp to rankId: " << rankId);
-        return BM_ERROR;
+    const uint32_t lanes = qpManager_->GetQpLaneCount(rankId);
+    for (uint32_t lane = 0; lane < lanes; ++lane) {
+        auto qp = qpManager_->GetLaneQpHandleWithRankId(rankId, lane);
+        if (qp == nullptr) {
+            BM_LOG_ERROR("no qp to rankId: " << rankId << " lane: " << lane);
+            return BM_ERROR;
+        }
+
+        auto ret = Synchronize(qp->qpHandle, rankId);
+        qpManager_->PutQpHandle(qp);
+        if (ret != BM_OK) {
+            return ret;
+        }
+    }
+    return BM_OK;
+}
+
+Result RdmaTransportManager::ReadRemoteBatchAsync(uint32_t rankId, const CopyDescriptor &descriptor)
+{
+    auto ret = RemoteIOBatchSharded(rankId, descriptor, false);
+    if (ret != BM_OK) {
+        BM_LOG_ERROR("ReadRemoteBatchAsync failed, ret: " << ret);
+        return ret;
+    }
+    return BM_OK;
+}
+
+Result RdmaTransportManager::WriteRemoteBatchAsync(uint32_t rankId, const CopyDescriptor &descriptor)
+{
+    auto ret = RemoteIOBatchSharded(rankId, descriptor, true);
+    if (ret != BM_OK) {
+        BM_LOG_ERROR("WriteRemoteBatchAsync failed, ret: " << ret);
+        return ret;
+    }
+    return BM_OK;
+}
+
+int RdmaTransportManager::RemoteIOBatchSharded(uint32_t rankId, const CopyDescriptor &descriptor, bool write)
+{
+    const size_t total = descriptor.localAddrs.size();
+    /* below this the thread handoff costs more than it saves: keep the serial path */
+    constexpr size_t LANE_BATCH_MIN_BLOCKS = 256;
+    uint32_t lanes = 1;
+    if (total >= LANE_BATCH_MIN_BLOCKS && qpManager_ != nullptr) {
+        lanes = qpManager_->GetQpLaneCount(rankId);
     }
 
-    auto ret = Synchronize(qp->qpHandle, rankId);
-    qpManager_->PutQpHandle(qp);
+    if (lanes <= 1U) {
+        for (size_t i = 0; i < total; ++i) {
+            auto lAddr = reinterpret_cast<uint64_t>(descriptor.localAddrs[i]);
+            auto rAddr = reinterpret_cast<uint64_t>(descriptor.globalAddrs[i]);
+            uint64_t size = descriptor.counts[i];
+            auto ret = write ? WriteRemoteAsync(rankId, lAddr, rAddr, size) : ReadRemoteAsync(rankId, lAddr, rAddr, size);
+            if (ret != BM_OK) {
+                BM_LOG_ERROR("batch copy failed at index " << i << ", ret: " << ret);
+                return ret;
+            }
+        }
+        return BM_OK;
+    }
+
+    TP_TRACE_BEGIN(TP_HYBM_RDMA_BATCH_SHARD);
+    /* single job slot: one parallel dispatch at a time; concurrent callers queue here (the
+     * serial fallback above stays lock-free) */
+    std::unique_lock<std::mutex> dispatchLock(laneDispatchMutex_);
+    laneFirstErr_.store(0);
+    EnsureLaneWorkers(lanes - 1U);
+
+    {
+        std::unique_lock<std::mutex> lock(lanePoolMutex_);
+        laneJob_ = LaneJob{rankId, &descriptor, write, lanes};
+        ++laneJobId_;
+        lanePending_.store(lanes - 1U);
+    }
+    laneWorkCv_.notify_all();
+
+    /* lane 0 runs on the dispatching thread */
+    auto qp = qpManager_->GetLaneQpHandleWithRankId(rankId, 0U);
+    if (qp == nullptr) {
+        BM_LOG_ERROR("no lane0 qp to rankId: " << rankId);
+        int32_t expected = 0;
+        laneFirstErr_.compare_exchange_strong(expected, BM_ERROR);
+    } else {
+        auto ret = RemoteIOLane(qp->qpHandle, rankId, descriptor, 0U, lanes, write);
+        if (ret != BM_OK) {
+            int32_t expected = 0;
+            laneFirstErr_.compare_exchange_strong(expected, ret);
+        }
+        qpManager_->PutQpHandle(qp);
+    }
+
+    {
+        std::unique_lock<std::mutex> lock(lanePoolMutex_);
+        laneDoneCv_.wait(lock, [this] { return lanePending_.load() == 0U; });
+    }
+
+    auto ret = laneFirstErr_.load();
+    if (ret != BM_OK) {
+        BM_LOG_ERROR("lane-sharded batch copy failed, lanes: " << lanes << ", ret: " << ret);
+    }
+    TP_TRACE_END(TP_HYBM_RDMA_BATCH_SHARD, ret);
     return ret;
+}
+
+void RdmaTransportManager::EnsureLaneWorkers(uint32_t lanes)
+{
+    std::unique_lock<std::mutex> lock(lanePoolMutex_);
+    if (laneWorkers_.size() >= lanes) {
+        return;
+    }
+    lanePoolStop_ = false;
+    for (uint32_t i = static_cast<uint32_t>(laneWorkers_.size()); i < lanes; ++i) {
+        laneWorkers_.emplace_back([this, i] { LaneWorkerLoop(i); });
+    }
+    BM_LOG_INFO("lane worker pool grown to " << laneWorkers_.size() << " worker(s).");
+}
+
+void RdmaTransportManager::StopLaneWorkers()
+{
+    std::vector<std::thread> workers;
+    {
+        std::unique_lock<std::mutex> lock(lanePoolMutex_);
+        if (laneWorkers_.empty()) {
+            return;
+        }
+        /* upper layer serializes IO vs close: any in-flight shard must drain first */
+        laneDoneCv_.wait(lock, [this] { return lanePending_.load() == 0U; });
+        lanePoolStop_ = true;
+        workers = std::move(laneWorkers_);
+    }
+    laneWorkCv_.notify_all();
+    for (auto &worker : workers) {
+        if (worker.joinable()) {
+            worker.join();
+        }
+    }
+}
+
+void RdmaTransportManager::LaneWorkerLoop(uint32_t workerIdx)
+{
+    /* bind a device context like every other long-lived helper thread (streams/QPs are
+     * thread-context bound); the per-thread HybmStream is created lazily on first use */
+    DlAclApi::AclrtSetDevice(userDeviceId_);
+    const uint32_t myLane = workerIdx + 1U;
+    uint64_t lastJobId = 0;
+    while (true) {
+        LaneJob job{};
+        {
+            std::unique_lock<std::mutex> lock(lanePoolMutex_);
+            laneWorkCv_.wait(lock, [this, &lastJobId] { return lanePoolStop_ || laneJobId_ != lastJobId; });
+            if (lanePoolStop_) {
+                return;
+            }
+            if (myLane >= laneJob_.lanes) {
+                /* more workers than lanes this round: nothing to do */
+                lastJobId = laneJobId_;
+                continue;
+            }
+            job = laneJob_;
+            lastJobId = laneJobId_;
+        }
+
+        auto qp = qpManager_->GetLaneQpHandleWithRankId(job.rankId, myLane);
+        if (qp == nullptr) {
+            BM_LOG_ERROR("no lane " << myLane << " qp to rankId: " << job.rankId);
+            int32_t expected = 0;
+            laneFirstErr_.compare_exchange_strong(expected, BM_ERROR);
+        } else {
+            auto ret = RemoteIOLane(qp->qpHandle, job.rankId, *job.desc, myLane, job.lanes, job.write);
+            if (ret != BM_OK) {
+                int32_t expected = 0;
+                laneFirstErr_.compare_exchange_strong(expected, ret);
+            }
+            qpManager_->PutQpHandle(qp);
+        }
+
+        {
+            std::unique_lock<std::mutex> lock(lanePoolMutex_);
+            auto left = lanePending_.fetch_sub(1U);
+            if (left == 1U) {
+                laneDoneCv_.notify_all();
+            }
+        }
+    }
 }
 
 void RdmaTransportManager::BuildTable(std::string &str, std::string &ip, uint32_t devId)
@@ -835,6 +1013,54 @@ int RdmaTransportManager::RemoteIO(uint32_t rankId, uint64_t lAddr, uint64_t rAd
     }
     qpManager_->PutQpHandle(qp);
     return ret;
+}
+
+int RdmaTransportManager::RemoteIOLane(void *qpHandle, uint32_t rankId, const CopyDescriptor &descriptor,
+                                       uint32_t lane, uint32_t lanes, bool write)
+{
+    auto hStream = HybmStreamManager::GetThreadHybmStream(HybmGetInitedLogicDeviceId());
+    BM_ASSERT_RETURN(hStream != nullptr, BM_ERROR);
+
+    for (size_t i = lane; i < descriptor.localAddrs.size(); i += lanes) {
+        auto lAddr = reinterpret_cast<uint64_t>(descriptor.localAddrs[i]);
+        auto rAddr = reinterpret_cast<uint64_t>(descriptor.globalAddrs[i]);
+        uint64_t size = descriptor.counts[i];
+
+        struct send_wr_v2 wr = {};
+        struct sg_list sgList = {.addr = lAddr, .len = (uint32_t)size, .lkey = 0};
+        wr.buf_list = &sgList;
+        wr.buf_num = 1; // 此处list只有一个，设置为1
+        wr.dst_addr = rAddr;
+        wr.op = write ? 0 : 4; /* RDMA_WRITE: 0  RDMA_READ: 4 */
+        wr.send_flag = RA_SEND_SIGNALED;
+        wr.wr_id = wrIdx_.fetch_add(1U);
+        auto ret = CorrectHostRegWr(rankId, lAddr, rAddr, size, wr);
+        if (ret != BM_OK) {
+            BM_LOG_ERROR("CorrectHostRegWr failed at lane " << lane << " index " << i << ": " << ret);
+            return ret;
+        }
+
+        send_wr_rsp rspInfo{};
+        TP_TRACE_BEGIN(TP_HYBM_DEV_SEND_WR);
+        ret = DlHccpApi::RaSendWrV2(qpHandle, &wr, &rspInfo);
+        TP_TRACE_END(TP_HYBM_DEV_SEND_WR, ret);
+        if (ret != 0) {
+            BM_LOG_ERROR("RaSendWrV2 on lane " << lane << " failed: " << ret);
+            return ret;
+        }
+
+        StreamTask task;
+        task.type = STREAM_TASK_TYPE_WRITE_VAL;
+        ConstructSqeNoSinkModeForRdmaDbSendTask(rspInfo, task.sqe, hStream);
+        TP_TRACE_BEGIN(TP_HYBM_DEV_SUBMIT_TASK);
+        ret = hStream->SubmitTasks(task);
+        TP_TRACE_END(TP_HYBM_DEV_SUBMIT_TASK, ret);
+        if (ret != BM_OK) {
+            BM_LOG_ERROR("SubmitTasks on lane " << lane << " failed: " << ret);
+            return ret;
+        }
+    }
+    return BM_OK;
 }
 
 int RdmaTransportManager::GetRegAddress(const MemoryRegionMap &map, uint64_t inputAddr, uint64_t size, bool isLocal,

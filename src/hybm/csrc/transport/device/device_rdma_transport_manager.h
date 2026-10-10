@@ -20,6 +20,9 @@
 #include <map>
 #include <mutex>
 #include <memory>
+#include <atomic>
+#include <thread>
+#include <condition_variable>
 #include <unordered_map>
 #include "hybm_define.h"
 #include "hybm_stream_manager.h"
@@ -58,33 +61,8 @@ public:
     Result ReadRemoteAsync(uint32_t rankId, uint64_t lAddr, uint64_t rAddr, uint64_t size) override;
     Result WriteRemoteAsync(uint32_t rankId, uint64_t lAddr, uint64_t rAddr, uint64_t size) override;
     Result Synchronize(uint32_t rankId) override;
-    Result ReadRemoteBatchAsync(uint32_t rankId, const CopyDescriptor &descriptor) override
-    {
-        for (size_t i = 0; i < descriptor.localAddrs.size(); ++i) {
-            auto lAddr = reinterpret_cast<uint64_t>(descriptor.localAddrs[i]);
-            auto rAddr = reinterpret_cast<uint64_t>(descriptor.globalAddrs[i]);
-            uint64_t size = descriptor.counts[i];
-            if (auto ret = ReadRemoteAsync(rankId, lAddr, rAddr, size); ret != BM_OK) {
-                BM_LOG_ERROR("ReadRemoteBatchAsync failed at index " << i << ", ret: " << ret);
-                return ret;
-            }
-        }
-        return BM_OK;
-    }
-
-    Result WriteRemoteBatchAsync(uint32_t rankId, const CopyDescriptor &descriptor) override
-    {
-        for (size_t i = 0; i < descriptor.localAddrs.size(); ++i) {
-            auto lAddr = reinterpret_cast<uint64_t>(descriptor.localAddrs[i]);
-            auto rAddr = reinterpret_cast<uint64_t>(descriptor.globalAddrs[i]);
-            uint64_t size = descriptor.counts[i];
-            if (auto ret = WriteRemoteAsync(rankId, lAddr, rAddr, size); ret != BM_OK) {
-                BM_LOG_ERROR("WriteRemoteBatchAsync failed at index " << i << ", ret: " << ret);
-                return ret;
-            }
-        }
-        return BM_OK;
-    }
+    Result ReadRemoteBatchAsync(uint32_t rankId, const CopyDescriptor &descriptor) override;
+    Result WriteRemoteBatchAsync(uint32_t rankId, const CopyDescriptor &descriptor) override;
 
 private:
     static bool PrepareOpenDevice(uint32_t userId, uint32_t device, uint32_t rankCount, in_addr &deviceIp,
@@ -96,6 +74,17 @@ private:
     void ClearAllRegisterMRs();
     int CheckPrepareOptions(const HybmTransPrepareOptions &options);
     int RemoteIO(uint32_t rankId, uint64_t lAddr, uint64_t rAddr, uint64_t size, bool write, bool sync);
+    /* submit one stride-shard of a batch over the given lane QP: blocks begin, begin+lanes, ...
+     * caller owns the qpHandle for the whole shard (one Get/Put per shard) */
+    int RemoteIOLane(void *qpHandle, uint32_t rankId, const CopyDescriptor &descriptor, uint32_t lane,
+                     uint32_t lanes, bool write);
+    /* shard a batch across ready QP lanes: lane 0 runs on the calling thread, lanes 1..N-1
+     * on the persistent worker pool; falls back to the serial per-block path when only one
+     * lane is ready or the batch is small */
+    int RemoteIOBatchSharded(uint32_t rankId, const CopyDescriptor &descriptor, bool write);
+    void EnsureLaneWorkers(uint32_t lanes);
+    void StopLaneWorkers();
+    void LaneWorkerLoop(uint32_t workerIdx);
     int CorrectHostRegWr(uint32_t rankId, uint64_t lAddr, uint64_t rAddr, uint64_t size, send_wr_v2 &wr);
     int ConvertHccpMrInfo(const TransportMemoryRegion &mr, HccpMrInfo &info);
     void OptionsToRankMRs(const HybmTransPrepareOptions &options);
@@ -113,6 +102,15 @@ private: // RDMA HOST STARS
     static bool GetRdmaHandleAfterInitHccl(uint32_t device, in_addr &deviceIp, void *&rdmaHandle);
 
 private:
+    /* one dispatched batch, shared read-only by all lane workers; lane owned by worker i is
+     * i+1, lane 0 belongs to the dispatching thread */
+    struct LaneJob {
+        uint32_t rankId{0};
+        const CopyDescriptor *desc{nullptr};
+        bool write{false};
+        uint32_t lanes{1};
+    };
+
     static thread_local HybmStreamNotifyPtr notify_;
     RdmaNotifyInfo notifyInfo_ = {};
     std::mutex mutex_;
@@ -120,6 +118,7 @@ private:
     uint32_t rankId_{0};
     uint32_t rankCount_{1};
     uint32_t deviceId_{0};
+    uint32_t userDeviceId_{0};
     hybm_role_type role_{HYBM_ROLE_PEER};
     in_addr deviceIp_{0};
     uint16_t devicePort_{0};
@@ -133,6 +132,22 @@ private:
     std::atomic<uint64_t> wrIdx_{0};
 
     ReadWriteLock lock_;
+
+    /* persistent lane worker pool (host-plane batch sharding): workers are created lazily on
+     * the first parallel batch and joined on CloseDevice/destruction; they must be persistent
+     * because per-thread HybmStreams are cached by tid and would be re-allocated per spawn */
+    std::vector<std::thread> laneWorkers_;
+    /* single job slot: serializes the dispatch phase of concurrent batch callers (each
+     * caller still runs its own lane 0 inside the lock) */
+    std::mutex laneDispatchMutex_;
+    std::mutex lanePoolMutex_;
+    std::condition_variable laneWorkCv_; // wake workers on a new job / stop
+    std::condition_variable laneDoneCv_; // dispatching thread waits for completion
+    LaneJob laneJob_{};                  // guarded by lanePoolMutex_
+    uint64_t laneJobId_{0};              // guarded by lanePoolMutex_
+    bool lanePoolStop_{false};           // guarded by lanePoolMutex_
+    std::atomic<uint32_t> lanePending_{0};
+    std::atomic<int32_t> laneFirstErr_{0};
 };
 } // namespace device
 } // namespace transport

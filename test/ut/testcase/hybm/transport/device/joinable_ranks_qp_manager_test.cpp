@@ -333,7 +333,7 @@ TEST_F(JoinableRanksQpManagerTest, WaitSocketConnections)
 
     clientManager->connections_.resize(K_RANK_COUNT); // 模拟已有连接状态
     clientManager->connections_[1].socketHandle = ToVoidPtr(0x1111);
-    clientManager->connections_[1].qpStatus = 1; // 模拟连接成功
+    clientManager->connections_[1].qpStatus[0] = 1; // 模拟连接成功
     ret = clientManager->WaitSocketConnections(newRanks);
     // DlHccpApi::RaGetSockets 失败
     EXPECT_EQ(ret, 1);
@@ -365,12 +365,12 @@ TEST_F(JoinableRanksQpManagerTest, MakeQpConnections)
     clientManager->SetRemoteRankInfo(ranks);
 
     clientManager->connections_.resize(K_RANK_COUNT); // 模拟已有连接状态
-    clientManager->connections_[1].socketFd = ToVoidPtr(0x1111);
-    clientManager->connections_[1].qpHandle = ToVoidPtr(0x2222); // 模拟连接未完成
-    clientManager->connections_[1].qpConnectCalled = false;
+    clientManager->connections_[1].socketFd[0] = ToVoidPtr(0x1111);
+    clientManager->connections_[1].qpHandle[0] = ToVoidPtr(0x2222); // 模拟连接未完成
+    clientManager->connections_[1].qpConnectCalled[0] = false;
 
-    clientManager->connections_[K_RANK_ID_2].socketFd = ToVoidPtr(0x1111);
-    clientManager->connections_[K_RANK_ID_2].qpStatus = 1; // 模拟连接成功
+    clientManager->connections_[K_RANK_ID_2].socketFd[0] = ToVoidPtr(0x1111);
+    clientManager->connections_[K_RANK_ID_2].qpStatus[0] = 1; // 模拟连接成功
     clientManager->MakeQpConnections(newRanks);
 }
 
@@ -389,12 +389,12 @@ TEST_F(JoinableRanksQpManagerTest, WaitQpConnections)
     auto clientManager = std::make_unique<TestableJoinableRanksQpManager>(1, 1, 1, K_RANK_COUNT, devNet);
 
     clientManager->connections_.resize(K_RANK_COUNT); // 模拟已有连接状态
-    clientManager->connections_[K_RANK_ID_3].qpHandle = ToVoidPtr(0x2222);
-    clientManager->connections_[K_RANK_ID_3].qpConnectCalled = true;
-    clientManager->connections_[K_RANK_ID_3].qpStatus = 1;  // 模拟连接完成
+    clientManager->connections_[K_RANK_ID_3].qpHandle[0] = ToVoidPtr(0x2222);
+    clientManager->connections_[K_RANK_ID_3].qpConnectCalled[0] = true;
+    clientManager->connections_[K_RANK_ID_3].qpStatus[0] = 1;  // 模拟连接完成
 
-    clientManager->connections_[K_RANK_ID_2].qpHandle = ToVoidPtr(0x1111);
-    clientManager->connections_[K_RANK_ID_2].qpConnectCalled = true;
+    clientManager->connections_[K_RANK_ID_2].qpHandle[0] = ToVoidPtr(0x1111);
+    clientManager->connections_[K_RANK_ID_2].qpConnectCalled[0] = true;
 
     // 非空集合，代码会走完的,K_RANK_ID_0 会加入server, K_RANK_ID_2,kRankId3为client, 但是没有设置status,不会进入
     std::set<uint32_t> newRanks = {K_RANK_ID_0, K_RANK_ID_2, K_RANK_ID_3};

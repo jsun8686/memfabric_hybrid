@@ -195,7 +195,7 @@ void BipartiteRanksQpManager::InitializeWhiteList(std::vector<HccpSocketWhiteLis
         auto res = connections_.emplace(it->first, ConnectionChannel{Ip2Net(info.remoteIp.addr), serverSocketHandle_});
         connectionView_[it->first] = &res.first->second;
         WriteGuard lockGuard(qpLock_);
-        userQpInfo_[it->first].qpHandle = connectionView_[it->first]->qpHandle;
+        userQpInfo_[it->first].qpHandle = connectionView_[it->first]->qpHandle[0];
         BM_LOG_INFO("connections list add rank: " << it->first << ", remoteIP: " << inet_ntoa(info.remoteIp.addr));
     }
 }
@@ -266,9 +266,9 @@ int BipartiteRanksQpManager::CreateConnectInfos(std::unordered_map<uint32_t, soc
                 pos = fst;
                 connectionView_[it->first] = &pos->second;
                 WriteGuard lockGuard(qpLock_);
-                userQpInfo_[it->first].qpHandle = connectionView_[it->first]->qpHandle;
+                userQpInfo_[it->first].qpHandle = connectionView_[it->first]->qpHandle[0];
                 BM_LOG_INFO("add to userQpInfo_, rank: " << it->first <<
-                    ", handle: " << connectionView_[it->first]->qpHandle);
+                    ", handle: " << connectionView_[it->first]->qpHandle[0]);
             } else {
                 BM_LOG_ERROR("failed to emplace into ConnectionChannel map, rank: " << it->first);
             }
@@ -276,7 +276,7 @@ int BipartiteRanksQpManager::CreateConnectInfos(std::unordered_map<uint32_t, soc
             socketHandle = pos->second.socketHandle;
         }
 
-        if (pos->second.socketFd != nullptr) {
+        if (pos->second.socketFd[0] != nullptr) {
             continue;
         }
 
@@ -401,7 +401,7 @@ void BipartiteRanksQpManager::ProcessSocketConnectionsByIP(uint32_t getSize, std
             continue;
         }
 
-        nPos->second.socketFd = socketInfos[i].fd;
+        nPos->second.socketFd[0] = socketInfos[i].fd;
         connectedRanks.emplace(pos->second);
         ip2rank.erase(pos);
         successCount++;
@@ -503,26 +503,26 @@ int BipartiteRanksQpManager::ProcessConnectQpTask() noexcept
             continue;
         }
 
-        if (pos->second.qpHandle == nullptr) {
-            auto ret = DlHccpApi::RaQpCreate(rdmaHandle_, 0, 2, pos->second.qpHandle);
+        if (pos->second.qpHandle[0] == nullptr) {
+            auto ret = DlHccpApi::RaQpCreate(rdmaHandle_, 0, 2, pos->second.qpHandle[0]);
             if (ret != 0) {
                 auto times = currTask.Failed(ranks);
                 BM_LOG_ERROR("create QP to " << rank << " failed: " << ret << ", times: " << times);
                 failedCount++;
                 continue;
             }
-            pos->second.qpConnectCalled = false;
+            pos->second.qpConnectCalled[0] = false;
         }
 
-        if (!pos->second.qpConnectCalled) {
-            auto ret = DlHccpApi::RaQpConnectAsync(pos->second.qpHandle, pos->second.socketFd);
+        if (!pos->second.qpConnectCalled[0]) {
+            auto ret = DlHccpApi::RaQpConnectAsync(pos->second.qpHandle[0], pos->second.socketFd[0]);
             if (ret != 0) {
                 auto times = currTask.Failed(ranks);
                 BM_LOG_ERROR("create QP to " << rank << " failed: " << ret << ", times: " << times);
                 failedCount++;
                 continue;
             }
-            pos->second.qpConnectCalled = true;
+            pos->second.qpConnectCalled[0] = true;
         }
 
         connectedQpRanks.emplace(rank);
@@ -556,7 +556,7 @@ int BipartiteRanksQpManager::ProcessQueryQpStateTask() noexcept
             continue;
         }
 
-        auto ret = DlHccpApi::RaGetQpStatus(pos->second.qpHandle, pos->second.qpStatus);
+        auto ret = DlHccpApi::RaGetQpStatus(pos->second.qpHandle[0], pos->second.qpStatus[0]);
         if (ret != 0) {
             auto times = currTask.Failed(ranks);
             BM_LOG_ERROR("get QP status to " << rank << " failed: " << ret << ", fail times: " << times);
@@ -564,17 +564,17 @@ int BipartiteRanksQpManager::ProcessQueryQpStateTask() noexcept
             continue;
         }
 
-        BM_LOG_INFO("get QP status to " << rank << " success. qpStatus: " << pos->second.qpStatus);
-        if (pos->second.qpStatus != 1) {
+        BM_LOG_INFO("get QP status to " << rank << " success. qpStatus: " << pos->second.qpStatus[0]);
+        if (pos->second.qpStatus[0] != 1) {
             currTask.ranks.emplace(rank);
             continue;
         }
         auto remoteMrs = GenerateRemoteLiteMrs(rank);
-        SetQpHandleRegisterMr(pos->second.qpHandle, localMrs, true);
-        SetQpHandleRegisterMr(pos->second.qpHandle, remoteMrs, false);
+        SetQpHandleRegisterMr(pos->second.qpHandle[0], localMrs, true);
+        SetQpHandleRegisterMr(pos->second.qpHandle[0], remoteMrs, false);
         WriteGuard lockGuard(qpLock_);
-        userQpInfo_[rank].qpHandle = pos->second.qpHandle;
-        BM_LOG_INFO("add to userQpInfo_, rank: " << rank << ", qpHandle: " << pos->second.qpHandle);
+        userQpInfo_[rank].qpHandle = pos->second.qpHandle[0];
+        BM_LOG_INFO("add to userQpInfo_, rank: " << rank << ", qpHandle: " << pos->second.qpHandle[0]);
     }
 
     if (!currTask.ranks.empty()) {
@@ -598,10 +598,10 @@ void BipartiteRanksQpManager::ProcessUpdateLocalMrTask() noexcept
 
     auto localMRs = GenerateLocalLiteMrs();
     for (auto it = connections_.begin(); it != connections_.end(); ++it) {
-        if (it->second.qpHandle == nullptr || it->second.qpStatus != 1) {
+        if (it->second.qpHandle[0] == nullptr || it->second.qpStatus[0] != 1) {
             continue;
         }
-        SetQpHandleRegisterMr(it->second.qpHandle, localMRs, true);
+        SetQpHandleRegisterMr(it->second.qpHandle[0], localMRs, true);
     }
 }
 
@@ -622,7 +622,7 @@ void BipartiteRanksQpManager::ProcessUpdateRemoteMrTask() noexcept
             continue;
         }
 
-        SetQpHandleRegisterMr(pos->second.qpHandle, mrs, false);
+        SetQpHandleRegisterMr(pos->second.qpHandle[0], mrs, false);
     }
 }
 
@@ -637,21 +637,21 @@ void BipartiteRanksQpManager::CloseServices() noexcept
 
     std::vector<HccpSocketCloseInfo> socketCloseInfos;
     for (auto it = connections_.begin(); it != connections_.end(); ++it) {
-        if (it->second.qpHandle != nullptr) {
-            auto ret = DlHccpApi::RaQpDestroy(it->second.qpHandle);
+        if (it->second.qpHandle[0] != nullptr) {
+            auto ret = DlHccpApi::RaQpDestroy(it->second.qpHandle[0]);
             if (ret != 0) {
                 BM_LOG_WARN("destroy QP to server: " << it->first << " failed: " << ret);
             }
-            it->second.qpHandle = nullptr;
+            it->second.qpHandle[0] = nullptr;
         }
 
-        if (it->second.socketFd != nullptr) {
+        if (it->second.socketFd[0] != nullptr) {
             HccpSocketCloseInfo info;
             info.handle = it->second.socketHandle;
-            info.fd = it->second.socketFd;
+            info.fd = it->second.socketFd[0];
             info.linger = 0;
             socketCloseInfos.push_back(info);
-            it->second.socketFd = nullptr;
+            it->second.socketFd[0] = nullptr;
         }
     }
 
@@ -688,20 +688,20 @@ void BipartiteRanksQpManager::ProcessRankRemoval(uint32_t rank, std::vector<Hccp
             whitelist.emplace_back(info);
         }
 
-        if (it->second.qpHandle != nullptr) {
-            auto ret = DlHccpApi::RaQpDestroy(it->second.qpHandle);
+        if (it->second.qpHandle[0] != nullptr) {
+            auto ret = DlHccpApi::RaQpDestroy(it->second.qpHandle[0]);
             if (ret != 0) {
                 BM_LOG_WARN("destroy QP to server: " << it->first << " failed: " << ret);
             }
-            it->second.qpHandle = nullptr;
+            it->second.qpHandle[0] = nullptr;
         }
-        if (it->second.socketFd != nullptr) {
+        if (it->second.socketFd[0] != nullptr) {
             HccpSocketCloseInfo info;
             info.handle = it->second.socketHandle;
-            info.fd = it->second.socketFd;
+            info.fd = it->second.socketFd[0];
             info.linger = 0;
             socketCloseInfos.push_back(info);
-            it->second.socketFd = nullptr;
+            it->second.socketFd[0] = nullptr;
         }
     }
     uniqueLock.unlock();
