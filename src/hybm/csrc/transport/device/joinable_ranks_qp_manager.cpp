@@ -390,11 +390,7 @@ void JoinableRanksQpManager::MakeQpConnections(const std::set<uint32_t> &newRank
             void *qpHandle = nullptr;
             auto info = new (std::nothrow) UserQpInfo;
             BM_ASSERT_RET_VOID(info != nullptr);
-            /* mode 0 = NORMAL_QP_MODE: keeps host WQEs off the HDC-lite fast path, whose
-             * in-process local_mr table rejects our windows (plog ra_hdc_lite.c:1059, -22);
-             * NORMAL routes wrlist through the HDC daemon message path (HCCL remote-access
-             * production recipe). Modes 2/4 (opbase/ext) require the lite table instead. */
-            auto ret = DlHccpApi::RaQpCreate(rdmaHandle_, 0, 0, qpHandle);
+            auto ret = DlHccpApi::RaQpCreate(rdmaHandle_, 0, 4, qpHandle);
             if (ret != 0) {
                 BM_LOG_ERROR("create QP to " << rankId << " failed: " << ret);
                 delete info;
@@ -411,9 +407,6 @@ void JoinableRanksQpManager::MakeQpConnections(const std::set<uint32_t> &newRank
         }
 
         if (!connections_[rankId].qpConnectCalled) {
-            if (preConnectMrRegHook_ != nullptr) {
-                preConnectMrRegHook_(connections_[rankId].qpHandle);
-            }
             auto ret = DlHccpApi::RaQpConnectAsync(connections_[rankId].qpHandle, connections_[rankId].socketFd);
             if (ret != 0) {
                 BM_LOG_ERROR("create QP from " << rankId_ << " to " << rankId << " failed: " << ret);

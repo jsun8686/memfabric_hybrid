@@ -430,32 +430,6 @@ struct send_wr_v2 {
     };
 };
 
-struct send_wrlist_data {
-    uint64_t dst_addr;         /**< destination address */
-    uint32_t op;               /**< operations of RDMA supported:RDMA_WRITE:0, RDMA_READ:4 */
-    int send_flag;             /**< reference to ra_send_flags */
-    struct sg_list mem_list;   /**< single sg embedded by value */
-};
-
-struct send_wrlist_data_ext {
-    uint64_t dst_addr;         /**< destination address */
-    uint32_t op;               /**< operations of RDMA supported:RDMA_WRITE:0, RDMA_READ:4 */
-    int send_flag;             /**< reference to ra_send_flags */
-    struct sg_list mem_list;   /**< single sg embedded by value */
-    union {
-        struct wr_aux_info aux; /**< aux info */
-        struct wr_ext_info ext; /**< ext info */
-    };
-};
-
-/* ra_send_wrlist return codes that allow partial-progress retry (values from hccp_common.h) */
-#ifndef SOCK_ENOENT
-#define SOCK_ENOENT 228200 /* mr async not success right now, revoke the function again */
-#endif
-#ifndef ROCE_EAGAIN
-#define ROCE_EAGAIN 128101 /* try again */
-#endif
-
 /**
  * @ingroup librdma
  * wqe template info
