@@ -731,7 +731,10 @@ bool RdmaTransportManager::RaRdevInit(uint32_t deviceId, in_addr deviceIp, void 
 
     info.mode = NETWORK_OFFLINE;
     info.notifyType = NOTIFY;
-    info.enabled2mbLite = true; // support 64k os
+    /* 2MB lite routes host-plane RDMA through the HDC daemon channel (per-QP ops tables
+     * dispatch to RaHdc*), where RaSendWrlistExt is rejected (128103); standard RoCE
+     * direct-post plane is required for wrlist (HCCL never enables lite) */
+    info.enabled2mbLite = false;
     rdev.phyId = deviceId;
     rdev.family = AF_INET;
     rdev.localIp.addr = deviceIp;
