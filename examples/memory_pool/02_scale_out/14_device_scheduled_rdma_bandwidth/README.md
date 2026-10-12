@@ -17,12 +17,13 @@
   - `--graph` **graph**：每方向捕获**一张完整图**——图内含整个轮转序列（blocks 份单拷贝内核，
     默认 `batch-size = real-pool-size` 时恰好全槽每个地址各写一遍），重放 `--replays` 次；
     即真实场景形态（完整图中内嵌整段槽轮转通信），重放期间 host 零参与；
-  - `--batch` **batch**：同序列**一次批量直发提交**。+fast：五描述符数组经
+  - `--batch` **batch**：同序列**一次批量直发提交**。+v2：五描述符数组经
     `stage_batch_desc` 打包 H2D 暂存 HBM 后走 `device_copy_batch_v2`——**单次 kernel
-    提交**，无分段、无中途 quiet；不带 fast：checked 路径 `device_copy_batch`
+    提交**，无分段、无中途 quiet；+v3：三数组 + peer/方向标量（uniform 契约）走
+    `device_copy_batch_v3`；不带 v2/v3：checked 路径 `device_copy_batch`
     （C 层按 64 段/launch 分块、每 distinct peer 一次 quiet）；
   - `--graph --batch` **graph-batch**：捕获**一次批量提交**入图并重放——重放零 host
-    参与；+fast 时图内仅含单个 DVA kernel 节点（描述符暂存在捕获前一次完成）。
+    参与；+v2/+v3 时图内仅含单个 DVA kernel 节点（描述符暂存在捕获前一次完成）。
 
 ## 拓扑与角色
 
@@ -51,6 +52,13 @@ FAR 节点（常驻守护，复用 08）                NEAR 节点（客户端�
   size ∈ (0,4G]、peerRank < rankCount 由调用方自负，错误路由安全退级为 WQE 跳过）；
   SQ 流控由内核子批 quiet 承担（2048 段/lane，SQ 环深 8192）；staging 须同 stream H2D
   且缓冲跨调用/图回放存活（流序保证复用无竞态）
+- `handle.device_copy_batch_v3`（**uniform DVA 单次提交**）：v2 的整批同构特化——整批
+  共享单 peer（`peer_rank`）+ 单方向（`is_write`），且 src/dst 数组各自落在所属端点的
+  **同一个 mkey** 内（调用方担保的 ABI 级契约）；仅三描述符数组（24B/段），内核把双端
+  MR 的 key/翻译/界址**每批一次解析进寄存器**，主循环零分支、WQE 寄存器模板化，每段仅
+  4 次比较的范围自检（越界段安全跳过，退化语义与 v2 一致）；doorbell 批量与 v2 共享。
+  单 lane 每 WQE 投递成本 0.96→0.63us（**-31%**，N=1 实测）；N=4 下与 v2 收敛到同一
+  引擎天花板（见判读）
 - 用户注册 HBM（`handle.register`）作本地端点：池槽 GVA 仅作 device_copy 端点，
   **禁止 CPU 解引用**（`--enable-56bits-gva` 下 GVA 窗位于 2^55 以上、无 CPU 映射）
 - NPUGraph 捕获与重放（`torch.npu.NPUGraph`），warmup 必须在捕获外完成
@@ -69,6 +77,9 @@ python3 memfabric_client.py --store tcp://<far_ip>:8588 --dev 1
 python3 memfabric_client.py --store tcp://<far_ip>:8588 --dev 1 --graph
 python3 memfabric_client.py --store tcp://<far_ip>:8588 --dev 1 --batch
 python3 memfabric_client.py --store tcp://<far_ip>:8588 --dev 1 --graph --batch
+#    批量快速路径：v2（五数组路由）/ v3（三数组 uniform 契约）
+python3 memfabric_client.py --store tcp://<far_ip>:8588 --dev 1 --batch --v2
+python3 memfabric_client.py --store tcp://<far_ip>:8588 --dev 1 --batch --v3
 
 # 3) 停止守护
 kill -TERM <daemon_pid>
@@ -100,8 +111,11 @@ kill -TERM <daemon_pid>
 | `--max-pool-size` | 4G | 池 DRAM 窗口（`ralloc.create` 的 `max_dram_size`，**必须 GB 对齐**） |
 | `--graph` | 关 | 计时段捕获为 NPUGraph 并重放 `--replays` 次（默认直发不捕获） |
 | `--replays` | 4 | graph/graph-batch 模式每计时段的完整图重放次数（计时总量 = replays × batch-size 每方向） |
-| `--batch` | 关 | 计时走批量接口：单用＝一次直发（batch），配 `--graph`＝捕获提交并重放（graph-batch）。+fast 走 `device_copy_batch_v2`（描述符 HBM 暂存 + **单次 kernel 提交**），不带 fast 走 checked `device_copy_batch`（64 段/launch 分块） |
-| `--fast` | 关 | 计时段走**显式路由快速路径**（单发 `device_copy` 传 `peer_rank`/`is_write`；批量经 `stage_batch_desc` 暂存 HBM 后走 `device_copy_batch_v2` 单次提交），C 层跳过每段地址预检；warmup 保持检查路径作正确性门。**契约**：路由与描述符内容（size ∈ (0,4G]、peerRank < rankCount）由调用方自负——错误路由安全退化为 WQE 跳过（内核 MR 查找 miss），仅能靠回读校验发现，不报同步错误；暂存 tensor 须跨调用/图回放存活。收益看 `submit W/R` 打印（提交墙钟） |
+| `--batch` | 关 | 计时走批量接口：单用＝一次直发（batch），配 `--graph`＝捕获提交并重放（graph-batch）。+v2/+v3 走 HBM 暂存描述符 + **单次 kernel 提交**，不带则走 checked `device_copy_batch`（64 段/launch 分块） |
+| `--v2` | 关 | **显式路由快速路径**（单发 `device_copy` 传 `peer_rank`/`is_write`；批量经 `stage_batch_desc` 五数组暂存后走 `device_copy_batch_v2` 单次提交），C 层跳过每段地址预检；warmup 保持检查路径作正确性门。**契约**：路由与描述符内容（size ∈ (0,4G]、peerRank < rankCount）由调用方自负——错误路由安全退化为 WQE 跳过（内核 MR 查找 miss），仅能靠回读校验发现，不报同步错误；暂存 tensor 须跨调用/图回放存活。收益看 `submit W/R` 打印（提交墙钟） |
+| `--v3` | 关 | **uniform 批量路径**（须 `--batch`，与 `--v2` 互斥）：整批共享单 peer/单方向且 src/dst 各在同一 mkey 内，走 `device_copy_batch_v3`——内核每批一次解析双端 MR（寄存器化 key/翻译/界址）、主循环零分支 + WQE 模板化；每段 4 次比较范围自检保留安全退化。单 lane 每 WQE 成本比 v2 低 ~31%；doorbell 批量随 `MF_DVA_DB_BATCH`（默认 32） |
+| 环境变量 `MF_QPS_PER_PEER` | 1 | 每 peer QP lane 数（双端同设，钳制 [1,4]），详见"多 QP"节 |
+| 环境变量 `MF_DVA_DB_BATCH` | 32 | SQ doorbell 批大小 K：每 K 个 WQE 摇一次 doorbell（PI 语义）；1 = 复现历史逐 WQE doorbell；钳制 [1,2048]。剂量曲线见判读 |
 | `--world` | 512 | 同守护 |
 | `--rpc-port-base` | 11100 | 同守护 |
 | `--enable-56bits-gva` | 关 | 56-bit GVA 建池（GVA 窗位于 2^55 以上，槽地址仅作设备端点） |
@@ -124,8 +138,8 @@ kill -TERM <daemon_pid>
   1. `device-scheduled pool created (DEVICE_RDMA | DEVICE_SCHEDULE, 56bits_gva=...)`
   2. `remote block from FAR rank <R> (gva=0x...)`
   3. 每个粒度：`size <S>: warmup round-trip OK (registered HBM <-> FAR slot, seed <n>)`
-  4. 每个粒度：`size <S>: <B> blocks (direct)` / `<B> blocks/1 batch (batch)` /
-     `<B> blocks/graph x <R> replays (graph|graph-batch)`，后随 `write X GB/s (Y us/block),
+  4. 每个粒度：`size <S>: <B> blocks (direct[ v2])` / `<B> blocks/1 batch (batch[ v2|v3])` /
+     `<B> blocks/graph x <R> replays (graph|graph-batch[ v2|v3])`，后随 `write X GB/s (Y us/block),
      read Z GB/s (W us/block) [round-trip OK]`
   5. `[client] all sizes OK, client finished cleanly`，exit 0
 - 守护侧正常常驻、停机 `all contributors stopped cleanly`
@@ -133,9 +147,10 @@ kill -TERM <daemon_pid>
 ## 判读
 - 四模式跑**同一轮转地址序列**：graph/graph-batch 吞吐 = `replays × blocks × size / 计时`，
   direct/batch = `blocks × size / 计时`（计时均含末次 synchronize）
-- **实测矩阵（2026-10-09 · N=4（MF_QPS_PER_PEER=4）· DVA 单次提交 · us/block，w / r）**
+- **实测矩阵（2026-10-09 · N=4 · DVA 单次提交 · K=1 时代基线，即 doorbell 批量化之前 ·
+  us/block，w / r）**
 
-  graph-batch fast（重放 4 次）：
+  graph-batch v2（重放 4 次）：
 
   | size | 2M | 4M | 8M | 16M | 32M | 64M |
   |---|---|---|---|---|---|---|
@@ -148,7 +163,7 @@ kill -TERM <daemon_pid>
   | 64K | 6.53/6.31 | 4.57/4.51 | 3.60/3.55 | 3.13/3.13 | 2.92/2.90 | 2.79/2.79 |
   | 128K | 12.13/12.33 | 8.61/8.66 | 6.96/6.91 | 6.19/6.15 | 5.76/5.74 | 5.56/5.56 |
 
-  batch fast（eager 直发）：
+  batch v2（eager 直发）：
 
   | size | 2M | 4M | 8M | 16M | 32M | 64M |
   |---|---|---|---|---|---|---|
@@ -164,24 +179,57 @@ kill -TERM <daemon_pid>
   \* 32K@2M read 单点离群（4 次重放噪声）；32M 列为独立复测刷新值，其余与首轮 ±2-3%
   复现。submit W/R 已塌缩至 0.03-0.06ms / 0.02-0.03ms（0.00-0.02 us/段）。
 
-- **成本模型（DVA 定稿）**：`t ≈ max(0.45us, size / 23.5GB/s)`——1K-8K 落纯消息管线
-  地板 0.43-0.49us（多 lane 并行摊薄后与消息大小无关），16K 起纯带宽受限（64M 档
-  22.3-22.4 GB/s ≈ 200G 单口线速）。标定条件：200G RoCE、N=4、bisheng 内核；换链路
-  速率或批量结构需重新拟合
+- **实测矩阵（2026-10-12 · N=4 · `MF_DVA_DB_BATCH=32`（现默认）· 64M 批 · GB/s，
+  括号内 us/block，w / r）**
+
+  | size | v2 | v3 |
+  |---|---|---|
+  | 2K | 5.13 (0.37) / 8.19 (0.23) | 5.18 (0.37) / 8.38 (0.23) |
+  | 4K | 10.08 (0.38) / 14.86 (0.26) | 10.19 (0.37) / **17.17 (0.22)** |
+  | 8K | 19.13 (0.40) / 22.16 (0.34) | 19.77 (0.39) / **22.22 (0.34)** |
+  | 16K | 22.00 (0.69) / 22.20 (0.69) | 22.15 (0.69) / **22.28 (0.68)** |
+
+  与 2026-10-09 基线（K=1，batch v2，64M 列）逐档对比：读方向 **2K 0.45→0.23
+  （1.96×）、4K 0.46→0.22（2.1×）、8K 0.44→0.34（1.29×）**；写方向 2K 0.43→0.37、
+  4K 0.46→0.37、8K 0.45→0.39（-13~20%）——K=1 时代 N=4 的每块时间已被写引擎地板
+  （~0.36us）主导，doorbell 批量释放的发布块开销在读路径占比更高，故读增益显著更大；
+  16K 双向与历史 22.28 逐位持平（**零回归**，wire 界与 K 无关）。单 lane 剂量参照
+  （N=1，2K，us/WQE）：v2 K=1 1.36 → v2 K=32 1.03 → v3 K=1 1.13 → **v3 K=32
+  0.71/0.63（w/r）**——doorbell 批量与 uniform 特化两项独立叠加、无重叠。
+
+- **成本模型（2026-10-12 定稿，双引擎版）**：
+  `t_write(size) ≈ max(0.36us, size / 23.5GB/s)`、`t_read(size) ≈ max(0.22us, size / 23.5GB/s)`
+  ——2K/4K/8K/16K 共 8 个数据点精确命中（误差 ≤1%）。写/读引擎的每 WQE 串行段
+  （0.36 vs 0.22us）即 N=4 聚合天花板（写 ~2.8M、读 ~4.3M WQE/s，**与内核路径无关**：
+  v2/v3 同值），是 RoCE 写/读引擎与完成路径的硬件属性；N=4 时它构成共享瓶颈，把单
+  lane 的 uniform 收益（-31%）淹没到等值。旧单地板模型 `t ≈ max(0.45us, size/23.5GB/s)`
+  为 K=1 时代标定，仅作历史参照。标定条件：200G RoCE、N=4、K=32；换链路速率或批量
+  结构需重新拟合
+- **doorbell 批量机制（`MF_DVA_DB_BATCH`，默认 32）**：hns SQ doorbell 为 PI（producer
+  index）语义——一次 doorbell 即发布"到 head 为止的全部 WQE"，故同 lane 顺序投递可攒
+  K 个 WQE 摇一次（与主线 hns_roce_v2_post_sends 的按次批量同款模式）。flush 点：
+  攒满 K / peer 切换 / lane 预算（2048）quiet 前 / 批尾——quiet 按 flushed head 轮 CQ，
+  未 flush 必挂死；K 调度是描述符数组的纯函数，graph 重放确定。剂量曲线（2K@N=1）：
+  K=1→32 每段省 ~0.3us（发布块的 barrier×3 + MMIO + head 回写），K=32→64 持平——
+  **32 即饱和点**，故设为默认；`K=1` 显式复现历史逐 WQE 行为。早期"整段 fill 一次
+  commit"的实验（劣化 6-9%）失败于把 fill 串行前置于传输，本机制为逐 K 流水发布，
+  两者不同
+
 - **eager 与 graph 首次打平**：单次提交消除了分段 launch 边界与中途 quiet 排空，
-  batch fast 与 graph-batch fast 在 ≥16M 档 ±2%（eager 略优——省去图回放派发）；
+  batch 与 graph-batch 在 ≥16M 档 ±2%（eager 略优——省去图回放派发）；
   host 提交成本塌缩 ~60×（8192 段 submit W：SEG64 时代 1.94ms → DVA 0.03ms）
-- **优化弧线（2K@4M 档，us/block）**：N=1 单 QP 2.10 → 多 QP N=4 0.80 → SEG_MAX=120
-  实验 0.59 → **DVA 单次提交 0.50**（@64M 0.43），累计 **4.2-4.9×**。分段开销已由
-  SEG_MAX 剂量实验（64 vs 32 vs 120）定价：每 64 段 chunk ≈ launch + quiet 排空
-  9.3us——该机制已由 DVA 单次提交移除
-- **推荐档位**：`MF_QPS_PER_PEER=4` + `--batch-size ≥32M`（小 IO 地板与每图固定项
-  摊销兼得；2M/4M 小 batch 档仍受每图固定成本影响，大 IO 档影响可忽略）
-- 大消息（≥1M）各模式均 ~88-89% 线速（200G），无优化空间。设备侧 doorbell 批量化
-  （一次 commit 覆盖整段 fill）**已试并回退**：实测各粒度劣化 ~6-9%——每段即时 ring
-  维持内核↔NIC 流水重叠，WQE 构造本就藏在 wire 之下，批量化反而把 fill 串行前置于传输
+- **优化弧线（2K 档，us/block，N=4）**：N=1 单 QP 2.10 → 多 QP N=4 0.80 → SEG_MAX=120
+  实验 0.59 → DVA 单次提交（K=1）0.43 → **doorbell 批量 K=32 + v3 uniform：写 0.37 / 读 0.23**
+  ——累计**写 5.7×、读 9.1×**（写已贴引擎地板 0.36，读贴 0.22 后 2K 达 8.4 GB/s 即
+  4.3M WQE/s）。分段开销已由 SEG_MAX 剂量实验定价：每 64 段 chunk ≈ launch + quiet
+  排空 9.3us——该机制已由 DVA 单次提交移除
+- **推荐档位**：`MF_QPS_PER_PEER=4` + `--batch --v3`（满足 uniform 契约时）或
+  `--batch --v2`（通用路由）+ `--batch-size ≥32M`；`MF_DVA_DB_BATCH` 保持默认 32
+  （剂量曲线饱和点，显式 =1 仅用于复现历史基线）
+- 大消息（≥1M）各模式均 ~88-89% 线速（200G），无优化空间——≥16K 档 wire 界与
+  doorbell 批量/v3 无关（实测 16K 双向 22.0-22.3 逐位持平）
 - **宿主侧剩余靶点 = `SmemRallocDeviceSegCheck`**：checked 批量路径每段多次全量
-  alloc-range 查询；`--fast`（显式路由/DVA）跳过全部逐段预检。收益看结果行的
+  alloc-range 查询；`--v2`（显式路由/DVA）与 `--v3` 跳过全部逐段预检。收益看结果行的
   `submit W/R` 打印（提交墙钟），**稳态吞吐不受影响**（host 超前、设备 wire-bound、
   graph-batch 重放零 host）
 - 单边提交 + 卡内 quiet，吞吐参考受消息粒度与 QP 深度约束，本用例验证的是
@@ -207,10 +255,12 @@ kill -TERM <daemon_pid>
 - **判读**：`multi-QP enabled`（Startup）/ `multi-QP client|server ... lane i ... tag`
   （建立）；性能对比看 2K-16K 小 IO 区每块时间（单 QP 基线 1.65-2.03us/块）与
   128K-1M 大 IO 吞吐（应持平，已线速）；direct 模式单发不受益（单段无分发）
-- **与 DVA 单次提交的组合**（`device_copy_batch_v2`）：内核同样 `blockDim = N`、
-  block b 独占 lane b；描述符改由 kernel 从 GM 直读（SoA 五数组，基址随 launch 参数
-  下发）；lane 内在途 WQE 以 **2048 段/lane 为子批做 quiet**（SQ 环深 8192，实际授予值
-  经 QP 表 `depth` 字段下发内核）——任意批量安全，不再受 SEG_MAX 分段约束
+- **与 DVA 单次提交的组合**（`device_copy_batch_v2` / `device_copy_batch_v3`）：内核
+  同样 `blockDim = N`、block b 独占 lane b；描述符改由 kernel 从 GM 直读（v2 五数组 /
+  v3 三数组 + peer/方向标量，基址随 launch 参数下发）；lane 内在途 WQE 以 **2048 段/lane
+  为子批做 quiet**（SQ 环深 8192，实际授予值经 QP 表 `depth` 字段下发内核）——任意批量
+  安全，不再受 SEG_MAX 分段约束；SQ doorbell 按 `MF_DVA_DB_BATCH`（默认 32）攒批发布
+  （v2/v3 共享，flush 点见判读）
 - 历史实验门控 `MF_SOCKS_PER_PEER` 已由正式实现取代并移除
 
 ## 排障（精简）
@@ -226,5 +276,8 @@ kill -TERM <daemon_pid>
 | 捕获阶段报错/崩溃 | warmup 是否在捕获外执行过（本用例每粒度已内置）；torch_npu 版本需支持 `torch.npu.NPUGraph` |
 | `pool is not device-scheduled` | `data_op_type` 未带 `DEVICE_SCHEDULE`（本用例已内置，自行改造时注意） |
 | device_copy_batch_v2 返回错误且日志报 `batch descriptor array address is 0` | 五个描述符数组地址有 0 值：检查 staging tensor 的 `data_ptr()` 是否正确传入五个参数 |
+| `--v3` 报 `requires --batch` 或 `replaces --v2` | 用法约束：v3 是批量路径的 uniform 特化（`--batch --v3`），与 `--v2` 互斥 |
+| device_copy_batch_v3 返回 SM_NOT_SUPPORTED 且日志报 `no uniform-batch (v3) entry` | 内核运行时包过旧（无 v3 符号）：主库与 `libmf_smem_ralloc_device_rdma.so` 须同版本安装——重跑 install.sh 并重启两端 |
+| device_copy_batch_v3 路由/范围契约违背（回读校验失败） | uniform 契约由调用方自负：整批须同一 peerRank/isWrite 且 src/dst 各在同一 mkey 内；越界段被范围自检安全跳过（置 user-MR miss 标志），仅回读校验可见——检查描述符数组内容与暂存 tensor 生命周期 |
 | 回读校验失败且数据陈旧/为空 | staged 描述符缓冲被提前回收（tensor 删除/出作用域）——描述符 tensor 必须跨调用与图回放存活；staging H2D 与提交须在同一 stream |
 | 其余与 08 相同 | 参照 08_far_daemon_near_client 排障表 |

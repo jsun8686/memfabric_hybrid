@@ -44,14 +44,16 @@ static uint32_t smem_ralloc_device_qps_per_peer()
 }
 
 /* host-side doorbell batch size for the DVA kernel (MF_DVA_DB_BATCH): publish every K WQEs
- * with one SQ doorbell. Default 1 keeps the historical per-WQE doorbell; clamped to the
- * lane budget so a pending batch never exceeds the outstanding-WQE bound of the in-kernel
- * quiet. Host-only: kernels cannot getenv, the value travels in the launch args. */
+ * with one SQ doorbell. Dose curve measured at 2K (2026-10): K=1->32 cuts the per-WQE
+ * publish block ~0.3us, K=32->64 is flat -- 32 is the saturation point, so it ships as the
+ * default; clamped to the lane budget so a pending batch never exceeds the outstanding-WQE
+ * bound of the in-kernel quiet. Host-only: kernels cannot getenv, the value travels in the
+ * launch args. */
 static uint32_t smem_ralloc_device_db_batch()
 {
     const char *env = getenv("MF_DVA_DB_BATCH");
     if (env == nullptr) {
-        return 1;
+        return 32;
     }
     long v = atol(env);
     if (v < 1) {

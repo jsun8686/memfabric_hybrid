@@ -71,9 +71,10 @@ struct smem_ralloc_device_batch_dva_args {
     uint32_t entityId;   /* ralloc pool entity id in the device meta window */
     /* SQ doorbell batching: publish every dbBatch WQEs with one doorbell (PI semantics)
      * instead of ringing per WQE; also flushed on peer switch / lane-budget quiet / batch
-     * end. 0 selects the host default from MF_DVA_DB_BATCH (1 = per-WQE doorbell, the
-     * historical behavior). Clamped to SMEM_RALLOC_DEVICE_DVA_LANE_BUDGET so a batch never
-     * exceeds the outstanding-WQE bound the in-kernel quiet relies on. */
+     * end. 0 selects the host default from MF_DVA_DB_BATCH (default 32, the measured
+     * saturation point; 1 reproduces the historical per-WQE doorbell). Clamped to
+     * SMEM_RALLOC_DEVICE_DVA_LANE_BUDGET so a batch never exceeds the outstanding-WQE
+     * bound the in-kernel quiet relies on. */
     uint32_t dbBatch;
 };
 
@@ -89,7 +90,7 @@ struct smem_ralloc_device_batch_v3_args {
     uint32_t isWrite;   /* 1 = WRITE for the whole batch, 0 = READ */
     uint32_t count;     /* valid segments, 1 .. SMEM_RALLOC_DEVICE_BATCH_MAX_COUNT */
     uint32_t entityId;  /* ralloc pool entity id in the device meta window */
-    uint32_t dbBatch;   /* 0 selects the host default from MF_DVA_DB_BATCH */
+    uint32_t dbBatch;   /* 0 selects the host default from MF_DVA_DB_BATCH (default 32) */
 };
 
 #ifdef __cplusplus
