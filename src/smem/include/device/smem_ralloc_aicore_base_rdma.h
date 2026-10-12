@@ -291,6 +291,64 @@ SMEM_RALLOC_INLINE_AICORE void smem_ralloc_report_user_mr_lookup_miss(uint32_t e
     AscendC::PipeBarrier<PIPE_ALL>();
 }
 
+/* ---- uniform batch endpoint resolution (v3) ---- */
+
+/* one resolved MR endpoint for a uniform batch: the whole srcArray/dstArray is asserted to
+ * stay inside this single region, so key/translation/bounds are held in registers across
+ * the batch. regAddr = delta + addr keeps the per-segment translation to a single add. */
+struct SmemRallocUniformMr {
+    uint32_t key;   /* rkey (remote endpoint) or lkey (local endpoint) */
+    uint64_t delta; /* regAddress - addr; 0 = identity mapping */
+    uint64_t lo;    /* guard bound: region base address */
+    uint64_t hi;    /* guard bound: region end (addr + size) */
+};
+
+/**
+ * @brief Resolve the remote (peer) endpoint of a uniform batch from its first segment
+ *        address. @return false when no pool MR slot of that rank covers it.
+ */
+SMEM_RALLOC_INLINE_AICORE bool smem_ralloc_resolve_remote_uniform(uint64_t memInfoTable, uint32_t destRankId,
+                                                                  uint64_t addr, SmemRallocUniformMr &mr)
+{
+    __gm__ SmemRallocMemInfo *slot = smem_ralloc_lookup_pool_mr(memInfoTable, destRankId, addr);
+    if (slot == nullptr) {
+        return false;
+    }
+    mr.key = slot->rkey;
+    mr.delta = (slot->regAddress != 0) ? slot->regAddress - slot->addr : 0;
+    mr.lo = slot->addr;
+    mr.hi = slot->addr + slot->size;
+    return true;
+}
+
+/**
+ * @brief Resolve the local endpoint of a uniform batch from its first segment address:
+ *        this rank's own pool MR slots first, then the user MR table. @return false when
+ *        neither covers it.
+ */
+SMEM_RALLOC_INLINE_AICORE bool smem_ralloc_resolve_local_uniform(uint32_t entityId, uint64_t memInfoTable,
+                                                                 uint64_t addr, SmemRallocUniformMr &mr)
+{
+    __gm__ SmemRallocMemInfo *slot = smem_ralloc_lookup_pool_mr(
+        memInfoTable, smem_ralloc_get_global_rank(entityId), addr);
+    if (slot != nullptr) {
+        mr.key = slot->lkey;
+        mr.delta = (slot->regAddress != 0) ? slot->regAddress - slot->addr : 0;
+        mr.lo = slot->addr;
+        mr.hi = slot->addr + slot->size;
+        return true;
+    }
+    __gm__ SmemRallocUserMrEntry *userMr = smem_ralloc_lookup_local_mr(entityId, addr);
+    if (userMr == nullptr) {
+        return false;
+    }
+    mr.key = userMr->lkey;
+    mr.delta = (userMr->regAddress != 0) ? userMr->regAddress - userMr->addr : 0;
+    mr.lo = userMr->addr;
+    mr.hi = userMr->addr + userMr->size;
+    return true;
+}
+
 /* ---- RDMA data plane ---- */
 
 enum class SmemRallocOpcode : uint32_t {
@@ -506,6 +564,63 @@ SMEM_RALLOC_INLINE_AICORE void smem_ralloc_rdma_post_send_nowait(uint32_t entity
     }
     *(__gm__ uint32_t *)(sgeAddr + 4) = localLkey; /* local key */
     *(__gm__ uint64_t *)(sgeAddr + 8) = localRegAddr;
+
+    /* WQE & SGE cache flush */
+    smem_ralloc_cache_write_through(wqeAddr, sizeof(SmemRallocWqeCtx) + sizeof(SmemRallocSegCtx));
+    AscendC::PipeBarrier<PIPE_ALL>();
+    curHead++;
+}
+
+/**
+ * @brief Uniform-batch variant of smem_ralloc_rdma_post_send_nowait: both MR endpoints are
+ *        pre-resolved (SmemRallocUniformMr, register-resident across the whole batch), so
+ *        the WQE build is a register-constant template plus the per-segment length and two
+ *        translated addresses -- no MR walks inside. A 4-compare range guard keeps the v2
+ *        safe-skip degradation: an out-of-contract segment reports the user-MR miss flag
+ *        and is skipped instead of being posted with a stale key. Doorbell/head handling is
+ *        identical to nowait (flush publishes).
+ */
+SMEM_RALLOC_INLINE_AICORE void smem_ralloc_rdma_post_send_uniform_nowait(
+    uint32_t entityId, uint32_t destRankId, uint32_t qpIdx, SmemRallocOpcode opcode, uint64_t messageLen,
+    uint64_t remoteAddr, const SmemRallocUniformMr &remoteMr, uint64_t localAddr, const SmemRallocUniformMr &localMr,
+    uint32_t &curHead)
+{
+    /* uniform trust contract guard: the whole batch claims one mkey per endpoint */
+    if (remoteAddr < remoteMr.lo || remoteAddr + messageLen > remoteMr.hi ||
+        localAddr < localMr.lo || localAddr + messageLen > localMr.hi) {
+        smem_ralloc_report_user_mr_lookup_miss(entityId);
+        return;
+    }
+
+    __gm__ void *qpInfoVa = smem_ralloc_get_qp_info_address(entityId);
+    __gm__ SmemRallocRdmaInfo *rdmaInfo = (__gm__ SmemRallocRdmaInfo *)qpInfoVa;
+    uint32_t qpNum = rdmaInfo->qpNum;
+    __gm__ SmemRallocWQCtx *qpCtxEntry =
+        (__gm__ SmemRallocWQCtx *)(rdmaInfo->sqPtr + (destRankId * qpNum + qpIdx) * sizeof(SmemRallocWQCtx));
+    auto sqBaseAddr = qpCtxEntry->bufAddr;
+    auto wqeSize = qpCtxEntry->wqeSize;
+    auto depth = qpCtxEntry->depth;
+    auto shift = 13; /* owner bit period = depth (8192 today, keep in sync with trans layer) */
+
+    /* write WQE to HBM (register template: only owner bit / length / addresses vary) */
+    __gm__ uint8_t *wqeAddr = (__gm__ uint8_t *)(sqBaseAddr + wqeSize * (curHead % depth));
+    uint64_t ownBit = (curHead >> shift) & 0x1;
+    uint32_t byte4 = (uint32_t)opcode & 0x1F; /* [0:4] opcode */
+    byte4 |= ((~ownBit) << 7) & (1 << 7);     /* [7] owner bit */
+    byte4 |= 1 << 8;                          /* [8] IBV_SEND_SIGNALED */
+    *(__gm__ uint32_t *)(wqeAddr) = byte4;
+    *(__gm__ uint32_t *)(wqeAddr + 4) = messageLen;
+    *(__gm__ uint32_t *)(wqeAddr + 8) = 0;        /* immediate data, 0 */
+    *(__gm__ uint32_t *)(wqeAddr + 12) = 1 << 24; /* [120:127] num_sge = 1 */
+    *(__gm__ uint32_t *)(wqeAddr + 16) = 0;       /* [128:151] start_sge_index = 0 */
+    *(__gm__ uint32_t *)(wqeAddr + 20) = remoteMr.key;          /* remote key */
+    *(__gm__ uint64_t *)(wqeAddr + 24) = remoteMr.delta + remoteAddr; /* remote VA */
+
+    /* write SGE to HBM */
+    __gm__ uint8_t *sgeAddr = wqeAddr + sizeof(SmemRallocWqeCtx);
+    *(__gm__ uint32_t *)(sgeAddr) = messageLen;
+    *(__gm__ uint32_t *)(sgeAddr + 4) = localMr.key;            /* local key */
+    *(__gm__ uint64_t *)(sgeAddr + 8) = localMr.delta + localAddr;
 
     /* WQE & SGE cache flush */
     smem_ralloc_cache_write_through(wqeAddr, sizeof(SmemRallocWqeCtx) + sizeof(SmemRallocSegCtx));

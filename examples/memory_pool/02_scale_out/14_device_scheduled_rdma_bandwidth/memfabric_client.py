@@ -21,14 +21,16 @@ copies at offsets (i % slots) * size):
   --graph:               capture ONE full NPUGraph per direction holding the whole rotated
                          sequence (single-copy kernels), replay it --replays times — the
                          real-world shape of a complete graph embedding the communication
-  --batch:               one direct device_copy_batch submit (the whole matrix). +fast
-                          stages the five descriptor arrays into HBM (stage_batch_desc)
-                          and submits ONE DVA kernel launch; without fast the checked
-                          path chunks by 64 segments per launch
+  --batch:               one direct device_copy_batch submit (the whole matrix). +v2
+                           stages the five descriptor arrays into HBM (stage_batch_desc)
+                           and submits ONE DVA kernel launch; without v2 the checked
+                           path chunks by 64 segments per launch
+  --batch --v3:          uniform variant of +v2: three descriptor arrays plus peer/direction
+                           scalars, submitted via device_copy_batch_v3
   --graph --batch:       capture the single batch submit and replay it --replays times —
-                          zero host work per replay AND amortized completion; +fast
-                          captures only the DVA submit (descriptor staging happens once,
-                          before capture)
+                           zero host work per replay AND amortized completion; +v2 (or +v3)
+                           captures only the DVA submit (descriptor staging happens once,
+                           before capture)
 
 Output lines match 08's format so runs are directly comparable.
 """
@@ -86,6 +88,22 @@ def stage_batch_desc(srcs, dsts, sizes, ranks, writes):
     dev = torch.from_numpy(host).to("npu")
     base = dev.data_ptr()
     return dev, base, base + n * 8, base + n * 16, base + n * 24, base + n * 28
+
+
+def stage_batch_desc_v3(srcs, dsts, sizes):
+    """Uniform (v3) staging: three SoA arrays only, [src u64 n][dst u64 n][size u64 n] =
+    24B/segment; peer rank / direction travel as scalars in the call. Same lifetime rule
+    as stage_batch_desc."""
+    import numpy as np
+    import torch
+    n = len(srcs)
+    host = np.empty(n * 24, dtype=np.uint8)
+    host[0:n * 8] = np.asarray(srcs, dtype=np.uint64).view(np.uint8)
+    host[n * 8:n * 16] = np.asarray(dsts, dtype=np.uint64).view(np.uint8)
+    host[n * 16:n * 24] = np.asarray(sizes, dtype=np.uint64).view(np.uint8)
+    dev = torch.from_numpy(host).to("npu")
+    base = dev.data_ptr()
+    return dev, base, base + n * 8, base + n * 16
 
 
 def _wait_tcp(url, timeout_sec):
@@ -153,16 +171,23 @@ def main():
                              f"= replays x batch-size per direction (default {DEFAULT_REPLAYS})")
     parser.add_argument("--batch", action="store_true",
                         help="time device_copy_batch submits (whole rotated matrix in one call; "
-                             "+fast stages descriptors to HBM and drives ONE DVA kernel launch, "
-                             "without fast the checked path uses 64-segment launches); alone it "
-                             "is one direct submit, combined with --graph the submit is captured "
-                             "and replayed (graph-batch)")
-    parser.add_argument("--fast", action="store_true",
-                        help="routed fast path: direct copies pass peer_rank/is_write (batch: "
-                             "descriptors staged to HBM, see stage_batch_desc) so the C layer "
-                             "skips the per-call address precheck; warmup stays on the checked "
-                             "path as the correctness gate; wrong routing degrades to a skipped "
-                             "WQE caught by the round-trip check, not corruption")
+                              "+v2 stages descriptors to HBM and drives ONE DVA kernel launch, "
+                              "without v2 the checked path uses 64-segment launches); alone it "
+                              "is one direct submit, combined with --graph the submit is captured "
+                              "and replayed (graph-batch)")
+    parser.add_argument("--v2", action="store_true",
+                        help="routed v2 fast path: direct copies pass peer_rank/is_write (batch: "
+                              "five descriptors staged to HBM via stage_batch_desc, submitted as "
+                              "device_copy_batch_v2) so the C layer skips the per-call address "
+                              "precheck; warmup stays on the checked path as the correctness "
+                              "gate; wrong routing degrades to a skipped WQE caught by the "
+                              "round-trip check, not corruption")
+    parser.add_argument("--v3", action="store_true",
+                        help="uniform-batch path (requires --batch, replaces --v2): the whole "
+                              "batch shares one peer rank and one direction and src/dst stay "
+                              "inside one mkey each, submitted via device_copy_batch_v3 — the "
+                              "kernel resolves both MR endpoints once and posts a branch-free "
+                              "WQE stream; doorbell batching follows MF_DVA_DB_BATCH")
     parser.add_argument("--world", type=int, default=DEFAULT_WORLD,
                         help=f"declared world capacity (default {DEFAULT_WORLD})")
     parser.add_argument("--rpc-port-base", type=int, default=RPC_PORT_BASE,
@@ -172,6 +197,11 @@ def main():
                              "addresses stay device-copy endpoints only, never CPU pointers)")
     parser.add_argument("--run-dir", default=None, help="client log dir (default ./log)")
     args = parser.parse_args()
+
+    if args.v3 and not args.batch:
+        raise RuntimeError("--v3 requires --batch (uniform single-submit variant of the batch path)")
+    if args.v3 and args.v2:
+        raise RuntimeError("--v3 replaces --v2 (both stage descriptors; v3 submits the uniform contract)")
 
     global _term_fd
     run_dir = os.path.abspath(args.run_dir or "./log")
@@ -189,7 +219,8 @@ def main():
     else:
         mode = "direct"
     _log(f"[client] run dir: {run_dir}, store: {args.store}, world: {args.world}, dev: {args.dev}, "
-         f"56bits_gva: {args.enable_56bits_gva}, timed mode: {mode}{' +fast' if args.fast else ''}")
+         f"56bits_gva: {args.enable_56bits_gva}, timed mode: {mode}"
+         f"{' +v3' if args.v3 else (' +v2' if args.v2 else '')}")
 
     sizes = [_parse_size(t) for t in args.io_sizes.split(",") if t.strip() != ""]
     if not sizes:
@@ -289,7 +320,7 @@ def main():
                 torch.npu.synchronize()
                 t0 = time.perf_counter()
                 for off in dst_offs:
-                    if args.fast:
+                    if args.v2:
                         assert handle.device_copy(src_addr, off, size, 0,
                                                   peer_rank=far_rank, is_write=1) == 0, "direct L2G failed"
                     else:
@@ -299,7 +330,7 @@ def main():
                 tw = time.perf_counter() - t0
                 t0 = time.perf_counter()
                 for off in dst_offs:
-                    if args.fast:
+                    if args.v2:
                         assert handle.device_copy(off, dst_addr, size, 0,
                                                   peer_rank=far_rank, is_write=0) == 0, "direct G2L failed"
                     else:
@@ -307,20 +338,27 @@ def main():
                 t_submit_r = time.perf_counter() - t0
                 torch.npu.synchronize()
                 tr = time.perf_counter() - t0
-                phase = f"{blocks} blocks (direct{' fast' if args.fast else ''})"
+                phase = f"{blocks} blocks (direct{' v2' if args.v2 else ''})"
                 moved = one_way
                 timed_blocks = blocks
             elif mode == "batch":
                 dst.zero_()
                 torch.npu.synchronize()
-                if args.fast:
+                if args.v3:
+                    # uniform staging: three arrays only, rank/direction are call scalars
+                    wdesc = stage_batch_desc_v3([src_addr] * blocks, dst_offs, [size] * blocks)
+                    rdesc = stage_batch_desc_v3(dst_offs, [dst_addr] * blocks, [size] * blocks)
+                elif args.v2:
                     # static descriptors: stage to HBM once, OUTSIDE the timed submit
                     wdesc = stage_batch_desc([src_addr] * blocks, dst_offs, [size] * blocks,
                                              [far_rank] * blocks, [1] * blocks)
                     rdesc = stage_batch_desc(dst_offs, [dst_addr] * blocks, [size] * blocks,
                                              [far_rank] * blocks, [0] * blocks)
                 t0 = time.perf_counter()
-                if args.fast:
+                if args.v3:
+                    assert handle.device_copy_batch_v3(wdesc[1], wdesc[2], wdesc[3], far_rank, 1,
+                                                       blocks, 0) == 0, "batch L2G failed"
+                elif args.v2:
                     assert handle.device_copy_batch_v2(wdesc[1], wdesc[2], wdesc[3], wdesc[4], wdesc[5],
                                                        blocks, 0) == 0, "batch L2G failed"
                 else:
@@ -330,7 +368,10 @@ def main():
                 torch.npu.synchronize()
                 tw = time.perf_counter() - t0
                 t0 = time.perf_counter()
-                if args.fast:
+                if args.v3:
+                    assert handle.device_copy_batch_v3(rdesc[1], rdesc[2], rdesc[3], far_rank, 0,
+                                                       blocks, 0) == 0, "batch G2L failed"
+                elif args.v2:
                     assert handle.device_copy_batch_v2(rdesc[1], rdesc[2], rdesc[3], rdesc[4], rdesc[5],
                                                        blocks, 0) == 0, "batch G2L failed"
                 else:
@@ -339,12 +380,19 @@ def main():
                 t_submit_r = time.perf_counter() - t0
                 torch.npu.synchronize()
                 tr = time.perf_counter() - t0
-                phase = f"{blocks} blocks/1 batch (batch{' fast' if args.fast else ''})"
+                variant = " v3" if args.v3 else (" v2" if args.v2 else "")
+                phase = f"{blocks} blocks/1 batch (batch{variant})"
                 moved = one_way
                 timed_blocks = blocks
             elif mode == "graph-batch":
                 torch.npu.synchronize()
-                if args.fast:
+                if args.v3:
+                    # stage BEFORE capture: the H2D must complete before the first replay
+                    # reads it, and the graph then contains ONLY the single uniform submit
+                    wdesc = stage_batch_desc_v3([src_addr] * blocks, dst_offs, [size] * blocks)
+                    rdesc = stage_batch_desc_v3(dst_offs, [dst_addr] * blocks, [size] * blocks)
+                    torch.npu.synchronize()
+                elif args.v2:
                     # stage BEFORE capture: the H2D must complete before the first replay
                     # reads it, and the graph then contains ONLY the single DVA submit
                     wdesc = stage_batch_desc([src_addr] * blocks, dst_offs, [size] * blocks,
@@ -356,7 +404,11 @@ def main():
                 with torch.npu.stream(side):
                     stream_ptr = torch.npu.current_stream().npu_stream
                     wgraph.capture_begin()
-                    if args.fast:
+                    if args.v3:
+                        assert handle.device_copy_batch_v3(wdesc[1], wdesc[2], wdesc[3], far_rank, 1,
+                                                           blocks, stream_ptr) == 0, \
+                            "captured batch write submit failed"
+                    elif args.v2:
                         assert handle.device_copy_batch_v2(wdesc[1], wdesc[2], wdesc[3], wdesc[4], wdesc[5],
                                                            blocks, stream_ptr) == 0, \
                             "captured batch write submit failed"
@@ -371,7 +423,11 @@ def main():
                 with torch.npu.stream(side):
                     stream_ptr = torch.npu.current_stream().npu_stream
                     rgraph.capture_begin()
-                    if args.fast:
+                    if args.v3:
+                        assert handle.device_copy_batch_v3(rdesc[1], rdesc[2], rdesc[3], far_rank, 0,
+                                                           blocks, stream_ptr) == 0, \
+                            "captured batch read submit failed"
+                    elif args.v2:
                         assert handle.device_copy_batch_v2(rdesc[1], rdesc[2], rdesc[3], rdesc[4], rdesc[5],
                                                            blocks, stream_ptr) == 0, \
                             "captured batch read submit failed"
@@ -392,10 +448,11 @@ def main():
                 torch.npu.synchronize()
                 tr = time.perf_counter() - t0
                 del wgraph, rgraph
-                if args.fast:
+                if args.v3 or args.v2:
                     # descriptor tensors must outlive the graphs' last replay
                     del wdesc, rdesc
-                phase = f"{blocks} blocks/graph x {args.replays} replays (graph-batch{' fast' if args.fast else ''})"
+                variant = " v3" if args.v3 else (" v2" if args.v2 else "")
+                phase = f"{blocks} blocks/graph x {args.replays} replays (graph-batch{variant})"
                 moved = args.replays * one_way
                 timed_blocks = args.replays * blocks
             else:

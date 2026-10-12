@@ -523,6 +523,13 @@ public:
         return smem_ralloc_device_copy_batch_v2(handle_, &params, reinterpret_cast<void *>(stream));
     }
 
+    int32_t DeviceCopyBatchV3(uint64_t srcArray, uint64_t dstArray, uint64_t sizeArray, uint32_t peerRank,
+                              uint32_t isWrite, uint32_t count, uintptr_t stream)
+    {
+        smem_ralloc_batch_copy_v3_params params = {srcArray, dstArray, sizeArray, peerRank, isWrite, count};
+        return smem_ralloc_device_copy_batch_v3(handle_, &params, reinterpret_cast<void *>(stream));
+    }
+
     std::vector<uint32_t> GetGroupRanks()
     {
         auto count = smem_ralloc_get_group_ranks(handle_, nullptr, 0);
@@ -1344,6 +1351,29 @@ Arguments:
     size_array(int):  device address of the uint64 size array
     rank_array(int):  device address of the uint32 peer rank array
     write_array(int): device address of the uint32 is_write array
+    count(int):       number of segments, (0, 1048576]
+    stream(int):      aclrt stream pointer, 0 uses the default stream, default 0
+Returns:
+    0 if successful)")
+        .def("device_copy_batch_v3", &RallocPool::DeviceCopyBatchV3, py::call_guard<py::gil_scoped_release>(),
+             py::arg("src_array"), py::arg("dst_array"), py::arg("size_array"), py::arg("peer_rank"),
+             py::arg("is_write"), py::arg("count"), py::arg("stream") = 0, R"(
+Uniform single-submit: like device_copy_batch_v2, but the whole batch shares ONE peer rank
+and ONE direction, and src_array / dst_array each stay inside a single mkey of their
+endpoint -- a caller-asserted contract. The kernel resolves both MR endpoints once per
+batch (keys/translations/bounds in registers) and posts a branch-free WQE stream with SQ
+doorbell batching (MF_DVA_DB_BATCH), so per-segment overhead is lower than v2. The three
+descriptor arrays must already live in device memory (uint64 entries each); stage them with
+an async H2D copy on the same stream before this call, keep the backing buffers alive
+across the call and across graph replays. Each segment is still range-guarded: an
+out-of-contract segment is skipped safely (visible only through data verification).
+
+Arguments:
+    src_array(int):   device address of the uint64 source array (local side when is_write=1)
+    dst_array(int):   device address of the uint64 destination array (peer side when is_write=1)
+    size_array(int):  device address of the uint64 size array
+    peer_rank(int):   owner rank of the remote endpoint (dst owner for write, src owner for read)
+    is_write(int):    1 = the whole batch is WRITE (local -> peer), 0 = READ (peer -> local)
     count(int):       number of segments, (0, 1048576]
     stream(int):      aclrt stream pointer, 0 uses the default stream, default 0
 Returns:

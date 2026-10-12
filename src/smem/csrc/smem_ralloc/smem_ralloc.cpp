@@ -903,3 +903,50 @@ SMEM_API int32_t smem_ralloc_device_copy_batch_v2(smem_ralloc_t handle, smem_ral
     submit(&args, stream);
     return SM_OK;
 }
+
+SMEM_API int32_t smem_ralloc_device_copy_batch_v3(smem_ralloc_t handle, smem_ralloc_batch_copy_v3_params_t *params,
+                                                  void *stream)
+{
+    SM_VALIDATE_RETURN(params != nullptr, "invalid param, params is NULL", SM_INVALID_PARAM);
+    SM_VALIDATE_RETURN(params->srcArray != 0U && params->dstArray != 0U && params->sizeArray != 0U,
+                       "invalid param, batch descriptor array address is 0", SM_INVALID_PARAM);
+    SM_VALIDATE_RETURN(params->batchSize > 0U, "invalid param, batchSize is 0", SM_INVALID_PARAM);
+    SM_VALIDATE_RETURN(params->batchSize <= SMEM_RALLOC_DEVICE_BATCH_MAX_COUNT,
+                       "invalid param, batchSize exceeds SMEM_RALLOC_DEVICE_BATCH_MAX_COUNT", SM_INVALID_PARAM);
+    SM_VALIDATE_RETURN(handle != nullptr, "invalid param, handle is NULL", SM_INVALID_PARAM);
+    SM_VALIDATE_RETURN(g_smemRallocInited, "smem ralloc not initialized yet", SM_NOT_INITIALIZED);
+
+    SmemRallocEntryPtr entry = nullptr;
+    auto ret = SmemRallocEntryManager::Instance().GetEntryByPtr(reinterpret_cast<uintptr_t>(handle), entry);
+    if (ret != SM_OK || entry == nullptr) {
+        SM_LOG_AND_SET_LAST_ERROR("input handle is invalid, result: " << ret);
+        return SM_INVALID_PARAM;
+    }
+    if (entry->GetCoreOptions().bmType != HYBM_TYPE_AI_CORE_INITIATE) {
+        SM_LOG_AND_SET_LAST_ERROR_CODE(SM_NOT_SUPPORTED,
+            "pool is not device-scheduled, create it with DEVICE_SCHEDULE | DEVICE_RDMA");
+        return SM_NOT_SUPPORTED;
+    }
+    if (!DlSmemRallocDeviceApi::TryLoadLibrary()) {
+        SM_LOG_AND_SET_LAST_ERROR_CODE(SM_ERROR,
+            "device rdma kernel library (libmf_smem_ralloc_device_rdma.so) is not available");
+        return SM_ERROR;
+    }
+    auto submit = DlSmemRallocDeviceApi::GetBatchV3RunSubmit();
+    if (submit == nullptr) {
+        SM_LOG_AND_SET_LAST_ERROR_CODE(SM_NOT_SUPPORTED,
+            "device rdma kernel library has no uniform-batch (v3) entry, reinstall the runtime package");
+        return SM_NOT_SUPPORTED;
+    }
+
+    struct smem_ralloc_device_batch_v3_args args{};
+    args.srcArray = params->srcArray;
+    args.dstArray = params->dstArray;
+    args.sizeArray = params->sizeArray;
+    args.peerRank = params->peerRank;
+    args.isWrite = params->isWrite;
+    args.count = params->batchSize;
+    args.entityId = entry->GetEntityId();
+    submit(&args, stream);
+    return SM_OK;
+}

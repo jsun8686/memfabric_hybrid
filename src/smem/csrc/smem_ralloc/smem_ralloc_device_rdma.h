@@ -37,6 +37,8 @@ using SmemRallocDeviceBatchRunFunc = void (*)(const struct smem_ralloc_device_ba
 
 using SmemRallocDeviceBatchV2RunFunc = void (*)(const struct smem_ralloc_device_batch_dva_args *args, void *stream);
 
+using SmemRallocDeviceBatchV3RunFunc = void (*)(const struct smem_ralloc_device_batch_v3_args *args, void *stream);
+
 class DlSmemRallocDeviceApi {
 public:
     /* dlopen the kernel library lazily, thread safe, returns true when the submit entries are ready */
@@ -69,6 +71,14 @@ public:
         return pBatchV2RunSubmit;
     }
 
+    /* OPTIONAL symbol: an older kernel .so without the v3 entry simply leaves this null,
+     * smem_ralloc_device_copy_batch_v3 reports not-supported; the required set above is
+     * untouched so v1/v2 keep working on that .so */
+    static SmemRallocDeviceBatchV3RunFunc GetBatchV3RunSubmit()
+    {
+        return pBatchV3RunSubmit;
+    }
+
 private:
     static bool gLoaded;
     static std::mutex gMutex;
@@ -77,6 +87,7 @@ private:
     static SmemRallocDeviceReadRunFunc pReadRunSubmit;
     static SmemRallocDeviceBatchRunFunc pBatchRunSubmit;
     static SmemRallocDeviceBatchV2RunFunc pBatchV2RunSubmit;
+    static SmemRallocDeviceBatchV3RunFunc pBatchV3RunSubmit;
 };
 
 } // namespace smem

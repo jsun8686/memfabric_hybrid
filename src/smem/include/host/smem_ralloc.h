@@ -326,6 +326,28 @@ int32_t smem_ralloc_device_copy_v2(smem_ralloc_t handle, const void *src, void *
 int32_t smem_ralloc_device_copy_batch_v2(smem_ralloc_t handle, smem_ralloc_batch_copy_v2_params_t *params,
                                          void *stream);
 
+/**
+ * @brief Uniform single-submit variant of <i>smem_ralloc_device_copy_batch_v2</i> for
+ *        batches whose segments all share one peer rank (<i>params->peerRank</i>), one
+ *        direction (<i>params->isWrite</i>) and whose srcArray / dstArray each stay inside
+ *        a single mkey of their owning endpoint. The kernel resolves both MR endpoints
+ *        once per batch (keys, translations and bounds held in registers) and posts a
+ *        branch-free WQE stream, on top of the SQ doorbell batching shared with v2
+ *        (MF_DVA_DB_BATCH). Everything else follows the v2 contract: the three descriptor
+ *        arrays are DEVICE addresses (DVA) staged by the caller with an async H2D on the
+ *        same stream, the whole batch is driven by ONE kernel launch, host side is pure
+ *        enqueue, and an out-of-contract segment degrades safely (range-checked, WQE
+ *        skipped, visible only through data verification).
+ *
+ * @param handle           [in] ralloc object handle created by <i>smem_ralloc_create</i> with
+ *                            SMEMRA_DATA_OP_DEVICE_SCHEDULE | SMEMRA_DATA_OP_DEVICE_RDMA
+ * @param params           [in] uniform batch description, plain device addresses (never host pointers)
+ * @param stream           [in] aclrt stream, null uses the default stream
+ * @return 0 if successful
+ */
+int32_t smem_ralloc_device_copy_batch_v3(smem_ralloc_t handle, smem_ralloc_batch_copy_v3_params_t *params,
+                                         void *stream);
+
 #ifdef __cplusplus
 }
 #endif

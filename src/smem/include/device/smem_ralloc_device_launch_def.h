@@ -77,6 +77,21 @@ struct smem_ralloc_device_batch_dva_args {
     uint32_t dbBatch;
 };
 
+/* Uniform single-peer/single-direction variant: rankArray/writeArray collapse into the
+ * scalars peerRank/isWrite, and srcArray/dstArray are each asserted to stay inside one mkey
+ * of their endpoint, so the kernel resolves both MR endpoints once per batch and posts a
+ * branch-free WQE stream (per-segment range guard keeps the safe-skip degradation). */
+struct smem_ralloc_device_batch_v3_args {
+    uint64_t srcArray;  /* device address of the const uint64 sources[count] */
+    uint64_t dstArray;  /* device address of the const uint64 destinations[count] */
+    uint64_t sizeArray; /* device address of the const uint64 dataSizes[count] */
+    uint32_t peerRank;  /* single peer: owner of the remote endpoint (dst for write, src for read) */
+    uint32_t isWrite;   /* 1 = WRITE for the whole batch, 0 = READ */
+    uint32_t count;     /* valid segments, 1 .. SMEM_RALLOC_DEVICE_BATCH_MAX_COUNT */
+    uint32_t entityId;  /* ralloc pool entity id in the device meta window */
+    uint32_t dbBatch;   /* 0 selects the host default from MF_DVA_DB_BATCH */
+};
+
 #ifdef __cplusplus
 }
 #endif

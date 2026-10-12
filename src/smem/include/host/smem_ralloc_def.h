@@ -145,6 +145,25 @@ typedef struct {
 } smem_ralloc_batch_copy_v2_params;
 typedef smem_ralloc_batch_copy_v2_params smem_ralloc_batch_copy_v2_params_t;
 
+/* uniform-batch variant consumed by smem_ralloc_device_copy_batch_v3: the whole batch
+ * shares ONE peer rank, ONE direction, and each of srcArray/dstArray stays inside a single
+ * mkey (memory region) of its owning endpoint. The contract is caller-asserted, so the
+ * kernel resolves both MR endpoints once per batch and keeps keys/translations/bounds in
+ * registers -- no per-segment rank/write loads, no per-WQE MR walks, no peer switching.
+ * The three descriptor arrays are DEVICE (HBM) addresses (DVA) like v2; the host never
+ * dereferences them. Safe degradation like v2: each segment is still range-checked against
+ * the resolved regions (4 compares) and an out-of-range segment is skipped with the user-MR
+ * miss flag set -- wrong input never corrupts data, it only shows up in verification. */
+typedef struct {
+    uint64_t srcArray;  /* DVA of the const uint64 sources[batchSize], all inside ONE local mkey (write) / peer mkey (read) */
+    uint64_t dstArray;  /* DVA of the const uint64 destinations[batchSize], all inside ONE peer mkey (write) / local mkey (read) */
+    uint64_t sizeArray; /* DVA of the const uint64 dataSizes[batchSize] */
+    uint32_t peerRank;  /* single peer: owner of the remote endpoint (dst for write, src for read) */
+    uint32_t isWrite;   /* 1 = the whole batch is WRITE (local -> peer), 0 = READ (peer -> local) */
+    uint32_t batchSize; /* number of the copy pairs, (0, SMEM_RALLOC_DEVICE_BATCH_MAX_COUNT] */
+} smem_ralloc_batch_copy_v3_params;
+typedef smem_ralloc_batch_copy_v3_params smem_ralloc_batch_copy_v3_params_t;
+
 /**
  * @brief smem join/leave event type
  */

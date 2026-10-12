@@ -338,3 +338,103 @@ extern "C" void smem_ralloc_device_batch_v2_run_submit(const struct smem_ralloc_
     }
     smem_ralloc_device_batch_v2_run_kernel<<<smem_ralloc_device_qps_per_peer(), nullptr, stream>>>(local);
 }
+
+/* ---- uniform batch (v3): single peer, single direction, srcArray/dstArray each inside one
+ * mkey of their endpoint ----
+ *
+ * Compared to v2 the main loop is branch-free: rank/write come as launch scalars, both MR
+ * endpoints are resolved ONCE from each lane's first segment and held in registers
+ * (SmemRallocUniformMr), the WQE is a register template with only owner bit / length / two
+ * translated addresses varying, and there is no peer switching or peer-mask quiet bookkeeping
+ * (one direct quiet per drain point). The per-segment 4-compare range guard keeps v2's
+ * safe-skip degradation. Doorbell batching (dbBatch) is shared with v2; outstanding WQEs
+ * stay bounded by LANE_BUDGET << SQ depth, so the single-shot near-full poll is not needed.
+ * The flush/quiet schedule is a pure function of the descriptor arrays -> graph replay safe. */
+extern "C" __global__ __aicore__ void smem_ralloc_device_batch_v3_run_kernel(
+    struct smem_ralloc_device_batch_v3_args args)
+{
+    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+    /* same lane discipline: one block per QP lane, block b exclusively owns lane b */
+    __gm__ void *qpInfoVa = smem_ralloc_get_qp_info_address(args.entityId);
+    uint32_t laneNum = ((__gm__ SmemRallocRdmaInfo *)qpInfoVa)->qpNum;
+    uint32_t blockIdx = AscendC::GetBlockIdx();
+    if (laneNum == 0 || blockIdx >= laneNum || args.count <= blockIdx) {
+        return;
+    }
+
+    AscendC::TPipe pipe;
+    AscendC::TQue<AscendC::TPosition::VECIN, 1> que64;
+    AscendC::TQue<AscendC::TPosition::VECIN, 1> que32;
+    AscendC::LocalTensor<uint64_t> ubLocal64;
+    AscendC::LocalTensor<uint32_t> ubLocal32;
+    smem_ralloc_device_ub_alloc(pipe, que64, que32, ubLocal64, ubLocal32);
+
+    /* direction resolved outside the loop: remote = peer-side array, local = own-side array */
+    __gm__ const uint64_t *srcArr = (__gm__ const uint64_t *)args.srcArray;
+    __gm__ const uint64_t *dstArr = (__gm__ const uint64_t *)args.dstArray;
+    __gm__ const uint64_t *sizeArr = (__gm__ const uint64_t *)args.sizeArray;
+    __gm__ const uint64_t *remoteArr = (args.isWrite != 0U) ? dstArr : srcArr;
+    __gm__ const uint64_t *localArr = (args.isWrite != 0U) ? srcArr : dstArr;
+    const SmemRallocOpcode opcode = (args.isWrite != 0U) ? SmemRallocOpcode::OP_RDMA_WRITE
+                                                         : SmemRallocOpcode::OP_RDMA_READ;
+
+    /* resolve both MR endpoints once per lane from this lane's first segment (uniform
+     * contract: every segment of the batch shares the same region); miss -> report and the
+     * whole lane no-ops (host diagnostics read the flag, verification shows the skip) */
+    __gm__ SmemRallocRdmaInfo *rdmaInfo = (__gm__ SmemRallocRdmaInfo *)qpInfoVa;
+    SmemRallocUniformMr remoteMr{};
+    SmemRallocUniformMr localMr{};
+    if (!smem_ralloc_resolve_remote_uniform(rdmaInfo->memPtr, args.peerRank, remoteArr[blockIdx], remoteMr)) {
+        smem_ralloc_report_user_mr_lookup_miss(args.entityId);
+        que32.FreeTensor(ubLocal32);
+        que64.FreeTensor(ubLocal64);
+        return;
+    }
+    if (!smem_ralloc_resolve_local_uniform(args.entityId, rdmaInfo->memPtr, localArr[blockIdx], localMr)) {
+        smem_ralloc_report_user_mr_lookup_miss(args.entityId);
+        que32.FreeTensor(ubLocal32);
+        que64.FreeTensor(ubLocal64);
+        return;
+    }
+
+    const uint32_t dbBatch = (args.dbBatch == 0U) ? 1U : args.dbBatch;
+    uint32_t pendHead = smem_ralloc_rdma_read_sq_head(args.entityId, args.peerRank, blockIdx);
+    uint32_t pendCnt = 0;
+    uint32_t lanePosted = 0;
+    for (uint32_t i = blockIdx; i < args.count; i += laneNum) {
+        smem_ralloc_rdma_post_send_uniform_nowait(args.entityId, args.peerRank, blockIdx, opcode, sizeArr[i],
+                                                  remoteArr[i], remoteMr, localArr[i], localMr, pendHead);
+        pendCnt++;
+        lanePosted++;
+        if (pendCnt >= dbBatch || lanePosted >= SMEM_RALLOC_DEVICE_DVA_LANE_BUDGET) {
+            if (pendCnt != 0U) {
+                smem_ralloc_rdma_post_send_flush(args.entityId, args.peerRank, blockIdx, pendHead, ubLocal64,
+                                                 ubLocal32);
+                pendCnt = 0U;
+            }
+        }
+        if (lanePosted >= SMEM_RALLOC_DEVICE_DVA_LANE_BUDGET) {
+            /* in-kernel sub-batch drain, single peer: direct quiet (no peer-mask scan) */
+            (void)smem_ralloc_roce_quiet(args.entityId, args.peerRank, blockIdx, ubLocal64, ubLocal32);
+            lanePosted = 0;
+        }
+    }
+    if (pendCnt != 0U) {
+        smem_ralloc_rdma_post_send_flush(args.entityId, args.peerRank, blockIdx, pendHead, ubLocal64, ubLocal32);
+    }
+    (void)smem_ralloc_roce_quiet(args.entityId, args.peerRank, blockIdx, ubLocal64, ubLocal32);
+
+    que32.FreeTensor(ubLocal32);
+    que64.FreeTensor(ubLocal64);
+}
+
+extern "C" void smem_ralloc_device_batch_v3_run_submit(const struct smem_ralloc_device_batch_v3_args *args,
+                                                       void *stream)
+{
+    /* host side: pure enqueue, same contract as v2; dbBatch == 0 selects MF_DVA_DB_BATCH */
+    struct smem_ralloc_device_batch_v3_args local = *args;
+    if (local.dbBatch == 0U) {
+        local.dbBatch = smem_ralloc_device_db_batch();
+    }
+    smem_ralloc_device_batch_v3_run_kernel<<<smem_ralloc_device_qps_per_peer(), nullptr, stream>>>(local);
+}

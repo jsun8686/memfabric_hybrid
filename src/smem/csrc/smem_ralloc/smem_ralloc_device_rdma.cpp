@@ -26,6 +26,7 @@ SmemRallocDeviceWriteRunFunc DlSmemRallocDeviceApi::pWriteRunSubmit = nullptr;
 SmemRallocDeviceReadRunFunc DlSmemRallocDeviceApi::pReadRunSubmit = nullptr;
 SmemRallocDeviceBatchRunFunc DlSmemRallocDeviceApi::pBatchRunSubmit = nullptr;
 SmemRallocDeviceBatchV2RunFunc DlSmemRallocDeviceApi::pBatchV2RunSubmit = nullptr;
+SmemRallocDeviceBatchV3RunFunc DlSmemRallocDeviceApi::pBatchV3RunSubmit = nullptr;
 
 static const char *SMEM_RALLOC_DEVICE_LIB_NAME = "libmf_smem_ralloc_device_rdma.so";
 
@@ -77,6 +78,10 @@ bool DlSmemRallocDeviceApi::TryLoadLibrary()
         return false;
     }
 
+    /* optional: uniform-batch v3 entry, absent on older kernel .so builds */
+    pBatchV3RunSubmit = reinterpret_cast<SmemRallocDeviceBatchV3RunFunc>(
+        dlsym(libHandle, "smem_ralloc_device_batch_v3_run_submit"));
+
     gLoaded = true;
     return true;
 }
@@ -92,6 +97,7 @@ void DlSmemRallocDeviceApi::CleanupLibrary()
     pReadRunSubmit = nullptr;
     pBatchRunSubmit = nullptr;
     pBatchV2RunSubmit = nullptr;
+    pBatchV3RunSubmit = nullptr;
     if (libHandle != nullptr) {
         dlclose(libHandle);
         libHandle = nullptr;
