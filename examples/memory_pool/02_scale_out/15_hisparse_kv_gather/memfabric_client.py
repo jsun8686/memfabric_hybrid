@@ -202,7 +202,7 @@ def _stage_batch_desc_v3(srcs, dsts, sizes):
 
 
 def _wait_tcp(url, timeout_sec):
-    host, port = url.split("://", 1).rsplit(":", 1)
+    host, port = url.split("://", 1)[1].rsplit(":", 1)
     deadline = time.time() + timeout_sec
     while time.time() < deadline:
         with socket.socket() as s:

@@ -64,7 +64,7 @@ def _load_csv_rows(path, run_id, per_layer_layout):
         for row in csv.DictReader(fh):
             if run_id and row.get("run_id") != run_id:
                 continue
-            if row.get("variant", "").startswith("checked"):
+            if row.get("variant", "").startswith(("checked", "graph-")):
                 continue  # host-checked path is not a deployment candidate
             lay = row["layout"]
             lay_class = "per_layer" if lay.startswith("per_layer") else lay
@@ -77,7 +77,7 @@ def _load_csv_rows(path, run_id, per_layer_layout):
 
 def _measured_us_per_round(rows, layout_want, f, s, direction, k):
     """us_per_round + segs measured for (layout, f, s, direction); None if absent."""
-    seg_bytes = f * s
+    seg_bytes = f * s if layout_want == "chunk" else s  # CSV per-layer rows key on s
     segs = k if layout_want == "chunk" else f * k
     row = rows.get((layout_want, seg_bytes, segs, direction))
     if row is None:
