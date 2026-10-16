@@ -9,6 +9,8 @@
  * MERCHANTABILITY OR FIT FOR A PARTICULAR PURPOSE.
  * See the Mulan PSL v2 for more details.
 */
+#include <cstring>
+
 #include "hybm_logger.h"
 #include "hybm_entity_factory.h"
 #include "hybm_big_mem.h"

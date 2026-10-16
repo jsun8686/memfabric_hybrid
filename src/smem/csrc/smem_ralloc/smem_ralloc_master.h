@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "smem_config_store.h"
+#include "smem_ralloc_def.h"
 #include "smem_ralloc_rpc_def.h"
 
 namespace ock {
