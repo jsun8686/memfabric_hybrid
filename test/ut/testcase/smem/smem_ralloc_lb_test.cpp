@@ -69,8 +69,10 @@ SmemRallocRpcMsg MakeGrantFailMsg(uint32_t nodeRank, uint64_t size)
 TEST(SmemRallocMasterLbTest, GrantFailReleasesInflightReservation)
 {
     SmemRallocMasterService master;
-    ASSERT_EQ(master.OnRegister(MakeRegisterMsg(1U, 0U, 50 * K_GB)), SM_OK);
-    ASSERT_EQ(master.OnRegister(MakeRegisterMsg(2U, 0U, 0U)), SM_OK);
+    auto reg1 = MakeRegisterMsg(1U, 0U, 50 * K_GB);
+    ASSERT_EQ(master.OnRegister(reg1), SM_OK);
+    auto reg2 = MakeRegisterMsg(2U, 0U, 0U);
+    ASSERT_EQ(master.OnRegister(reg2), SM_OK);
 
     auto place = MakeDevicePlacementMsg(100 * K_GB);
 
@@ -83,7 +85,8 @@ TEST(SmemRallocMasterLbTest, GrantFailReleasesInflightReservation)
     ASSERT_EQ(place.nodeRank, 1U);
 
     /* the rank 1 grant failed to land on the executor: NACK releases it */
-    ASSERT_EQ(master.OnGrantFail(MakeGrantFailMsg(1U, 100 * K_GB)), SM_OK);
+    auto nack = MakeGrantFailMsg(1U, 100 * K_GB);
+    ASSERT_EQ(master.OnGrantFail(nack), SM_OK);
 
     /* without the release rank 1 would still show 150 GB and lose to rank 2 (100 GB) */
     ASSERT_EQ(master.OnPlacement(place), SM_OK);
@@ -95,11 +98,14 @@ TEST(SmemRallocMasterLbTest, GrantFailUnknownNodeOrNoMatchIsNoop)
     SmemRallocMasterService master;
 
     /* no candidate table at all: unknown node is a benign no-op */
-    ASSERT_EQ(master.OnGrantFail(MakeGrantFailMsg(7U, 100 * K_GB)), SM_OK);
+    auto unknown = MakeGrantFailMsg(7U, 100 * K_GB);
+    ASSERT_EQ(master.OnGrantFail(unknown), SM_OK);
 
-    ASSERT_EQ(master.OnRegister(MakeRegisterMsg(1U, 0U, 0U)), SM_OK);
+    auto reg = MakeRegisterMsg(1U, 0U, 0U);
+    ASSERT_EQ(master.OnRegister(reg), SM_OK);
     /* size matches no in-flight grant: nothing released, still a no-op */
-    ASSERT_EQ(master.OnGrantFail(MakeGrantFailMsg(1U, 100 * K_GB)), SM_OK);
+    auto nomatch = MakeGrantFailMsg(1U, 100 * K_GB);
+    ASSERT_EQ(master.OnGrantFail(nomatch), SM_OK);
 
     auto place = MakeDevicePlacementMsg(100 * K_GB);
     ASSERT_EQ(master.OnPlacement(place), SM_OK);
