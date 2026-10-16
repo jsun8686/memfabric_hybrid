@@ -612,22 +612,27 @@ TEST(FixedRanksQpManagerTestTest, StartupReserveQpInfoFailReturnsError)
     EXPECT_EQ(manager.Startup(&dummy), BM_ERROR);
 }
 
-TEST(FixedRanksQpManagerTestTest, StartupRankInfoSizeMismatchReturnsInvalidParam)
+TEST(FixedRanksQpManagerTestTest, StartupWithFewerRanksThanWorldSucceeds)
 {
     sockaddr_in devNet{};
     inet_aton("127.0.0.1", &devNet.sin_addr);
     devNet.sin_port = htons(12345);
     devNet.sin_family = AF_INET;
 
-    // rankCount_ = 2, but currentRanksInfo_ left empty
-    FixedRanksQpManagerTest manager(0, 0, 2, devNet);
+    /* dynamic-group semantics: a member set smaller than the world size is accepted (empty
+     * = solo startup), only size > rankCount is rejected -- the old size-equality rule is
+     * gone. rankCount=1 lets both connect sides early-return (same shape as the Success
+     * test), so no socket mocks are needed */
+    FixedRanksQpManagerTest manager(0, 0, 1, devNet);
 
     DlAclApiFnGuard guard;
     DlAclApi::pAclrtMalloc = &FakeAclrtMallocOk;
     DlAclApi::pAclrtFree = &FakeAclrtFreeOk;
 
     int dummy = 0;
-    EXPECT_EQ(manager.Startup(&dummy), BM_INVALID_PARAM);
+    EXPECT_EQ(manager.Startup(&dummy), BM_OK);
+    EXPECT_TRUE(manager.started_.load());
+    EXPECT_EQ(manager.rdmaHandle_, &dummy);
 }
 
 TEST(FixedRanksQpManagerTestTest, StartupRankInfoContainsInvalidRankIdReturnsInvalidParam)
