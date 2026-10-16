@@ -561,6 +561,13 @@ int FixedRanksQpManager::CreateOneQp(AiCoreConnChannel &channel, uint32_t lane) 
 
 int FixedRanksQpManager::FillQpInfo() noexcept
 {
+    if (qpInfoSize_ == 0U || qpInfo_ == nullptr) {
+        /* reachable when a rank update arrives while the table is not reserved yet (e.g. tests
+         * or a startup race): the zero-size buffer below would hand out a null data pointer.
+         * The SetRemoteRankInfo refresh path treats this as a benign skip (warn + deferred) */
+        BM_LOG_WARN("fill qp info skipped: qp table not reserved yet");
+        return BM_ERROR;
+    }
     std::vector<uint8_t> qpInfoBuffer(qpInfoSize_);
     auto copyInfo = (AiQpRMAQueueInfo *)(void *)qpInfoBuffer.data();
     /* count = QP lanes per connection; the sq/rq/scq/rcq arrays are indexed

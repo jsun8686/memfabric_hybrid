@@ -392,7 +392,7 @@ TEST(FixedRanksQpManagerTestTest, SetRemoteRankInfoSuccess)
     EXPECT_EQ(manager.currentRanksInfo_.size(), 2U);
 }
 
-TEST(FixedRanksQpManagerTestTest, SetRemoteRankInfoFailWhenStarted)
+TEST(FixedRanksQpManagerTestTest, SetRemoteRankInfoWhenStartedMergesAndRefreshes)
 {
     sockaddr_in devNet{};
     inet_aton("127.0.0.1", &devNet.sin_addr);
@@ -400,7 +400,19 @@ TEST(FixedRanksQpManagerTestTest, SetRemoteRankInfoFailWhenStarted)
     devNet.sin_family = AF_INET;
 
     FixedRanksQpManagerTest manager(0, 0, 2, devNet);
+    /* started without Startup: the qp table is not reserved yet, so the refresh inside the
+     * started branch hits the not-reserved guard (benign skip) instead of a null write */
     manager.started_.store(true);
+
+    /* pre-seed rank 1: the started branch must MERGE the new entries, not replace the map */
+    in_addr seedIp{};
+    inet_aton("192.168.1.2", &seedIp);
+    sockaddr_in seedNet{};
+    seedNet.sin_addr = seedIp;
+    seedNet.sin_port = htons(12346);
+    seedNet.sin_family = AF_INET;
+    manager.currentRanksInfo_.emplace(1, ConnectRankInfo(HYBM_ROLE_PEER, seedNet,
+                                                          std::vector<TransportMemoryKey>{}));
 
     std::unordered_map<uint32_t, ConnectRankInfo> ranks;
     in_addr ip;
@@ -411,8 +423,9 @@ TEST(FixedRanksQpManagerTestTest, SetRemoteRankInfoFailWhenStarted)
     net.sin_family = AF_INET;
     ranks.emplace(0, ConnectRankInfo(HYBM_ROLE_PEER, net, std::vector<TransportMemoryKey>{}));
 
-    // Test failure case when already started
-    EXPECT_EQ(manager.SetRemoteRankInfo(ranks), BM_ERROR);
+    /* dynamic-group semantics: already started no longer rejects -- merge + refresh + BM_OK */
+    EXPECT_EQ(manager.SetRemoteRankInfo(ranks), BM_OK);
+    EXPECT_EQ(manager.currentRanksInfo_.size(), 2U);
 }
 
 TEST(FixedRanksQpManagerTestTest, ReserveQpInfoSpaceSuccess)
