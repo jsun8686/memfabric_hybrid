@@ -975,7 +975,7 @@ TEST(FixedRanksQpManagerTestTest, CheckReadyConnectionSuccess)
     EXPECT_EQ(manager.CheckReadyConnection(connections, addr2index, socketInfo), BM_OK);
     auto pos = connections.find(0);
     ASSERT_NE(pos, connections.end());
-    EXPECT_EQ(pos->second.socketFd, socketInfo.fd);
+    EXPECT_EQ(pos->second.socketFd[0], socketInfo.fd);
 }
 
 TEST(FixedRanksQpManagerTestTest, CheckReadyConnectionIpNotInMap)
@@ -1052,7 +1052,7 @@ TEST(FixedRanksQpManagerTestTest, CheckReadyConnectionSocketFdAlreadySet)
     connections.emplace(0, FixedRanksQpManagerTest::AiCoreConnChannel(ip, socketHandle));
     auto pos = connections.find(0);
     ASSERT_NE(pos, connections.end());
-    pos->second.socketFd = reinterpret_cast<void*>(0x9ABCUL);  // Already set
+    pos->second.socketFd[0] = reinterpret_cast<void*>(0x9ABCUL);  // Already set
 
     std::unordered_map<in_addr_t, uint32_t> addr2index;
     addr2index[ip.s_addr] = 0;
@@ -1114,8 +1114,8 @@ TEST(FixedRanksQpManagerTestTest, CreateOneQpSuccess)
     FixedRanksQpManagerTest::AiCoreConnChannel channel(ip);
 
     // Test success case
-    EXPECT_EQ(manager.CreateOneQp(channel), 0);
-    EXPECT_NE(channel.qpHandle, nullptr);
+    EXPECT_EQ(manager.CreateOneQp(channel, 0), 0);
+    EXPECT_NE(channel.qpHandle[0], nullptr);
 }
 
 TEST(FixedRanksQpManagerTestTest, CreateOneQpFail)
@@ -1137,8 +1137,8 @@ TEST(FixedRanksQpManagerTestTest, CreateOneQpFail)
     FixedRanksQpManagerTest::AiCoreConnChannel channel(ip);
 
     // Test failure case
-    EXPECT_NE(manager.CreateOneQp(channel), 0);
-    EXPECT_EQ(channel.qpHandle, nullptr);
+    EXPECT_NE(manager.CreateOneQp(channel, 0), 0);
+    EXPECT_EQ(channel.qpHandle[0], nullptr);
 }
 
 TEST(FixedRanksQpManagerTestTest, WaitConnectionsReadySuccess)
@@ -1163,7 +1163,7 @@ TEST(FixedRanksQpManagerTestTest, WaitConnectionsReadySuccess)
     EXPECT_EQ(manager.WaitConnectionsReady(connections), BM_OK);
     auto pos = connections.find(0);
     ASSERT_NE(pos, connections.end());
-    EXPECT_NE(pos->second.socketFd, nullptr);
+    EXPECT_NE(pos->second.socketFd[0], nullptr);
 }
 
 TEST(FixedRanksQpManagerTestTest, WaitConnectionsReadyFailWhenRaGetSocketsFail)
@@ -1390,16 +1390,16 @@ TEST(FixedRanksQpManagerTestTest, CloseConnections)
     connections.emplace(0, FixedRanksQpManagerTest::AiCoreConnChannel(ip0, reinterpret_cast<void*>(0x1234UL)));
     auto pos0 = connections.find(0);
     ASSERT_NE(pos0, connections.end());
-    pos0->second.qpHandle = reinterpret_cast<void*>(0x5678UL);
-    pos0->second.socketFd = reinterpret_cast<void*>(0x9ABCUL);
+    pos0->second.qpHandle[0] = reinterpret_cast<void*>(0x5678UL);
+    pos0->second.socketFd[0] = reinterpret_cast<void*>(0x9ABCUL);
 
     in_addr ip1{};
     inet_aton("192.168.1.2", &ip1);
     connections.emplace(1, FixedRanksQpManagerTest::AiCoreConnChannel(ip1, reinterpret_cast<void*>(0xDEF0UL)));
     auto pos1 = connections.find(1);
     ASSERT_NE(pos1, connections.end());
-    pos1->second.qpHandle = reinterpret_cast<void*>(0x12345UL);
-    pos1->second.socketFd = reinterpret_cast<void*>(0x67890UL);
+    pos1->second.qpHandle[0] = reinterpret_cast<void*>(0x12345UL);
+    pos1->second.socketFd[0] = reinterpret_cast<void*>(0x67890UL);
 
     // Test close connections
     manager.CloseConnections(connections);
@@ -1428,8 +1428,8 @@ TEST(FixedRanksQpManagerTestTest, CloseClientConnections)
     {
         auto pos = manager.clientConnections_.find(0);
         ASSERT_NE(pos, manager.clientConnections_.end());
-        pos->second.qpHandle = reinterpret_cast<void*>(0x5678UL);
-        pos->second.socketFd = reinterpret_cast<void*>(0x9ABCUL);
+        pos->second.qpHandle[0] = reinterpret_cast<void*>(0x5678UL);
+        pos->second.socketFd[0] = reinterpret_cast<void*>(0x9ABCUL);
     }
 
     // Test close client connections
@@ -1459,8 +1459,8 @@ TEST(FixedRanksQpManagerTestTest, CloseServerConnections)
     {
         auto pos = manager.serverConnections_.find(0);
         ASSERT_NE(pos, manager.serverConnections_.end());
-        pos->second.qpHandle = reinterpret_cast<void*>(0x5678UL);
-        pos->second.socketFd = reinterpret_cast<void*>(0x9ABCUL);
+        pos->second.qpHandle[0] = reinterpret_cast<void*>(0x5678UL);
+        pos->second.socketFd[0] = reinterpret_cast<void*>(0x9ABCUL);
     }
 
     // Test close server connections
@@ -1490,8 +1490,8 @@ TEST(FixedRanksQpManagerTestTest, CloseServices)
     {
         auto pos = manager.clientConnections_.find(0);
         ASSERT_NE(pos, manager.clientConnections_.end());
-        pos->second.qpHandle = reinterpret_cast<void*>(0x5678UL);
-        pos->second.socketFd = reinterpret_cast<void*>(0x9ABCUL);
+        pos->second.qpHandle[0] = reinterpret_cast<void*>(0x5678UL);
+        pos->second.socketFd[0] = reinterpret_cast<void*>(0x9ABCUL);
     }
 
     manager.serverConnections_.emplace(
@@ -1499,8 +1499,8 @@ TEST(FixedRanksQpManagerTestTest, CloseServices)
     {
         auto pos = manager.serverConnections_.find(1);
         ASSERT_NE(pos, manager.serverConnections_.end());
-        pos->second.qpHandle = reinterpret_cast<void*>(0x12345UL);
-        pos->second.socketFd = reinterpret_cast<void*>(0x67890UL);
+        pos->second.qpHandle[0] = reinterpret_cast<void*>(0x12345UL);
+        pos->second.socketFd[0] = reinterpret_cast<void*>(0x67890UL);
     }
 
     // Test close services

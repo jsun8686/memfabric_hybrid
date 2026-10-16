@@ -28,14 +28,16 @@ namespace {
 /* in-memory admin client: records add/remove calls, no SPDK dependency */
 class MockNvmeAdmin : public HybmNvmeAdminClient {
 public:
-    Result AddNs(uint64_t lbaOffset, uint64_t lbaLen, uint32_t &nsid) override
+    /* fully qualified return types: mockcpp.hpp injects a global mockcpp::Result that is
+     * ambiguous with ock::mf::Result under `using namespace ock::mf` */
+    ock::mf::Result AddNs(uint64_t lbaOffset, uint64_t lbaLen, uint32_t &nsid) override
     {
         added.emplace_back(lbaOffset, lbaLen);
         nsid = ++nextNsid;
         return BM_OK;
     }
 
-    Result RemoveNs(uint32_t nsid) override
+    ock::mf::Result RemoveNs(uint32_t nsid) override
     {
         removed.push_back(nsid);
         return BM_OK;
