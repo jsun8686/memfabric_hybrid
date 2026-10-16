@@ -13,6 +13,7 @@
 #include "hybm_data_op_device_rdma.h"
 #include "hybm_data_op_host_shm.h"
 #include "hybm_data_op_host_rdma.h"
+#include "hybm_data_op_nvme.h"
 #include "hybm_data_op_factory.h"
 
 namespace ock {
@@ -35,6 +36,11 @@ DataOperatorPtr DataOperatorFactory::CreateHostRdmaDataOperator(uint32_t rankId,
 DataOperatorPtr DataOperatorFactory::CreateHostShmDataOperator(uint32_t rankId)
 {
     return std::make_shared<HostDataOpHostShm>(rankId);
+}
+
+DataOperatorPtr DataOperatorFactory::CreateNvmeDataOperator(uint32_t rankId)
+{
+    return std::make_shared<HostDataOpNvme>(rankId);
 }
 } // namespace mf
 } // namespace ock

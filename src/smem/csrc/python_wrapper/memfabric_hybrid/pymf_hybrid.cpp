@@ -380,12 +380,13 @@ public:
         return smem_ralloc_get_rank_id();
     }
 
-    static RallocPool *Create(uint32_t id, uint64_t maxDramSize, uint64_t maxHbmSize,
+    static RallocPool *Create(uint32_t id, uint64_t maxDramSize, uint64_t maxHbmSize, uint64_t maxNvmeSize,
                               smem_ralloc_data_op_type dataOpType, bool enable56BitsGva, uint32_t flags)
     {
         smem_ralloc_create_option_t option{};
         option.maxDramSize = maxDramSize;
         option.maxHbmSize = maxHbmSize;
+        option.maxNvmeSize = maxNvmeSize;
         option.dataOpType = dataOpType;
         option.enable56BitsGva = enable56BitsGva;
         option.flags = flags;
@@ -400,7 +401,7 @@ public:
 
     /* accepts a named enum member, an unregistered enum value (new pybind11 arithmetic result)
      * or a plain int bitmask (old pybind11 arithmetic result), keeps all callers working */
-    static RallocPool *CreateFlexible(uint32_t id, uint64_t maxDramSize, uint64_t maxHbmSize,
+    static RallocPool *CreateFlexible(uint32_t id, uint64_t maxDramSize, uint64_t maxHbmSize, uint64_t maxNvmeSize,
                                       py::object dataOpType, bool enable56BitsGva, uint32_t flags)
     {
         smem_ralloc_data_op_type op;
@@ -410,7 +411,7 @@ public:
             op = static_cast<smem_ralloc_data_op_type>(dataOpType.cast<uint32_t>());
         }
         py::gil_scoped_release release;
-        return Create(id, maxDramSize, maxHbmSize, op, enable56BitsGva, flags);
+        return Create(id, maxDramSize, maxHbmSize, maxNvmeSize, op, enable56BitsGva, flags);
     }
 
     py::tuple ExtendLocalMem(smem_ralloc_mem_type memType, uint64_t size)
@@ -1085,7 +1086,10 @@ void DefineRallocConfig(py::module_ &m)
         .value("LOCAL_DEVICE", SMEM_RALLOC_MEM_TYPE_LOCAL_DEVICE, "memory type is on local DEVICE side.")
         .value("LOCAL_HOST", SMEM_RALLOC_MEM_TYPE_LOCAL_HOST, "memory type is on local HOST side.")
         .value("DEVICE", SMEM_RALLOC_MEM_TYPE_DEVICE, "memory type is on global DEVICE side.")
-        .value("HOST", SMEM_RALLOC_MEM_TYPE_HOST, "memory type is on global HOST side.");
+        .value("HOST", SMEM_RALLOC_MEM_TYPE_HOST, "memory type is on global HOST side.")
+        .value("NVME", SMEM_RALLOC_MEM_TYPE_NVME,
+               "remote NVMe SSD block media over NVMe-oF: gva maps to an LBA extent, IO goes"
+               " through smem_ralloc_copy with the NVMe data op");
 
     py::enum_<smem_ralloc_data_op_type>(m, "RallocDataOpType", py::arithmetic())
         .value("SDMA", SMEMRA_DATA_OP_SDMA, "data operation done by device SDMA")
@@ -1094,6 +1098,9 @@ void DefineRallocConfig(py::module_ &m)
         .value("DEVICE_RDMA", SMEMRA_DATA_OP_DEVICE_RDMA, "data operation done by device RDMA")
         .value("HOST_URMA", SMEMRA_DATA_OP_HOST_URMA, "data operation done by host URMA")
         .value("HOST_SHM", SMEMRA_DATA_OP_HOST_SHM, "same-node host shared memory (no network transport)")
+        .value("NVME", SMEMRA_DATA_OP_NVME,
+               "remote NVMe SSD blocks served over NVMe-oF (host initiator), combine with HOST_RDMA"
+               " for DRAM windows")
         .value("DEVICE_SCHEDULE", SMEMRA_DATA_OP_DEVICE_SCHEDULE,
                "ralloc-only modifier: pool is scheduled from the AICore, combine with DEVICE_RDMA");
 
@@ -1163,7 +1170,7 @@ Returns:
     rank id if successful, UINT32_MAX is returned if failed.)");
 
     m.def("create", &RallocPool::CreateFlexible, py::arg("id"),
-          py::arg("max_dram_size"), py::arg("max_hbm_size") = 0,
+          py::arg("max_dram_size"), py::arg("max_hbm_size") = 0, py::arg("max_nvme_size") = 0,
           py::arg("data_op_type") = static_cast<uint32_t>(SMEMRA_DATA_OP_HOST_RDMA), py::arg("enable_56bits_gva") = false,
           py::arg("flags") = 0, R"(
 Create a ralloc pool on a NEAR role node after initialized. Pure alignment: the window is
@@ -1174,8 +1181,10 @@ Arguments:
     max_dram_size(int):            the max size of one rank DRAM slot reserved in the window, 2M aligned
     max_hbm_size(int):             the max size of one rank HBM slot reserved in the window, 2M aligned,
                                    default 0 (no HBM window)
+    max_nvme_size(int):            the max size of one rank NVMe slot reserved in the window, 2M aligned,
+                                   default 0 (no NVMe window); requires the NVME op bit in data_op_type
     data_op_type(RallocDataOpType or int): data operation type of the pool, accepts a named member,
-                                   a combined bitmask (e.g. SDMA | DEVICE_RDMA) or its int value,
+                                   a combined bitmask (e.g. HOST_RDMA | NVME) or its int value,
                                    default HOST_RDMA
     enable_56bits_gva(bool):       explicitly enable 56-bit GVA, default false
     flags(int):                    optional flags, default 0
@@ -1189,7 +1198,7 @@ Returns:
 Extend one memory block on the local slot.
 
 Arguments:
-    mem_type(RallocMemType): memory type, HOST or DEVICE, default HOST
+    mem_type(RallocMemType): memory type, HOST, DEVICE or NVME, default HOST
     size(int):               block size in byte, must be 2M aligned
 Returns:
     tuple: (ret, {"rank_id": int, "gva": int}) — rank_id is the contributor rank (local rank),
@@ -1200,7 +1209,7 @@ Acquire one memory block from a remote contributor node selected by the master
 (least loaded candidate on the requested media, never the requester itself).
 
 Arguments:
-    mem_type(RallocMemType): memory type, HOST or DEVICE, default HOST
+    mem_type(RallocMemType): memory type, HOST, DEVICE or NVME, default HOST
     size(int):               block size in byte, must be 2M aligned
 Returns:
     tuple: (ret, {"rank_id": int, "gva": int}) — rank_id is the contributor rank,

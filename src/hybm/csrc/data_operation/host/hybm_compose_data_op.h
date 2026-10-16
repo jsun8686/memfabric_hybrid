@@ -57,6 +57,7 @@ private:
     DataOperatorPtr sdmaDataOperator_;
     DataOperatorPtr devRdmaDataOperator_;
     DataOperatorPtr hostRdmaDataOperator_;
+    DataOperatorPtr nvmeDataOperator_;
 };
 } // namespace mf
 } // namespace ock

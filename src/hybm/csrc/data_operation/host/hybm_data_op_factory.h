@@ -24,6 +24,7 @@ public:
     static DataOperatorPtr CreateDevRdmaDataOperator(uint32_t rankId, const transport::TransManagerPtr &tm);
     static DataOperatorPtr CreateHostRdmaDataOperator(uint32_t rankId, const transport::TransManagerPtr &tm);
     static DataOperatorPtr CreateHostShmDataOperator(uint32_t rankId);
+    static DataOperatorPtr CreateNvmeDataOperator(uint32_t rankId);
 };
 } // namespace mf
 } // namespace ock

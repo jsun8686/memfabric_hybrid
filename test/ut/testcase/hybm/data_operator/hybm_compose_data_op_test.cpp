@@ -113,6 +113,7 @@ public:
     CreateDevRdmaDataOperator(uint32_t rankId, const std::shared_ptr<ock::mf::transport::TransportManager> &tm);
     static std::shared_ptr<ock::mf::DataOperator>
     CreateHostRdmaDataOperator(uint32_t rankId, const std::shared_ptr<ock::mf::transport::TransportManager> &tm);
+    static std::shared_ptr<ock::mf::DataOperator> CreateNvmeDataOperator(uint32_t rankId);
 
 protected:
     uint32_t OpOr()
@@ -131,6 +132,7 @@ protected:
     static std::shared_ptr<DataOperatorMock> sdmaDataOpMock;
     static std::shared_ptr<DataOperatorMock> devRdmaDataOpMock;
     static std::shared_ptr<DataOperatorMock> hostRdmaDataOpMock;
+    static std::shared_ptr<DataOperatorMock> nvmeDataOpMock;
 };
 
 std::shared_ptr<DataOperatorMock> HybmComposeDataOpTest::sdmaDataOpMock = std::make_shared<DataOperatorMock>("sdma");
@@ -138,12 +140,14 @@ std::shared_ptr<DataOperatorMock> HybmComposeDataOpTest::devRdmaDataOpMock =
     std::make_shared<DataOperatorMock>("dev_rdma");
 std::shared_ptr<DataOperatorMock> HybmComposeDataOpTest::hostRdmaDataOpMock =
     std::make_shared<DataOperatorMock>("host_rdma");
+std::shared_ptr<DataOperatorMock> HybmComposeDataOpTest::nvmeDataOpMock = std::make_shared<DataOperatorMock>("nvme");
 
 void HybmComposeDataOpTest::SetUp()
 {
     sdmaDataOpMock->Reset();
     devRdmaDataOpMock->Reset();
     hostRdmaDataOpMock->Reset();
+    nvmeDataOpMock->Reset();
 }
 
 void HybmComposeDataOpTest::TearDown()
@@ -152,6 +156,7 @@ void HybmComposeDataOpTest::TearDown()
     sdmaDataOpMock->Reset();
     devRdmaDataOpMock->Reset();
     hostRdmaDataOpMock->Reset();
+    nvmeDataOpMock->Reset();
 }
 
 std::shared_ptr<ock::mf::DataOperator> HybmComposeDataOpTest::CreateSdmaDataOperator()
@@ -171,6 +176,11 @@ HybmComposeDataOpTest::CreateHostRdmaDataOperator(uint32_t rankId,
                                                   const std::shared_ptr<ock::mf::transport::TransportManager> &tm)
 {
     return hostRdmaDataOpMock;
+}
+
+std::shared_ptr<ock::mf::DataOperator> HybmComposeDataOpTest::CreateNvmeDataOperator(uint32_t rankId)
+{
+    return nvmeDataOpMock;
 }
 
 TEST_F(HybmComposeDataOpTest, initialize_with_bm_type_ai_core)
@@ -359,6 +369,59 @@ TEST_F(HybmComposeDataOpTest, initialize_with_data_op_all_host_rdma_failed)
     ASSERT_EQ(0UL, hostRdmaDataOpMock->uninitializeCount);
     ASSERT_EQ(0UL, devRdmaDataOpMock->uninitializeCount);
     ASSERT_EQ(0UL, hostRdmaDataOpMock->uninitializeCount);
+}
+
+TEST_F(HybmComposeDataOpTest, initialize_with_nvme_op)
+{
+    hybm_options options{};
+    options.bmType = HYBM_TYPE_HOST_INITIATE;
+    options.bmDataOpType = static_cast<hybm_data_op_type>(OpOr(HYBM_DOP_TYPE_NVME, HYBM_DOP_TYPE_HOST_RDMA));
+    auto tag = std::make_shared<ock::mf::HybmEntityTagInfo>();
+    tag->TagInfoInit(options);
+
+    MOCKER(ock::mf::DataOperatorFactory::CreateNvmeDataOperator).stubs().will(invoke(CreateNvmeDataOperator));
+    MOCKER(ock::mf::DataOperatorFactory::CreateHostRdmaDataOperator).stubs().will(invoke(CreateHostRdmaDataOperator));
+
+    ock::mf::HostComposeDataOp dataOp(options, nullptr, tag);
+    auto ret = dataOp.Initialize();
+    ASSERT_EQ(BM_OK, ret);
+    ASSERT_EQ(1UL, nvmeDataOpMock->initializeCount);
+    ASSERT_EQ(1UL, hostRdmaDataOpMock->initializeCount);
+
+    dataOp.UnInitialize();
+    ASSERT_EQ(1UL, nvmeDataOpMock->uninitializeCount);
+    ASSERT_EQ(1UL, hostRdmaDataOpMock->uninitializeCount);
+}
+
+TEST_F(HybmComposeDataOpTest, data_copy_nvme_direction_uses_nvme_op_first)
+{
+    hybm_options options{};
+    options.bmType = HYBM_TYPE_HOST_INITIATE;
+    options.bmDataOpType = static_cast<hybm_data_op_type>(OpOr(HYBM_DOP_TYPE_NVME, HYBM_DOP_TYPE_HOST_RDMA));
+    auto tag = std::make_shared<ock::mf::HybmEntityTagInfo>();
+    tag->TagInfoInit(options);
+
+    union {
+        uint32_t (ock::mf::HybmEntityTagInfo::*getRank2RankOpType)(uint32_t rankId1, uint32_t rankId2);
+        uint32_t (*mocker)(ock::mf::HybmEntityTagInfo *, uint32_t, uint32_t);
+    } u;
+    u.getRank2RankOpType = &ock::mf::HybmEntityTagInfo::GetRank2RankOpType;
+    MOCKER(u.mocker).stubs().will(returnValue(OpOr(HYBM_DOP_TYPE_NVME, HYBM_DOP_TYPE_HOST_RDMA)));
+    MOCKER(ock::mf::DataOperatorFactory::CreateNvmeDataOperator).stubs().will(invoke(CreateNvmeDataOperator));
+    MOCKER(ock::mf::DataOperatorFactory::CreateHostRdmaDataOperator).stubs().will(invoke(CreateHostRdmaDataOperator));
+
+    ock::mf::HostComposeDataOp dataOp(options, nullptr, tag);
+    auto ret = dataOp.Initialize();
+    ASSERT_EQ(BM_OK, ret);
+
+    hybm_copy_params copyParams{};
+    ock::mf::ExtOptions extOptions{};
+    ret = dataOp.DataCopy(copyParams, HYBM_LOCAL_HOST_TO_GLOBAL_NVME, extOptions);
+    ASSERT_EQ(BM_OK, ret);
+    ASSERT_EQ(1UL, nvmeDataOpMock->dataCopyCount);
+    ASSERT_EQ(0UL, hostRdmaDataOpMock->dataCopyCount);
+
+    dataOp.UnInitialize();
 }
 
 TEST_F(HybmComposeDataOpTest, data_copy_sdma_success)

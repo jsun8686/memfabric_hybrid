@@ -17,6 +17,7 @@
 #include "dl_hcom_api.h"
 #include "dl_rt_api.h"
 #include "dl_op_api.h"
+#include "dl_nvme_api.h"
 #include "dl_hybm_copy_extend.h"
 
 namespace ock {
@@ -87,6 +88,12 @@ Result DlApi::LoadExtendLibrary(DlApiExtendLibraryType libraryType)
 
     if (libraryType == DlApiExtendLibraryType::DL_EXT_LIB_HOST_RDMA) {
         return DlHcomApi::LoadLibrary();
+    }
+
+    /* optional library: the nvme data operator also lazy-loads on first IO, this entry
+     * only exists for callers that want to preload and fail early */
+    if (libraryType == DlApiExtendLibraryType::DL_EXT_LIB_NVME) {
+        return DlNvmeApi::LoadLibrary();
     }
 
     return BM_OK;

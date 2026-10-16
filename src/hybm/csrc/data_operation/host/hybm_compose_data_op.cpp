@@ -62,6 +62,16 @@ Result HostComposeDataOp::Initialize() noexcept
         }
     }
 
+    if (options_.bmDataOpType & HYBM_DOP_TYPE_NVME) {
+        nvmeDataOperator_ = DataOperatorFactory::CreateNvmeDataOperator(options_.rankId);
+        auto ret = nvmeDataOperator_->Initialize();
+        if (ret != BM_OK) {
+            BM_LOG_ERROR("NVMe data operator init failed, ret:" << ret);
+            nvmeDataOperator_ = nullptr;
+            return ret;
+        }
+    }
+
     if (options_.bmDataOpType & HYBM_DOP_TYPE_HOST_SHM) {
         hostRdmaDataOperator_ = DataOperatorFactory::CreateHostShmDataOperator(options_.rankId);
         auto ret = hostRdmaDataOperator_->Initialize();
@@ -79,6 +89,10 @@ Result HostComposeDataOp::Initialize() noexcept
 
 void HostComposeDataOp::UnInitialize() noexcept
 {
+    if (nvmeDataOperator_ != nullptr) {
+        nvmeDataOperator_->UnInitialize();
+        nvmeDataOperator_ = nullptr;
+    }
     if (hostRdmaDataOperator_ != nullptr) {
         hostRdmaDataOperator_->UnInitialize();
         hostRdmaDataOperator_ = nullptr;
@@ -240,6 +254,12 @@ HostComposeDataOp::DataOperators HostComposeDataOp::GetPrioritedDataOperators(co
 {
     HostComposeDataOp::DataOperators dataOperators;
     auto opTypes = entityTagInfo_->GetRank2RankOpType(options.srcRankId, options.destRankId);
+    /* nvme first: only it accepts NVMe directions, and for other directions it rejects
+     * fast without touching the spdk loader */
+    if (nvmeDataOperator_ != nullptr && (opTypes & static_cast<uint32_t>(HYBM_DOP_TYPE_NVME)) != 0U) {
+        dataOperators.emplace_back(HYBM_DOP_TYPE_NVME, nvmeDataOperator_);
+    }
+
     if (sdmaDataOperator_ != nullptr && (opTypes & static_cast<uint32_t>(HYBM_DOP_TYPE_SDMA)) != 0U) {
         dataOperators.emplace_back(HYBM_DOP_TYPE_SDMA, sdmaDataOperator_);
     }

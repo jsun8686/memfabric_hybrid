@@ -21,6 +21,25 @@
 | `ACCLINK_CHECK_PERIOD_HOURS` | 24 | 控制路径SSL证书定期检查周期（小时），有效范围1-168。 |
 | `ACCLINK_CERT_CHECK_AHEAD_DAYS` | 30 | 证书提前检查天数，在证书过期前多少天开始告警，有效范围1-365。 |
 
+## NVMe 第三介质环境变量
+
+以下变量仅在启用 NVMe SSD 池（`SMEMRA_DATA_OP_NVME` / `HYBM_DOP_TYPE_NVME`）时读取，其余介质路径完全不感知：
+
+| 环境变量名 | 默认值 | 说明 |
+|-----------|-------|------|
+| `MF_NVME_NQN` | 按实体自动生成 | 本节点 nvmf target 的子系统 NQN（贡献侧管理面，配置于 `hybm_nvme_segment`）。 |
+| `MF_NVME_TRADDR` | 第一个非 lo 网卡 IP | initiator 连接使用的监听 IP 字符串。 |
+| `MF_NVME_TRSVCID` | 4420 | nvmf target 监听端口。 |
+| `MF_NVME_RPC_SOCK` | `/var/tmp/spdk.sock` | SPDK JSON-RPC unix socket 路径（贡献侧管理面）。 |
+| `MF_NVME_BASE_BDEV` | `Nvme0n1` | NVMe 池底层的 bdev 名。 |
+| `MF_NVME_LBA_BASE` | 0 | 本贡献者可分配的起始 LBA；多 FAR 进程共享同一节点 target 时需配置不相交区间。 |
+| `MF_NVME_EXTENT_GRAN` | 1G | LBA extent 分配粒度（字节，最小 2M，需 2M 对齐）。 |
+| `MF_NVME_SPDK_NVME_LIB` | `libspdk_nvme.so` | NEAR 侧 dlopen 的 SPDK nvme initiator 库名（数据面，配置于 `hybm_data_op_nvme`）。 |
+| `MF_NVME_SPDK_ENV_LIB` | `libspdk_env_dpdk.so` | SPDK env 库名（提供 DMA 内存分配器）。 |
+| `MF_NVME_BUF_MB` | 4 | 数据面 staging 缓冲单块大小（MB，1-1024），大块拷贝按此分片。 |
+| `MF_NVME_BUF_SLOTS` | 4 | staging 缓冲池深度（1-64），超出部分临时分配用后即释放。 |
+| `MF_NVME_QPAIRS` | 2 | 每个远端控制器的 IO qpair 数（1-16），多 qpair 轮询分发批量 IO。 |
+
 ## 构建时环境变量
 
 以下环境变量在编译构建时读取，用于控制构建行为：
