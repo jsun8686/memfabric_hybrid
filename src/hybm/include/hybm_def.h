@@ -76,6 +76,7 @@ typedef enum {
     HYBM_DOP_TYPE_HOST_TCP = 1U << 4,
     HYBM_DOP_TYPE_HOST_URMA = 1U << 5,
     HYBM_DOP_TYPE_HOST_SHM = 1U << 6, /* same-node host shared memory (no network transport) */
+    HYBM_DOP_TYPE_NVME = 1U << 7,     /* remote NVMe SSD blocks served over NVMe-oF (host initiator) */
 
     HYBM_DOP_TYPE_BUTT
 } hybm_data_op_type;
@@ -83,6 +84,8 @@ typedef enum {
 typedef enum {
     HYBM_MEM_TYPE_DEVICE = 1U << 0,
     HYBM_MEM_TYPE_HOST = 1U << 1,
+    HYBM_MEM_TYPE_NVME = 1U << 2, /* block media: GVA range maps to a remote NVMe-oF LBA extent,
+                                     never materialized, never registered as an MR */
 
     HYBM_MEM_TYPE_BUTT
 } hybm_mem_type;
@@ -113,6 +116,22 @@ typedef struct {
     uint32_t ownerRank;      /* rank which contributes the memory of the range */
 } hybm_va_range;
 typedef hybm_va_range hybm_va_range_t;
+
+/* NVMe extent detail of a gva inside an NVMe-media block (see hybm_query_nvme_extent);
+ * lba fields are in 512B units, the nvmf identity addresses the owner's NVMe-oF target */
+typedef struct {
+    uint64_t gvaBase;        /* base gva of the extent */
+    uint64_t size;           /* VA size of the extent in bytes */
+    uint32_t ownerRank;      /* rank which contributes (owns) the extent */
+    uint32_t blockId;        /* opaque per-pool extent id */
+    uint32_t nsid;           /* namespace id on the owner's nvmf target */
+    uint32_t trsvcid;        /* NVMe-oF listener port of the owner's nvmf target */
+    uint64_t lbaBase;        /* first LBA of the extent, 512B units */
+    uint64_t lbaLen;         /* extent length in LBAs (512B units) */
+    char nqn[64];            /* subsystem NQN of the owner's nvmf target */
+    char traddr[46];         /* listener address (IP string) of the owner's nvmf target */
+} hybm_nvme_extent_info;
+typedef hybm_nvme_extent_info hybm_nvme_extent_info_t;
 
 typedef struct {
     bool tlsEnable;
@@ -145,6 +164,10 @@ typedef struct {
     char tagOpInfo[256];
     hybm_tls_config tlsOption;
     int dramShmFd;
+    /* NVMe third media (append-only tail, value-init callers keep 0 = no NVMe window):
+     * the NVMe band is VA-reserved only, blocks are LBA extents on a remote nvmf target */
+    uint64_t maxNvmeSize;  /* per-rank NVMe window slot VA reservation, 0 = none */
+    uint64_t nvmeVASpace;  /* initial NVMe block committed at entity create, 0 on non-contributors */
 } hybm_options;
 
 typedef enum {
@@ -165,6 +188,12 @@ typedef enum {
     HYBM_GLOBAL_DEVICE_TO_LOCAL_DEVICE = 11,
 
     HYBM_DATA_COPY_DIRECTION_AUTO = 12,
+    /* NVMe-media endpoints (value-stable append: existing values 0..12 keep their ABI meaning,
+     * so binaries compiled against the old table stay link-compatible) */
+    HYBM_LOCAL_HOST_TO_GLOBAL_NVME = 13,
+    HYBM_GLOBAL_NVME_TO_LOCAL_HOST = 14,
+    HYBM_LOCAL_DEVICE_TO_GLOBAL_NVME = 15,
+    HYBM_GLOBAL_NVME_TO_LOCAL_DEVICE = 16,
     HYBM_DATA_COPY_DIRECTION_BUTT
 } hybm_data_copy_direction;
 

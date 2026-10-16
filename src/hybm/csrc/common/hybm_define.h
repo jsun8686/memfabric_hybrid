@@ -71,10 +71,12 @@ constexpr uint64_t HBM_SLICE_EXPORT_INFO_MAGIC = 0xAABB1234FFFFEE01UL;
 constexpr uint64_t DRAM_SLICE_EXPORT_INFO_MAGIC = 0xAABB1234FFFFEE02UL;
 constexpr uint64_t VMM_BASE_HBM_SLICE_EXPORT_INFO_MAGIC = 0xAABB1234FFFFEE03UL;
 constexpr uint64_t VMM_BASE_DRAM_SLICE_EXPORT_INFO_MAGIC = 0xAABB1234FFFFEE04UL;
+constexpr uint64_t NVME_SLICE_EXPORT_INFO_MAGIC = 0xAABB1234FFFFEE05UL;
 constexpr uint64_t EXPORT_INFO_VERSION = 0x1UL;
 
 constexpr uint16_t SEGMENT_TYPE_VMM = 0x1U;
 constexpr uint16_t SEGMENT_TYPE_USER_DEV = 0x2U;
+constexpr uint16_t SEGMENT_TYPE_NVME = 0x4U;
 constexpr uint16_t SEGMENT_TYPE_DEFAULT = 0x10U;
 constexpr uint16_t SEGMENT_TYPE_OFFSET = 8U;
 constexpr uint16_t UNIFIED_EXCHANGE_SEG_INFO_SIZE = 192U; /* all exchange info padding to same size */
@@ -82,6 +84,11 @@ constexpr uint16_t UNIFIED_EXCHANGE_SEG_INFO_SIZE = 192U; /* all exchange info p
 inline bool IsDramSlice(uint64_t magic)
 {
     return magic == DRAM_SLICE_EXPORT_INFO_MAGIC || magic == VMM_BASE_DRAM_SLICE_EXPORT_INFO_MAGIC;
+}
+
+inline bool IsNvmeSlice(uint64_t magic)
+{
+    return magic == NVME_SLICE_EXPORT_INFO_MAGIC;
 }
 
 inline bool IsArmArch()

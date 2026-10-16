@@ -91,23 +91,24 @@ bool SmemRallocMasterService::IsRunning() const
     return running_;
 }
 
-uint64_t SmemRallocMasterService::SumInflight(const std::vector<InflightGrant> &inflight, bool deviceMedia)
+uint64_t SmemRallocMasterService::SumInflight(const std::vector<InflightGrant> &inflight,
+                                              smem_ralloc_mem_type media)
 {
     uint64_t sum = 0;
     for (const auto &grant : inflight) {
-        if (grant.deviceMedia == deviceMedia) {
+        if (grant.media == media) {
             sum += grant.size;
         }
     }
     return sum;
 }
 
-void SmemRallocMasterService::ShrinkInflight(std::vector<InflightGrant> &inflight, bool deviceMedia,
+void SmemRallocMasterService::ShrinkInflight(std::vector<InflightGrant> &inflight, smem_ralloc_mem_type media,
                                              uint64_t keepSum)
 {
-    auto sum = SumInflight(inflight, deviceMedia);
+    auto sum = SumInflight(inflight, media);
     for (auto grant = inflight.begin(); grant != inflight.end() && sum > keepSum;) {
-        if (grant->deviceMedia != deviceMedia) {
+        if (grant->media != media) {
             ++grant;
             continue;
         }
@@ -141,14 +142,21 @@ Result SmemRallocMasterService::OnRegister(SmemRallocRpcMsg &msg)
              * grants have landed on the FAR, drop them; grants still inside the executor
              * keep their reservation, a shrinking report (pool reaped) keeps them all */
             candidate.inflight = std::move(it->second.inflight);
-            const uint64_t hostInflight = SumInflight(candidate.inflight, false);
+            const uint64_t hostInflight = SumInflight(candidate.inflight, SMEM_RALLOC_MEM_TYPE_HOST);
             const uint64_t hostConfirmed = msg.size > it->second.committedBytes
                                                ? msg.size - it->second.committedBytes : 0U;
-            ShrinkInflight(candidate.inflight, false, hostInflight - std::min(hostConfirmed, hostInflight));
-            const uint64_t devInflight = SumInflight(candidate.inflight, true);
+            ShrinkInflight(candidate.inflight, SMEM_RALLOC_MEM_TYPE_HOST,
+                           hostInflight - std::min(hostConfirmed, hostInflight));
+            const uint64_t devInflight = SumInflight(candidate.inflight, SMEM_RALLOC_MEM_TYPE_DEVICE);
             const uint64_t devConfirmed = msg.deviceCommittedBytes > it->second.deviceCommittedBytes
                                               ? msg.deviceCommittedBytes - it->second.deviceCommittedBytes : 0U;
-            ShrinkInflight(candidate.inflight, true, devInflight - std::min(devConfirmed, devInflight));
+            ShrinkInflight(candidate.inflight, SMEM_RALLOC_MEM_TYPE_DEVICE,
+                           devInflight - std::min(devConfirmed, devInflight));
+            const uint64_t nvmeInflight = SumInflight(candidate.inflight, SMEM_RALLOC_MEM_TYPE_NVME);
+            const uint64_t nvmeConfirmed = msg.nvmeCommittedBytes > it->second.nvmeCommittedBytes
+                                               ? msg.nvmeCommittedBytes - it->second.nvmeCommittedBytes : 0U;
+            ShrinkInflight(candidate.inflight, SMEM_RALLOC_MEM_TYPE_NVME,
+                           nvmeInflight - std::min(nvmeConfirmed, nvmeInflight));
             it->second = std::move(candidate);
         } else {
             candidates_.emplace(msg.nodeRank, std::move(candidate));
@@ -157,14 +165,16 @@ Result SmemRallocMasterService::OnRegister(SmemRallocRpcMsg &msg)
 
     SM_LOG_DEBUG("candidate registered, rank: " << msg.nodeRank << " endpoint: " << msg.nodeIp << ":"
                                                  << msg.nodePort << " committed: " << msg.size
-                                                 << " deviceCommitted: " << msg.deviceCommittedBytes);
+                                                 << " deviceCommitted: " << msg.deviceCommittedBytes
+                                                 << " nvmeCommitted: " << msg.nvmeCommittedBytes);
     return SM_OK;
 }
 
 Result SmemRallocMasterService::OnPlacement(SmemRallocRpcMsg &msg)
 {
     SM_VALIDATE_RETURN(msg.size != 0, "placement size is 0", SM_INVALID_PARAM);
-    SM_VALIDATE_RETURN(msg.memType == SMEM_RALLOC_MEM_TYPE_HOST || msg.memType == SMEM_RALLOC_MEM_TYPE_DEVICE,
+    SM_VALIDATE_RETURN(msg.memType == SMEM_RALLOC_MEM_TYPE_HOST || msg.memType == SMEM_RALLOC_MEM_TYPE_DEVICE ||
+                           msg.memType == SMEM_RALLOC_MEM_TYPE_NVME,
         "placement with invalid mem type", SM_INVALID_PARAM);
 
     uint64_t chosenLoad = UINT64_MAX;
@@ -187,8 +197,10 @@ Result SmemRallocMasterService::OnPlacement(SmemRallocRpcMsg &msg)
          * (optimistic in-flight add, reconciled by the next REGISTER or released by
          * GRANT_FAIL): concurrent placements no longer stack on a stale view, and the
          * map-order tie-break only decides genuinely equal loads */
-        const bool deviceMedia = msg.memType == SMEM_RALLOC_MEM_TYPE_DEVICE;
-        const uint64_t window = deviceMedia ? msg.maxHbmSize : msg.maxDramSize;
+        const auto media = static_cast<smem_ralloc_mem_type>(msg.memType);
+        const uint64_t window = media == SMEM_RALLOC_MEM_TYPE_DEVICE ? msg.maxHbmSize
+            : (media == SMEM_RALLOC_MEM_TYPE_NVME                   ? msg.maxNvmeSize
+                                                                    : msg.maxDramSize);
         uint32_t chosen = SMEM_RALLOC_INVALID_RANK;
         uint32_t alive = 0;
         for (auto &it : candidates_) {
@@ -204,8 +216,10 @@ Result SmemRallocMasterService::OnPlacement(SmemRallocRpcMsg &msg)
                     ++grant;
                 }
             }
-            auto load = (deviceMedia ? it.second.deviceCommittedBytes : it.second.committedBytes) +
-                        SumInflight(it.second.inflight, deviceMedia);
+            auto committed = media == SMEM_RALLOC_MEM_TYPE_DEVICE ? it.second.deviceCommittedBytes
+                : (media == SMEM_RALLOC_MEM_TYPE_NVME             ? it.second.nvmeCommittedBytes
+                                                                  : it.second.committedBytes);
+            auto load = committed + SumInflight(it.second.inflight, media);
             /* capacity filter mirroring the executor window guard: a full contributor is
              * skipped instead of granted and failed; window == 0 (requester did not fill
              * the field, old binary) disables the filter */
@@ -237,7 +251,7 @@ Result SmemRallocMasterService::OnPlacement(SmemRallocRpcMsg &msg)
         (void)strncpy(msg.nodeIp, it->second.ep.ip, sizeof(msg.nodeIp) - 1);
         /* reserve the grant optimistically so placements granted before the next report
          * see it in the load above */
-        it->second.inflight.push_back(InflightGrant{msg.size, deviceMedia, now});
+        it->second.inflight.push_back(InflightGrant{msg.size, media, now});
     }
 
     SM_LOG_INFO("placement granted, requester: " << msg.reqRank << " memType: " << msg.memType
@@ -250,10 +264,11 @@ Result SmemRallocMasterService::OnPlacement(SmemRallocRpcMsg &msg)
 Result SmemRallocMasterService::OnGrantFail(SmemRallocRpcMsg &msg)
 {
     SM_VALIDATE_RETURN(msg.size != 0, "grant failure with size 0", SM_INVALID_PARAM);
-    SM_VALIDATE_RETURN(msg.memType == SMEM_RALLOC_MEM_TYPE_HOST || msg.memType == SMEM_RALLOC_MEM_TYPE_DEVICE,
+    SM_VALIDATE_RETURN(msg.memType == SMEM_RALLOC_MEM_TYPE_HOST || msg.memType == SMEM_RALLOC_MEM_TYPE_DEVICE ||
+                           msg.memType == SMEM_RALLOC_MEM_TYPE_NVME,
         "grant failure with invalid mem type", SM_INVALID_PARAM);
 
-    const bool deviceMedia = msg.memType == SMEM_RALLOC_MEM_TYPE_DEVICE;
+    const auto media = static_cast<smem_ralloc_mem_type>(msg.memType);
     std::lock_guard<std::mutex> guard(mutex_);
     auto it = candidates_.find(msg.nodeRank);
     if (it == candidates_.end()) {
@@ -261,7 +276,7 @@ Result SmemRallocMasterService::OnGrantFail(SmemRallocRpcMsg &msg)
         return SM_OK;
     }
     for (auto grant = it->second.inflight.begin(); grant != it->second.inflight.end(); ++grant) {
-        if (grant->size == msg.size && grant->deviceMedia == deviceMedia) {
+        if (grant->size == msg.size && grant->media == media) {
             it->second.inflight.erase(grant);
             SM_LOG_INFO("in-flight grant released, rank: " << msg.nodeRank << " size: " << msg.size
                                                            << " memType: " << msg.memType);

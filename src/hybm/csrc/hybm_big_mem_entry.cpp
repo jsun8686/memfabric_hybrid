@@ -14,6 +14,7 @@
 #include "hybm_big_mem.h"
 #include "dl_hal_api.h"
 #include "hybm_ex_info_transfer.h"
+#include "hybm_nvme_segment.h"
 #include "hybm_va_manager.h"
 #include "hybm_define.h"
 
@@ -156,6 +157,34 @@ HYBM_API hybm_mem_slice_t hybm_register_local_memory(hybm_entity_t e, const void
     }
 
     return slice;
+}
+
+HYBM_API int32_t hybm_query_nvme_extent(hybm_entity_t e, uint64_t gva, uint64_t size,
+                                        hybm_nvme_extent_info *info)
+{
+    (void)e; /* the extent registry is process-wide, the entity handle is not dereferenced */
+    BM_ASSERT_RETURN(info != nullptr, BM_INVALID_PARAM);
+    if (size == 0) {
+        return BM_INVALID_PARAM;
+    }
+
+    HybmNvmeExtent extent;
+    if (!HybmNvmeExtentRegistry::GetInstance().Lookup(gva, size, extent)) {
+        return BM_ERROR;
+    }
+    info->gvaBase = extent.gvaBase;
+    info->size = extent.size;
+    info->ownerRank = extent.ownerRank;
+    info->blockId = extent.blockId;
+    info->nsid = extent.nsid;
+    info->trsvcid = extent.trsvcid;
+    info->lbaBase = extent.lbaBase;
+    info->lbaLen = extent.lbaLen;
+    (void)memset(info->nqn, 0, sizeof(info->nqn));
+    (void)memset(info->traddr, 0, sizeof(info->traddr));
+    (void)memcpy(info->nqn, extent.nqn, sizeof(info->nqn) - 1);
+    (void)memcpy(info->traddr, extent.traddr, sizeof(info->traddr) - 1);
+    return BM_OK;
 }
 
 HYBM_API int32_t hybm_export(hybm_entity_t e, hybm_mem_slice_t slice, uint32_t flags, hybm_exchange_info *exInfo)

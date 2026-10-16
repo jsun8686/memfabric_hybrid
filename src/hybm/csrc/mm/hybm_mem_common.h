@@ -37,6 +37,8 @@ enum MemSegType : int32_t {
     HYBM_MST_HBM = 0,
     HYBM_MST_DRAM,
     HYBM_MST_HBM_USER,
+    HYBM_MST_NVME, /* block media: LBA extents on the local nvmf target, VA band only, no slice
+                      materialization, no transport MR */
 
     HYBM_MST_BUTT
 };

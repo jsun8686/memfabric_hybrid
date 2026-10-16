@@ -44,14 +44,20 @@ Result SmemRallocExecutor::OnJoinAlloc(SmemRallocRpcMsg &msg)
     SM_VALIDATE_RETURN(msg.size % SMEM_RALLOC_SIZE_ALIGNMENT == 0, "join alloc size is not 2M aligned",
                        SM_INVALID_PARAM);
     const bool deviceMedia = msg.memType == static_cast<uint32_t>(SMEM_RALLOC_MEM_TYPE_DEVICE);
+    const bool nvmeMedia = msg.memType == static_cast<uint32_t>(SMEM_RALLOC_MEM_TYPE_NVME);
     if (deviceMedia) {
         SM_VALIDATE_RETURN(msg.maxHbmSize != 0, "join alloc maxHbmSize is 0", SM_INVALID_PARAM);
         SM_VALIDATE_RETURN(msg.size <= msg.maxHbmSize, "join alloc size exceeds maxHbmSize", SM_INVALID_PARAM);
         SM_VALIDATE_RETURN(msg.size <= SMEM_LOCAL_HBM_SIZE_MAX, "join alloc size exceeds local hbm max",
                            SM_INVALID_PARAM);
+    } else if (nvmeMedia) {
+        SM_VALIDATE_RETURN(msg.maxNvmeSize != 0, "join alloc maxNvmeSize is 0", SM_INVALID_PARAM);
+        SM_VALIDATE_RETURN(msg.size <= msg.maxNvmeSize, "join alloc size exceeds maxNvmeSize", SM_INVALID_PARAM);
+        SM_VALIDATE_RETURN(msg.size <= SMEM_LOCAL_NVME_SIZE_MAX, "join alloc size exceeds local nvme max",
+                           SM_INVALID_PARAM);
     } else {
         SM_VALIDATE_RETURN(msg.memType == static_cast<uint32_t>(SMEM_RALLOC_MEM_TYPE_HOST),
-                           "join alloc mem type is neither HOST nor DEVICE", SM_NOT_SUPPORTED);
+                           "join alloc mem type is neither HOST, DEVICE nor NVME", SM_NOT_SUPPORTED);
         SM_VALIDATE_RETURN(msg.maxDramSize != 0, "join alloc maxDramSize is 0", SM_INVALID_PARAM);
         SM_VALIDATE_RETURN(msg.size <= msg.maxDramSize, "join alloc size exceeds maxDramSize", SM_INVALID_PARAM);
         SM_VALIDATE_RETURN(msg.size <= SMEM_LOCAL_DRAM_SIZE_MAX, "join alloc size exceeds local dram max",
@@ -96,15 +102,18 @@ Result SmemRallocExecutor::OnJoinAlloc(SmemRallocRpcMsg &msg)
         auto wantBt = ((msg.dataOpType & SMEMRA_DATA_OP_DEVICE_SCHEDULE) != 0U) ? HYBM_TYPE_AI_CORE_INITIATE
                                                                                 : HYBM_TYPE_HOST_INITIATE;
         bool mismatch = (cur.maxDRAMSize != msg.maxDramSize) || (cur.maxHBMSize != msg.maxHbmSize) ||
+                        (cur.maxNvmeSize != msg.maxNvmeSize) ||
                         (cur.bmDataOpType != wantOp) || (cur.bmType != wantBt) ||
                         (cur.enable56BitsGva != (msg.enable56BitsGva != 0U));
         if (mismatch) {
             if (existEntry->PoolEmpty()) {
                 SM_LOG_WARN("join alloc pool-definition mismatch on empty pool: " << msg.poolId
                               << ", recycling the leftover entry (cur dram:" << cur.maxDRAMSize
-                              << " hbm:" << cur.maxHBMSize << " op:" << cur.bmDataOpType
+                              << " hbm:" << cur.maxHBMSize << " nvme:" << cur.maxNvmeSize
+                              << " op:" << cur.bmDataOpType
                               << " 56bits:" << cur.enable56BitsGva << ", want dram:" << msg.maxDramSize
-                              << " hbm:" << msg.maxHbmSize << " op:" << wantOp
+                              << " hbm:" << msg.maxHbmSize << " nvme:" << msg.maxNvmeSize
+                              << " op:" << wantOp
                               << " 56bits:" << (msg.enable56BitsGva != 0U) << ")");
                 existEntry->UnInitialize();
                 (void)manager.RemoveEntryByPtr(reinterpret_cast<uintptr_t>(existEntry.Get()));
@@ -158,7 +167,7 @@ Result SmemRallocExecutor::OnJoinAlloc(SmemRallocRpcMsg &msg)
         }
         options.bmType = HYBM_TYPE_AI_CORE_INITIATE;
     }
-    options.memType = SmemRallocHelper::TransHybmMemType(msg.maxDramSize, msg.maxHbmSize);
+    options.memType = SmemRallocHelper::TransHybmMemType(msg.maxDramSize, msg.maxHbmSize, msg.maxNvmeSize);
     options.bmDataOpType = SmemRallocHelper::TransHybmDataOpType(
         static_cast<smem_ralloc_data_op_type>(msg.dataOpType));
 #if !defined(ASCEND_NPU)
@@ -173,9 +182,11 @@ Result SmemRallocExecutor::OnJoinAlloc(SmemRallocRpcMsg &msg)
     options.devId = manager.GetDeviceId();
     options.maxHBMSize = msg.maxHbmSize;
     options.maxDRAMSize = msg.maxDramSize;
-    /* X commits the initial block of the requested media, the other window stays reserved-only */
+    /* X commits the initial block of the requested media, the other windows stay reserved-only */
     options.deviceVASpace = deviceMedia ? msg.size : 0;
-    options.hostVASpace = deviceMedia ? 0 : msg.size;
+    options.hostVASpace = (deviceMedia || nvmeMedia) ? 0 : msg.size;
+    options.maxNvmeSize = msg.maxNvmeSize;
+    options.nvmeVASpace = nvmeMedia ? msg.size : 0;
     options.role = HYBM_ROLE_PEER;
     options.flags = msg.flags;
     options.enable56BitsGva = msg.enable56BitsGva;

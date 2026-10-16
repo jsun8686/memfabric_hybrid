@@ -11,6 +11,7 @@
  */
 #include <algorithm>
 #include <chrono>
+#include <cstring>
 #include <limits>
 #include <thread>
 #include "smem_common_includes.h"
@@ -134,18 +135,27 @@ static inline int32_t SmemRallocDataOpCheck(smem_ralloc_data_op_type dataOpType)
 {
     constexpr uint32_t dataOpTypeMask = SMEMRA_DATA_OP_SDMA | SMEMRA_DATA_OP_HOST_RDMA | SMEMRA_DATA_OP_HOST_URMA |
                                         SMEMRA_DATA_OP_HOST_TCP | SMEMRA_DATA_OP_DEVICE_RDMA |
-                                        SMEMRA_DATA_OP_DEVICE_SCHEDULE;
+                                        SMEMRA_DATA_OP_DEVICE_SCHEDULE | SMEMRA_DATA_OP_NVME;
     return (dataOpType & dataOpTypeMask) != 0;
 }
 
 static inline bool SmemRallocCreateOptionCheck(const smem_ralloc_create_option_t *option)
 {
     SM_VALIDATE_RETURN(option != nullptr, "option is null", false);
-    SM_VALIDATE_RETURN(!(option->maxDramSize == 0UL && option->maxHbmSize == 0UL), "maxMemorySize is 0", false);
+    SM_VALIDATE_RETURN(!(option->maxDramSize == 0UL && option->maxHbmSize == 0UL && option->maxNvmeSize == 0UL),
+        "maxMemorySize is 0", false);
     SM_VALIDATE_RETURN(option->maxDramSize % SMEM_RALLOC_SIZE_ALIGNMENT == 0UL, "maxDramSize is not 2M aligned",
                        false);
     SM_VALIDATE_RETURN(option->maxHbmSize % SMEM_RALLOC_SIZE_ALIGNMENT == 0UL, "maxHbmSize is not 2M aligned",
                        false);
+    SM_VALIDATE_RETURN(option->maxNvmeSize % SMEM_RALLOC_SIZE_ALIGNMENT == 0UL, "maxNvmeSize is not 2M aligned",
+                       false);
+    if (option->maxNvmeSize > 0UL) {
+        SM_VALIDATE_RETURN(option->dataOpType & SMEMRA_DATA_OP_NVME,
+            "maxNvmeSize > 0 requires the SMEMRA_DATA_OP_NVME op bit", false);
+        SM_VALIDATE_RETURN((option->dataOpType & SMEMRA_DATA_OP_DEVICE_SCHEDULE) == 0U,
+            "NVMe media is host-initiated and cannot be combined with DEVICE_SCHEDULE", false);
+    }
     return true;
 }
 
@@ -203,7 +213,7 @@ static int32_t smem_ralloc_create_inner(uint32_t id, const smem_ralloc_create_op
     if ((option->dataOpType & SMEMRA_DATA_OP_DEVICE_SCHEDULE) != 0U) {
         options.bmType = HYBM_TYPE_AI_CORE_INITIATE;
     }
-    options.memType = SmemRallocHelper::TransHybmMemType(option->maxDramSize, option->maxHbmSize);
+    options.memType = SmemRallocHelper::TransHybmMemType(option->maxDramSize, option->maxHbmSize, option->maxNvmeSize);
     options.bmDataOpType = SmemRallocHelper::TransHybmDataOpType(option->dataOpType);
 #if !defined(ASCEND_NPU)
     if ((options.bmDataOpType & HYBM_DOP_TYPE_SDMA) || (options.bmDataOpType & HYBM_DOP_TYPE_DEVICE_RDMA)) {
@@ -219,20 +229,22 @@ static int32_t smem_ralloc_create_inner(uint32_t id, const smem_ralloc_create_op
     options.devId = manager.GetDeviceId();
     options.maxHBMSize = option->maxHbmSize; /* >0 reserves the HBM window, commit still comes from extend_* */
     options.maxDRAMSize = option->maxDramSize;
+    options.maxNvmeSize = option->maxNvmeSize; /* >0 reserves the NVMe band (VA-only, LBA extents) */
     options.deviceVASpace = 0;
     options.hostVASpace = 0; /* create never commits local memory, blocks come from extend_* only */
+    options.nvmeVASpace = 0;
     options.role = HYBM_ROLE_PEER;
     options.flags = option->flags;
 
     constexpr uint64_t SMEM_56BITS_GVA_REQUIRED_THRESHOLD = 32ULL << 40; // 32TB
-    const uint64_t totalAddrSpace =
-        (option->maxDramSize + option->maxHbmSize) * static_cast<uint64_t>(options.rankCount);
+    const uint64_t totalAddrSpace = (option->maxDramSize + option->maxHbmSize + option->maxNvmeSize) *
+                                    static_cast<uint64_t>(options.rankCount);
     if (!option->enable56BitsGva && totalAddrSpace > SMEM_56BITS_GVA_REQUIRED_THRESHOLD) {
         SM_LOG_AND_SET_LAST_ERROR_CODE(SM_INVALID_PARAM,
             "total address space (" << totalAddrSpace << " B) exceeds 32TB but enable56BitsGva is false. "
             << "Please set enable56BitsGva = true, "
             << "maxDram=" << option->maxDramSize << ", maxHbm=" << option->maxHbmSize
-            << ", rankCount=" << options.rankCount);
+            << ", maxNvme=" << option->maxNvmeSize << ", rankCount=" << options.rankCount);
         cleanup();
         return SM_INVALID_PARAM;
     }
@@ -401,8 +413,9 @@ SMEM_API int32_t smem_ralloc_extend_remote_mem(smem_ralloc_t handle, smem_ralloc
 {
     SM_VALIDATE_RETURN(handle != nullptr, "invalid param, handle is NULL", SM_INVALID_PARAM);
     SM_VALIDATE_RETURN(g_smemRallocInited, "smem ralloc not initialized yet", SM_NOT_INITIALIZED);
-    SM_VALIDATE_RETURN(memType == SMEM_RALLOC_MEM_TYPE_HOST || memType == SMEM_RALLOC_MEM_TYPE_DEVICE,
-        "invalid param, mem type must be HOST or DEVICE", SM_NOT_SUPPORTED);
+    SM_VALIDATE_RETURN(memType == SMEM_RALLOC_MEM_TYPE_HOST || memType == SMEM_RALLOC_MEM_TYPE_DEVICE ||
+                           memType == SMEM_RALLOC_MEM_TYPE_NVME,
+        "invalid param, mem type must be HOST, DEVICE or NVME", SM_NOT_SUPPORTED);
     SM_VALIDATE_RETURN(size > 0, "invalid param, size is 0", SM_INVALID_PARAM);
     SM_VALIDATE_RETURN(size % SMEM_RALLOC_SIZE_ALIGNMENT == 0, "invalid param, size is not 2M aligned",
                        SM_INVALID_PARAM);
@@ -448,6 +461,7 @@ SMEM_API int32_t smem_ralloc_extend_remote_mem(smem_ralloc_t handle, smem_ralloc
         placeMsg.memType = static_cast<uint32_t>(memType);
         placeMsg.maxDramSize = coreOptions.maxDRAMSize;
         placeMsg.maxHbmSize = coreOptions.maxHBMSize;
+        placeMsg.maxNvmeSize = coreOptions.maxNvmeSize;
         ret = rpc.SyncCall(manager.GetMasterEndpoint(), placeMsg);
         if (ret == SM_NOT_CONNECTED) {
             /* cached master endpoint may be stale (restart/failover), refresh and retry once */
@@ -483,6 +497,7 @@ SMEM_API int32_t smem_ralloc_extend_remote_mem(smem_ralloc_t handle, smem_ralloc
         allocMsg.size = size;
         allocMsg.maxDramSize = coreOptions.maxDRAMSize;
         allocMsg.maxHbmSize = coreOptions.maxHBMSize;
+        allocMsg.maxNvmeSize = coreOptions.maxNvmeSize;
         allocMsg.dataOpType = SmemRallocHelper::TransSmemDataOpType(coreOptions.bmDataOpType);
         if (coreOptions.bmType == HYBM_TYPE_AI_CORE_INITIATE) {
             allocMsg.dataOpType |= SMEMRA_DATA_OP_DEVICE_SCHEDULE;
@@ -494,7 +509,8 @@ SMEM_API int32_t smem_ralloc_extend_remote_mem(smem_ralloc_t handle, smem_ralloc
         if (ret == SM_OK && allocMsg.result == SM_OK && allocMsg.gva != 0) {
             /* 3. deliver the block info, gva is usable at once: the contributor replies strictly
              * after its GroupJoin/GroupUpdate barrier returned, by then this node has imported
-             * the block */
+             * the block (NVMe extents: the nvmf identity arrived with the same import and is
+             * already resolvable from the local extent registry) */
             if (info != nullptr) {
                 info->rankId = allocMsg.ownerRank;
                 info->gva = reinterpret_cast<void *>(allocMsg.gva);
@@ -645,6 +661,15 @@ static int32_t SmemRallocDeviceSegCheck(smem_ralloc_t handle, const void *src, c
         if (entry->IsUserRegistered(reinterpret_cast<uint64_t>(addr), len)) {
             type = DevEndType::USER;
             return SM_OK;
+        }
+        /* NVMe-media blocks carry no MR: the AICore cannot address them at all, reject before
+         * the window/range machinery reports a misleading pool error */
+        hybm_nvme_extent_info nvmeInfo;
+        if (hybm_query_nvme_extent(nullptr, reinterpret_cast<uint64_t>(addr), len, &nvmeInfo) == 0) {
+            SM_LOG_AND_SET_LAST_ERROR_CODE(SM_NOT_SUPPORTED,
+                "copy endpoint is NVMe media: the AICore-scheduled device_copy path cannot address "
+                "NVMe blocks (no MR); use smem_ralloc_copy/copy_batch or prefetch to a DRAM block");
+            return SM_NOT_SUPPORTED;
         }
         rank = entry->GetRankIdByGva(const_cast<void *>(addr));
         if (rank != UINT32_MAX) {

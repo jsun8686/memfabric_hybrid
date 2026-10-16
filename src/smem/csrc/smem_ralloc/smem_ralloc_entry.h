@@ -102,6 +102,9 @@ public:
     /* total committed bytes of the local DEVICE slot, authoritative value for master accounting */
     uint64_t GetDeviceCommittedBytes() const;
 
+    /* total committed bytes of the local NVMe slot (LBA extent bytes), for master accounting */
+    uint64_t GetNvmeCommittedBytes() const;
+
     /* true when a FAR entry has been marked pool-empty (no NEAR member left) for longer
      * than graceSec, ready for self teardown by the manager reaper */
     bool IsPoolEmptyExpired(uint64_t graceSec) const;
@@ -217,6 +220,7 @@ private:
     std::atomic<uint64_t> poolEmptySinceUs_{0};
     std::atomic<uint64_t> committedBytes_{0};
     std::atomic<uint64_t> deviceCommittedBytes_{0};
+    std::atomic<uint64_t> nvmeCommittedBytes_{0};
 
     /* first-JOIN_ALLOC bootstrap state, see MarkBootstrapRunning; guarded by its own mutex
      * because the bootstrap thread never takes mutex_ and extend waiters must not queue
@@ -266,6 +270,11 @@ inline uint64_t SmemRallocEntry::GetCommittedBytes() const
 inline uint64_t SmemRallocEntry::GetDeviceCommittedBytes() const
 {
     return deviceCommittedBytes_.load();
+}
+
+inline uint64_t SmemRallocEntry::GetNvmeCommittedBytes() const
+{
+    return nvmeCommittedBytes_.load();
 }
 
 } // namespace smem

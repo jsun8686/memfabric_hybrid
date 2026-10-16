@@ -633,12 +633,14 @@ bool SmemRallocEntryManager::ReportCommittedBytes(uint32_t retry)
     }
     uint64_t total = 0;
     uint64_t deviceTotal = 0;
+    uint64_t nvmeTotal = 0;
     {
         std::lock_guard<std::mutex> guard(entryMutex_);
         for (auto &it : entryIdMap_) {
             if (it.second != nullptr) {
                 total += it.second->GetCommittedBytes();
                 deviceTotal += it.second->GetDeviceCommittedBytes();
+                nvmeTotal += it.second->GetNvmeCommittedBytes();
             }
         }
     }
@@ -651,10 +653,12 @@ bool SmemRallocEntryManager::ReportCommittedBytes(uint32_t retry)
     (void)strncpy(msg.nodeIp, localEp.ip, sizeof(msg.nodeIp) - 1);
     msg.size = total; /* REGISTER reuses the size field as the HOST committed bytes report */
     msg.deviceCommittedBytes = deviceTotal;
+    msg.nvmeCommittedBytes = nvmeTotal;
     for (uint32_t i = 0; i <= retry; i++) {
         auto ret = rpc.SyncCall(GetMasterEndpoint(), msg);
         if (ret == SM_OK && msg.result == SM_OK) {
-            SM_LOG_DEBUG("report committed bytes ok, total: " << total << " deviceTotal: " << deviceTotal);
+            SM_LOG_DEBUG("report committed bytes ok, total: " << total << " deviceTotal: " << deviceTotal
+                                                              << " nvmeTotal: " << nvmeTotal);
             return true;
         }
         SM_LOG_WARN("report committed bytes failed, ret: " << ret << " result: " << msg.result << " retry: " << i);

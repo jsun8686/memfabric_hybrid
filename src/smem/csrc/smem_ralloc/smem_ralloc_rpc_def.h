@@ -23,7 +23,12 @@ namespace smem {
  * the same fixed-size POD struct, fields marked [resp] are meaningful in response only,
  * fields marked [register] are meaningful in SMEMRA_RPC_OP_REGISTER request only. */
 constexpr uint16_t SMEMRA_RPC_MAGIC = 0x524AU;      /* 'R','A' */
-constexpr uint16_t SMEMRA_RPC_MSG_VERSION = 2U;
+constexpr uint16_t SMEMRA_RPC_MSG_VERSION = 3U; /* v3: appended the NVMe media control fields (144 -> 160);
+                                                   * mixed-version peers are rejected by the magic/version check
+                                                   * instead of misreading the tail. The nvmf identity of an NVMe
+                                                   * extent (nqn/nsid/lba) is NOT carried here: it rides the slice
+                                                   * exchange info and lands in every member's extent registry
+                                                   * before the JOIN_ALLOC reply leaves the contributor */
 constexpr int16_t SMEMRA_RPC_MSG_TYPE = 1; /* acc_tcp route tag, valid range [MIN_MSG_TYPE, MAX_MSG_TYPE) = [0,48), 0 is taken by the tcp store */
 constexpr uint32_t SMEMRA_RPC_MASTER_KEY_MAX_LEN = 46U;
 
@@ -67,8 +72,14 @@ struct SmemRallocRpcMsg {
     uint64_t deviceCommittedBytes; /* [register] committed bytes on the DEVICE media */
     char nodeIp[SMEMRA_RPC_MASTER_KEY_MAX_LEN]; /* [resp][register] endpoint ip */
     uint8_t pad[10];
+    /* ---- v3 tail: NVMe media control fields (append-only; HOST/DEVICE-only fields above are
+     * unchanged). Only window/capacity bookkeeping lives here -- placement filter, join window
+     * guard, pool-definition consistency and the load report; never NVMe-oF details. ---- */
+    uint64_t maxNvmeSize;  /* [placement|join_alloc] NVMe window slot size of the pool, 0 = no NVMe window;
+                              in PLACEMENT 0 disables the NVMe capacity filter */
+    uint64_t nvmeCommittedBytes; /* [register] committed bytes on the NVMe media */
 };
-static_assert(sizeof(SmemRallocRpcMsg) == 144U, "smem ralloc rpc msg size must be 144");
+static_assert(sizeof(SmemRallocRpcMsg) == 160U, "smem ralloc rpc msg size must be 160 (v3: 144 + 16 NVMe control tail)");
 static_assert(sizeof(SmemRallocRpcEndpoint) == 56U, "smem ralloc rpc endpoint size must be 56 (54 bytes + 2 tail padding)");
 
 /* master endpoint published under the RA_ prefixed store, value is POD SmemRallocRpcEndpoint */

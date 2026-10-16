@@ -23,7 +23,7 @@ namespace smem {
 class SmemRallocHelper {
 public:
     /* mirrors SmemHybmHelper::TransHybmMemType: window presence decides the media bits */
-    static inline hybm_mem_type TransHybmMemType(uint64_t maxDramSize, uint64_t maxHbmSize)
+    static inline hybm_mem_type TransHybmMemType(uint64_t maxDramSize, uint64_t maxHbmSize, uint64_t maxNvmeSize = 0)
     {
         uint32_t resultMemType = 0;
         if (maxDramSize > 0) {
@@ -31,6 +31,9 @@ public:
         }
         if (maxHbmSize > 0) {
             resultMemType |= HYBM_MEM_TYPE_DEVICE;
+        }
+        if (maxNvmeSize > 0) {
+            resultMemType |= HYBM_MEM_TYPE_NVME;
         }
 
         return static_cast<hybm_mem_type>(resultMemType);
@@ -63,6 +66,10 @@ public:
             resultOpType |= HYBM_DOP_TYPE_HOST_SHM;
         }
 
+        if (smemRallocDataOpType & SMEMRA_DATA_OP_NVME) {
+            resultOpType |= HYBM_DOP_TYPE_NVME;
+        }
+
         return static_cast<hybm_data_op_type>(resultOpType);
     }
 
@@ -91,6 +98,10 @@ public:
 
         if (hybmDataOpType & HYBM_DOP_TYPE_HOST_SHM) {
             resultOpType |= SMEMRA_DATA_OP_HOST_SHM;
+        }
+
+        if (hybmDataOpType & HYBM_DOP_TYPE_NVME) {
+            resultOpType |= SMEMRA_DATA_OP_NVME;
         }
 
         return resultOpType;

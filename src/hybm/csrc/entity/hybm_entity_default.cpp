@@ -86,6 +86,10 @@ Result MemEntityDefault::InitTagManager()
         compatibleInfo << localTag << ":" << HybmEntityTagInfo::GetOpTypeStr(HYBM_DOP_TYPE_HOST_SHM) << ":" << localTag
                        << ",";
     }
+    if (options_.bmDataOpType & HYBM_DOP_TYPE_NVME) {
+        compatibleInfo << localTag << ":" << HybmEntityTagInfo::GetOpTypeStr(HYBM_DOP_TYPE_NVME) << ":" << localTag
+                       << ",";
+    }
     BM_ASSERT_LOG_AND_RETURN(tagManager_->AddTagOpInfo(compatibleInfo.str()) == BM_OK,
                              "Failed to add tagOpInfo:" << compatibleInfo.str(), BM_INVALID_PARAM);
     options_.bmDataOpType = static_cast<hybm_data_op_type>(tagManager_->GetAllOpType());
@@ -170,8 +174,18 @@ int32_t MemEntityDefault::ReserveMemorySpace() noexcept
         }
         if (dataOperator_) {
             dataOperator_->UpdateGvaSpace(HYBM_MEM_TYPE_HOST, (uint64_t)dramGva_, options_.maxDRAMSize,
-                                          options_.rankCount);
+                                           options_.rankCount);
         }
+    }
+
+    if (nvmeSegment_ != nullptr) {
+        auto ret = nvmeSegment_->ReserveMemorySpace(&nvmeGva_);
+        if (ret != BM_OK) {
+            UnReserveMemorySpace();
+            BM_LOG_ERROR("Failed to reserver NVMe memory space ret: " << ret);
+            return ret;
+        }
+        /* no UpdateGvaSpace: the NVMe band carries no transport-visible window (no MR) */
     }
 
     return BM_OK;
@@ -189,6 +203,9 @@ int32_t MemEntityDefault::UnReserveMemorySpace() noexcept
     if (dramSegment_ != nullptr) {
         dramSegment_->UnReserveMemorySpace();
     }
+    if (nvmeSegment_ != nullptr) {
+        nvmeSegment_->UnReserveMemorySpace();
+    }
     return BM_OK;
 }
 
@@ -205,7 +222,14 @@ int32_t MemEntityDefault::AllocLocalMemory(uint64_t size, hybm_mem_type mType, u
         return BM_INVALID_PARAM;
     }
 
-    auto segment = mType == HYBM_MEM_TYPE_DEVICE ? hbmSegment_ : dramSegment_;
+    std::shared_ptr<MemSegment> segment;
+    if (mType == HYBM_MEM_TYPE_DEVICE) {
+        segment = hbmSegment_;
+    } else if (mType == HYBM_MEM_TYPE_NVME) {
+        segment = nvmeSegment_;
+    } else {
+        segment = dramSegment_;
+    }
     if (segment == nullptr) {
         BM_LOG_ERROR("allocate memory with mType: " << mType << ", no segment.");
         return BM_INVALID_PARAM;
@@ -222,6 +246,11 @@ int32_t MemEntityDefault::AllocLocalMemory(uint64_t size, hybm_mem_type mType, u
     }
 
     slice = realSlice->ConvertToId();
+    if (segment->GetMemoryType() == HYBM_MEM_TYPE_NVME) {
+        /* NVMe extents are remote LBA ranges: no transport MR (nothing local to register) and
+         * no device meta to publish (the data plane is a host initiator, not the AICore) */
+        return BM_OK;
+    }
     transport::TransportMemoryRegion info;
     info.addr = realSlice->vAddress_;
     info.size = realSlice->size_;
@@ -301,22 +330,24 @@ int32_t MemEntityDefault::FreeLocalMemory(hybm_mem_slice_t slice, uint32_t flags
     HybmVaManager::GetInstance().DumpReservedGvaInfo();
     HybmVaManager::GetInstance().DumpAllocatedGvaInfo();
     MemSlicePtr memSlice;
-    bool fromHbm = false;
+    int fromSeg = 0; /* 0 = none, 1 = hbm, 2 = dram, 3 = nvme */
     if (hbmSegment_ != nullptr && (memSlice = hbmSegment_->GetMemSlice(slice, true)) != nullptr) {
-        fromHbm = true;
+        fromSeg = 1;
     } else if (dramSegment_ != nullptr && (memSlice = dramSegment_->GetMemSlice(slice)) != nullptr) {
-        fromHbm = false;
+        fromSeg = 2;
+    } else if (nvmeSegment_ != nullptr && (memSlice = nvmeSegment_->GetMemSlice(slice)) != nullptr) {
+        fromSeg = 3;
     } else {
         memSlice = nullptr;
     }
 
     if (memSlice == nullptr) {
         BM_LOG_ERROR("FreeLocalMemory: cannot resolve slice id=" << slice
-                     << ", neither hbmSegment_ nor dramSegment_ owns it; VaManager entry may leak");
+                      << ", no segment owns it; VaManager entry may leak");
         return BM_OK;
     }
 
-    if (transportManager_ != nullptr) {
+    if (fromSeg != 3 && transportManager_ != nullptr) { /* NVMe extents carry no transport MR */
         auto ret = transportManager_->UnregisterMemoryRegion(memSlice->vAddress_);
         if (ret != BM_OK) {
             BM_LOG_ERROR("UnregisterMemoryRegion failed, please check input slice.");
@@ -324,10 +355,12 @@ int32_t MemEntityDefault::FreeLocalMemory(hybm_mem_slice_t slice, uint32_t flags
     }
 
     Result relRet = BM_OK;
-    if (fromHbm) {
+    if (fromSeg == 1) {
         relRet = hbmSegment_->ReleaseSliceMemory(memSlice);
-    } else {
+    } else if (fromSeg == 2) {
         relRet = dramSegment_->ReleaseSliceMemory(memSlice);
+    } else {
+        relRet = nvmeSegment_->ReleaseSliceMemory(memSlice);
     }
     if (relRet != BM_OK) {
         BM_LOG_ERROR("ReleaseSliceMemory failed, ret:" << relRet);
@@ -342,6 +375,8 @@ void *MemEntityDefault::GetSliceVa(hybm_mem_slice_t slice)
         return reinterpret_cast<void *>(memSlice->vAddress_);
     } else if (dramSegment_ != nullptr && (memSlice = dramSegment_->GetMemSlice(slice)) != nullptr) {
         return reinterpret_cast<void *>(memSlice->vAddress_);
+    } else if (nvmeSegment_ != nullptr && (memSlice = nvmeSegment_->GetMemSlice(slice)) != nullptr) {
+        return reinterpret_cast<void *>(memSlice->vAddress_); /* 0 for NVMe extents (no local VA) */
     }
 
     BM_LOG_ERROR("failed to get slice va, invalid slice:" << slice);
@@ -356,6 +391,8 @@ void *MemEntityDefault::GetSliceGva(hybm_mem_slice_t slice)
     if (hbmSegment_ != nullptr && (memSlice = hbmSegment_->GetMemSlice(slice, true)) != nullptr) {
         return reinterpret_cast<void *>(memSlice->gva_);
     } else if (dramSegment_ != nullptr && (memSlice = dramSegment_->GetMemSlice(slice)) != nullptr) {
+        return reinterpret_cast<void *>(memSlice->gva_);
+    } else if (nvmeSegment_ != nullptr && (memSlice = nvmeSegment_->GetMemSlice(slice)) != nullptr) {
         return reinterpret_cast<void *>(memSlice->gva_);
     }
 
@@ -448,6 +485,11 @@ int32_t MemEntityDefault::ExportSliceExchangeInfo(hybm_mem_slice_t slice, Exchan
         currentSegment = dramSegment_;
         exportMagic = DRAM_SLICE_EXPORT_INFO_MAGIC;
     }
+    if (realSlice == nullptr && nvmeSegment_ != nullptr) {
+        realSlice = nvmeSegment_->GetMemSlice(slice);
+        currentSegment = nvmeSegment_;
+        exportMagic = NVME_SLICE_EXPORT_INFO_MAGIC;
+    }
     if (realSlice == nullptr) {
         BM_LOG_ERROR("cannot find input slice for export.");
         return BM_INVALID_PARAM;
@@ -466,7 +508,9 @@ int32_t MemEntityDefault::ExportSliceExchangeInfo(hybm_mem_slice_t slice, Exchan
 
     SliceExportTransportKey transportKey{exportMagic, options_.rankId, realSlice->gva_};
     if (transportManager_ != nullptr) {
-        if (realSlice->size_ > 0) {
+        if (realSlice->size_ > 0 && exportMagic != NVME_SLICE_EXPORT_INFO_MAGIC) {
+            /* NVMe extents have no transport MR: skip the key query but still append the
+             * (zeroed) key so the reader's stream stays segment-info/key aligned */
             ret = transportManager_->QueryMemoryKey(realSlice->vAddress_, transportKey.key);
             if (ret != 0) {
                 BM_LOG_ERROR("query memory key when export slice failed: " << ret);
@@ -498,8 +542,10 @@ int32_t MemEntityDefault::ImportForSegment(const ExchangeInfoReader desc[], uint
 
     std::vector<std::string> dramInfos;
     std::vector<std::string> hbmInfos;
+    std::vector<std::string> nvmeInfos;
     std::vector<uint32_t> dramIndex;
     std::vector<uint32_t> hbmIndex;
+    std::vector<uint32_t> nvmeIndex;
 
     for (uint32_t i = 0; i < count; i++) {
         uint64_t magic;
@@ -513,6 +559,9 @@ int32_t MemEntityDefault::ImportForSegment(const ExchangeInfoReader desc[], uint
         if (IsDramSlice(magic)) {
             dramInfos.emplace_back(tmp, UNIFIED_EXCHANGE_SEG_INFO_SIZE);
             dramIndex.emplace_back(i);
+        } else if (IsNvmeSlice(magic)) {
+            nvmeInfos.emplace_back(tmp, UNIFIED_EXCHANGE_SEG_INFO_SIZE);
+            nvmeIndex.emplace_back(i);
         } else {
             hbmInfos.emplace_back(tmp, UNIFIED_EXCHANGE_SEG_INFO_SIZE);
             hbmIndex.emplace_back(i);
@@ -545,6 +594,21 @@ int32_t MemEntityDefault::ImportForSegment(const ExchangeInfoReader desc[], uint
         if (addresses != nullptr) {
             for (uint32_t i = 0; i < hbmInfos.size(); i++) {
                 addresses[hbmIndex[i]] = hbmAddrs[i];
+            }
+        }
+    }
+
+    if (!nvmeInfos.empty()) {
+        std::vector<void *> nvmeAddrs(nvmeInfos.size(), nullptr);
+        BM_ASSERT_LOG_AND_RETURN(nvmeSegment_ != nullptr, "nvmeSegment is nullptr", BM_ERROR);
+        auto ret = nvmeSegment_->Import(nvmeInfos, nvmeAddrs.data());
+        if (ret != BM_OK) {
+            BM_LOG_ERROR("nvme segment import infos failed: " << ret);
+            return ret;
+        }
+        if (addresses != nullptr) {
+            for (uint32_t i = 0; i < nvmeInfos.size(); i++) {
+                addresses[nvmeIndex[i]] = nvmeAddrs[i];
             }
         }
     }
@@ -681,15 +745,30 @@ int32_t MemEntityDefault::ImportEntityExchangeInfo(const ExchangeInfoReader desc
     }
 
     std::vector<std::string> infos;
+    std::vector<std::string> nvmeInfos;
     for (auto i = 0U; i < count; i++) {
         if (desc[i].LeftBytes() > 0) {
+            uint64_t magic = 0;
+            if (desc[i].Test(magic) >= 0 && IsNvmeSlice(magic)) {
+                nvmeInfos.emplace_back(desc[i].LeftToString());
+                continue;
+            }
             infos.emplace_back(desc[i].LeftToString());
         }
     }
     if (infos.size() > 0) {
+        BM_ASSERT_LOG_AND_RETURN(hbmSegment_ != nullptr, "hbmSegment is nullptr for leftover import", BM_ERROR);
         auto ret = hbmSegment_->Import(infos, nullptr);
         if (ret != BM_OK) {
             BM_LOG_ERROR("failed to import segment info, ret: " << ret);
+            return BM_ERROR;
+        }
+    }
+    if (nvmeInfos.size() > 0) {
+        BM_ASSERT_LOG_AND_RETURN(nvmeSegment_ != nullptr, "nvmeSegment is nullptr for leftover import", BM_ERROR);
+        auto ret = nvmeSegment_->Import(nvmeInfos, nullptr);
+        if (ret != BM_OK) {
+            BM_LOG_ERROR("failed to import nvme segment info, ret: " << ret);
             return BM_ERROR;
         }
     }
@@ -957,6 +1036,10 @@ bool MemEntityDefault::CheckAddressInEntity(const void *ptr, uint64_t length) co
         return true;
     }
 
+    if (nvmeSegment_ != nullptr && nvmeSegment_->MemoryInRange(ptr, length)) {
+        return true;
+    }
+
     return false;
 }
 
@@ -994,6 +1077,21 @@ int MemEntityDefault::CheckOptions(const hybm_options *options) noexcept
         BM_LOG_ERROR("local rank id: " << options->rankId << ", create with share memory flag set but fd: "
                                        << options->dramShmFd << " invalid.");
         return BM_INVALID_PARAM;
+    }
+
+    if ((options->bmDataOpType & HYBM_DOP_TYPE_NVME) != 0) {
+        if (options->bmType == HYBM_TYPE_AI_CORE_INITIATE) {
+            BM_LOG_ERROR("NVME op type requires the host-initiated bmType (no DEVICE_SCHEDULE)");
+            return BM_INVALID_PARAM;
+        }
+        if (options->maxNvmeSize == 0 || (options->maxNvmeSize % HYBM_LARGE_PAGE_SIZE) != 0) {
+            BM_LOG_ERROR("NVME op type requires a nonzero 2M-aligned maxNvmeSize, got: " << options->maxNvmeSize);
+            return BM_INVALID_PARAM;
+        }
+        if (options->nvmeVASpace > options->maxNvmeSize) {
+            BM_LOG_ERROR("nvmeVASpace: " << options->nvmeVASpace << " exceeds maxNvmeSize: " << options->maxNvmeSize);
+            return BM_INVALID_PARAM;
+        }
     }
 
     return BM_OK;
@@ -1167,6 +1265,14 @@ Result MemEntityDefault::InitSegment()
         }
     }
 
+    if (options_.memType & HYBM_MEM_TYPE_NVME) {
+        auto ret = InitNvmeSegment();
+        if (ret != BM_OK) {
+            BM_LOG_ERROR("InitNvmeSegment() failed: " << ret);
+            return ret;
+        }
+    }
+
     return BM_OK;
 }
 
@@ -1232,6 +1338,31 @@ Result MemEntityDefault::InitDramSegment()
     if (options_.scene != HYBM_SCENE_TRANS && (options_.bmDataOpType & HYBM_DOP_TYPE_SDMA) != 0U &&
         !dramSegment_->CheckSdmaReaches(options_.rankId)) {
         BM_LOG_ERROR("dram segment does not support sdma in current environment, rankId: " << options_.rankId);
+        return BM_ERROR;
+    }
+    return BM_OK;
+}
+
+Result MemEntityDefault::InitNvmeSegment()
+{
+    if (options_.maxNvmeSize == 0) {
+        BM_LOG_INFO("Nvme rank space is zero.");
+        return BM_OK;
+    }
+
+    MemSegmentOptions segmentOptions;
+    segmentOptions.size = options_.nvmeVASpace;
+    segmentOptions.maxSize = options_.maxNvmeSize;
+    segmentOptions.devId = HybmGetInitDeviceId();
+    segmentOptions.segType = HYBM_MST_NVME;
+    segmentOptions.rankId = options_.rankId;
+    segmentOptions.rankCnt = options_.rankCount;
+    segmentOptions.dataOpType = options_.bmDataOpType;
+    segmentOptions.flags = options_.flags;
+    segmentOptions.enable56BitsGva = options_.enable56BitsGva;
+    nvmeSegment_ = MemSegment::Create(segmentOptions, id_);
+    if (nvmeSegment_ == nullptr) {
+        BM_LOG_ERROR("Failed to create nvme segment");
         return BM_ERROR;
     }
     return BM_OK;
@@ -1328,6 +1459,12 @@ hybm_data_op_type MemEntityDefault::CanReachDataOperators(uint32_t remoteRank) c
     if (options_.bmDataOpType & HYBM_DOP_TYPE_HOST_URMA) {
         supportDataOp |= HYBM_DOP_TYPE_HOST_URMA;
     }
+
+    if (options_.bmDataOpType & HYBM_DOP_TYPE_NVME) {
+        /* the NVMe path is media-local (host initiator to the owner's nvmf target): reachability
+         * is not rank-pair dependent, mirror the HOST_RDMA treatment */
+        supportDataOp |= HYBM_DOP_TYPE_NVME;
+    }
     return static_cast<hybm_data_op_type>(supportDataOp);
 }
 
@@ -1339,6 +1476,10 @@ void *MemEntityDefault::GetReservedMemoryPtr(hybm_mem_type memType) noexcept
 
     if (memType == HYBM_MEM_TYPE_HOST) {
         return dramGva_;
+    }
+
+    if (memType == HYBM_MEM_TYPE_NVME) {
+        return nvmeGva_;
     }
 
     return nullptr;
@@ -1376,8 +1517,10 @@ void MemEntityDefault::ReleaseResources()
     importedMemories_.clear();
     hbmGva_ = nullptr;
     dramGva_ = nullptr;
+    nvmeGva_ = nullptr;
     hbmSegment_.reset();
     dramSegment_.reset();
+    nvmeSegment_.reset();
     dataOperator_.reset();
     if (transportManager_ != nullptr) {
         transportManager_->CloseDevice();

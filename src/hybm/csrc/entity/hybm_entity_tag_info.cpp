@@ -58,7 +58,7 @@ Result HybmEntityTagInfo::AddOneTagOpInfo(const std::string &tagOpInfo)
         {"DEVICE_SDMA", HYBM_DOP_TYPE_SDMA},    {"DEVICE_RDMA", HYBM_DOP_TYPE_DEVICE_RDMA},
         {"HOST_RDMA", HYBM_DOP_TYPE_HOST_RDMA}, {"HOST_TCP", HYBM_DOP_TYPE_HOST_TCP},
         {"HOST_URMA", HYBM_DOP_TYPE_HOST_URMA}, {"HOST_SHM", HYBM_DOP_TYPE_HOST_SHM},
-        {"DEVICE_MTE", HYBM_DOP_TYPE_MTE},
+        {"HOST_NVME", HYBM_DOP_TYPE_NVME},      {"DEVICE_MTE", HYBM_DOP_TYPE_MTE},
     };
 
     std::smatch match;
@@ -181,7 +181,7 @@ std::string HybmEntityTagInfo::GetOpTypeStr(hybm_data_op_type opType)
         {HYBM_DOP_TYPE_SDMA, "DEVICE_SDMA"},    {HYBM_DOP_TYPE_DEVICE_RDMA, "DEVICE_RDMA"},
         {HYBM_DOP_TYPE_HOST_RDMA, "HOST_RDMA"}, {HYBM_DOP_TYPE_HOST_TCP, "HOST_TCP"},
         {HYBM_DOP_TYPE_HOST_URMA, "HOST_URMA"}, {HYBM_DOP_TYPE_HOST_SHM, "HOST_SHM"},
-        {HYBM_DOP_TYPE_MTE, "DEVICE_MTE"},
+        {HYBM_DOP_TYPE_NVME, "HOST_NVME"},      {HYBM_DOP_TYPE_MTE, "DEVICE_MTE"},
     };
     auto it = opType2StrMap.find(opType);
     if (it != opType2StrMap.end()) {

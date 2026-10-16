@@ -201,6 +201,9 @@ AddrType HybmVaManager::ClassifyAddress(const uint64_t va)
         if (gvaType == HYBM_MEM_TYPE_HOST) {
             return GLOBAL_HOST;
         }
+        if (gvaType == HYBM_MEM_TYPE_NVME) {
+            return GLOBAL_NVME;
+        }
     }
     if (va >= HYBM_DEVICE_VA_START && va < (HYBM_DEVICE_VA_START + HYBM_DEVICE_VA_SIZE)) {
         return LOCAL_DEVICE;
@@ -245,7 +248,10 @@ ReservedGvaInfo HybmVaManager::AllocReserveGva(uint32_t localRankId, uint64_t si
     ReservedGvaInfo result;
     uint32_t t = HVM_DVA; // reserve device va all
     BM_VALIDATE_RETURN(size != 0, "size must > 0.", result);
-    BM_VALIDATE_RETURN(localSize != 0 || enable56BitsGva,
+    /* NVMe media is GVA-only: the band is pure VA bookkeeping over remote LBA capacity, no LVA
+     * is ever reserved or mapped, so the localSize>0 requirement does not apply */
+    const bool nvmeMedia = (memType == HYBM_MEM_TYPE_NVME);
+    BM_VALIDATE_RETURN(localSize != 0 || enable56BitsGva || nvmeMedia,
                        "local size must > 0 when 56-bit GVA is not enabled.", result);
 
     std::unique_lock<std::shared_mutex> lock(mutex_);
@@ -258,12 +264,22 @@ ReservedGvaInfo HybmVaManager::AllocReserveGva(uint32_t localRankId, uint64_t si
     }
 
     uint64_t gva = lva;
-    if (enable56BitsGva) {
+    if (enable56BitsGva || nvmeMedia) {
         uint64_t startAddr = HYBM_56BITS_GVA_START_ADDR;
         uint64_t endAddr = HYBM_56BITS_GVA_END_ADDR;
         if (isTrans) {
             startAddr = HYBM_TRANS_GVA_START_ADDR;
             endAddr = HYBM_TRANS_GVA_END_ADDR;
+        }
+        if (nvmeMedia && !enable56BitsGva) {
+            /* NVMe band without 56-bit GVA: take the plain GVM band (like an LVA reservation)
+             * but booked under HVM_GVA -- nothing is ever mapped into it */
+            startAddr = HYBM_GVM_START_ADDR;
+            endAddr = HYBM_GVM_END_ADDR;
+            if (soc_ == ASCEND_950) {
+                startAddr = HYBM_GVM_START_ADDR_A5;
+                endAddr = HYBM_GVM_END_ADDR_A5;
+            }
         }
         uint64_t upperLimit = endAddr - startAddr;
         if (size > upperLimit) {
@@ -288,9 +304,11 @@ ReservedGvaInfo HybmVaManager::AllocReserveGva(uint32_t localRankId, uint64_t si
     result.localRankId = localRankId;
     reservedMap_[HVM_GVA][result.va[HVM_GVA]] = result;
     // 启用 56 位 GVA 时 lvaSize 与 gvaSize 不一致
-    auto lvaResult = result;
-    lvaResult.size = localSize;
-    reservedMap_[t][lvaResult.va[t]] = lvaResult;
+    if (lva != 0) {
+        auto lvaResult = result;
+        lvaResult.size = localSize;
+        reservedMap_[t][lvaResult.va[t]] = lvaResult;
+    }
     BM_LOG_INFO("AllocReserveGva success: " << result);
     return result;
 }
@@ -482,6 +500,21 @@ std::pair<uint64_t, bool> HybmVaManager::FindFreeSpace(uint64_t start, uint64_t 
         return {0, false};
     }
     std::vector<std::pair<uint64_t, uint64_t>> usedRanges;
+    /* reserved ranges are globally non-overlapping ("GVA ranges of all types must not
+     * overlap"): scan BOTH the requested type's map and the companion map, so an NVMe
+     * band booked under HVM_GVA keeps a DRAM window search (HVM_DVA, same GVM band in
+     * non-56-bit mode) from landing on top of it and vice versa */
+    for (uint32_t scan = 0; scan < HVM_BUTT; scan++) {
+        if (scan == type) {
+            continue;
+        }
+        for (const auto &pair : reservedMap_[scan]) {
+            const ReservedGvaInfo &info = pair.second;
+            if (info.va[scan] >= start && info.va[scan] < end) {
+                usedRanges.emplace_back(info.va[scan], info.va[scan] + info.size);
+            }
+        }
+    }
     for (const auto &pair : reservedMap_[type]) {
         const ReservedGvaInfo &info = pair.second;
         if (info.va[type] >= start && info.va[type] < end) {

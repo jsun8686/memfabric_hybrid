@@ -76,7 +76,7 @@ private:
      * was lost and the grant will never land */
     struct InflightGrant {
         uint64_t size;                              /* granted bytes */
-        bool deviceMedia;                           /* grant media */
+        smem_ralloc_mem_type media;                 /* grant media (HOST / DEVICE / NVME) */
         std::chrono::steady_clock::time_point at;   /* grant time */
     };
 
@@ -84,15 +84,16 @@ private:
         SmemRallocRpcEndpoint ep{};
         uint64_t committedBytes = 0;       /* committed bytes on the HOST media, last reported value */
         uint64_t deviceCommittedBytes = 0; /* committed bytes on the DEVICE media, last reported value */
+        uint64_t nvmeCommittedBytes = 0;   /* committed bytes on the NVMe media, last reported value */
         std::vector<InflightGrant> inflight; /* grants issued since the last report, see above */
         std::chrono::steady_clock::time_point lastSeen{}; /* refreshed by every periodic REGISTER */
     };
 
-    static uint64_t SumInflight(const std::vector<InflightGrant> &inflight, bool deviceMedia);
+    static uint64_t SumInflight(const std::vector<InflightGrant> &inflight, smem_ralloc_mem_type media);
 
     /* entries are append-ordered, drop the oldest media-matching grants first until the
      * media sum fits keepSum */
-    static void ShrinkInflight(std::vector<InflightGrant> &inflight, bool deviceMedia, uint64_t keepSum);
+    static void ShrinkInflight(std::vector<InflightGrant> &inflight, smem_ralloc_mem_type media, uint64_t keepSum);
 
     std::mutex mutex_;
     std::map<uint32_t, Candidate> candidates_;

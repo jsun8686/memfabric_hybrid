@@ -22,6 +22,7 @@
 #include "hybm_types.h"
 #include "hybm_host_shm_segment.h"
 #include "hybm_conn_based_segment.h"
+#include "hybm_nvme_segment.h"
 #include "hybm_vmm_based_segment.h"
 #include "hybm_va_manager.h"
 
@@ -95,6 +96,9 @@ MemSegmentPtr MemSegment::Create(const MemSegmentOptions &options, int entityId)
             break;
         case HYBM_MST_HBM_USER:
             tmpSeg = std::make_shared<HybmDevUserLegacySegment>(options, entityId);
+            break;
+        case HYBM_MST_NVME:
+            tmpSeg = std::make_shared<HybmNvmeSegment>(options, entityId);
             break;
         default:
             BM_LOG_ERROR("Invalid memory seg type " << int(options.segType));

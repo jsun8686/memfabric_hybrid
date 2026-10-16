@@ -121,6 +121,20 @@ int32_t hybm_query_alloc_ranges(hybm_entity_t e, uint64_t gvaBegin, uint64_t gva
                                 hybm_va_range ranges[], uint32_t *inOutCount);
 
 /**
+ * @brief Resolve the NVMe extent backing [gva, gva + size). Works on the owner (after
+ *        hybm_alloc_local_memory with HYBM_MEM_TYPE_NVME) and on every member (after the
+ *        extent was imported), the registry is process-wide and entity-independent.
+ *
+ * @param e                [in] entity created by hybm_create_entity
+ * @param gva              [in] any address inside the NVMe extent
+ * @param size             [in] accessed length in byte, the whole [gva, gva+size) must stay
+ *                            inside one extent (extents are never split)
+ * @param info             [out] resolved extent detail
+ * @return true(1) when resolved, false(0) when gva is not NVMe media or crosses extents
+ */
+int32_t hybm_query_nvme_extent(hybm_entity_t e, uint64_t gva, uint64_t size, hybm_nvme_extent_info *info);
+
+/**
  * @brief Register memory at local side, registered memory can be accessed by remote.
  * @param e                [in] entity created by hybm_create_entity
  * @param ptr              [in] local memory start address

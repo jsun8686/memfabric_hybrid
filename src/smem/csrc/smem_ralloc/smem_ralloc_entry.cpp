@@ -13,6 +13,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstring>
 
 #include "hybm_def.h"
 #include "hybm_big_mem.h"
@@ -91,6 +92,24 @@ int32_t SmemRallocEntry::Initialize(const hybm_options &options)
             sliceInfos_.push_back(deviceSliceInfo);
         }
 
+        hybm_exchange_info nvmeSliceInfo{};
+        if (options.maxNvmeSize > 0 && options.nvmeVASpace > 0) {
+            slice = hybm_alloc_local_memory(entity, HYBM_MEM_TYPE_NVME, options.nvmeVASpace, flags);
+            if (slice == nullptr) {
+                SM_LOG_ERROR("alloc local nvme extent failed, size: " << options.nvmeVASpace);
+                ret = SM_ERROR;
+                break;
+            }
+            slices_.push_back(slice);
+
+            ret = hybm_export(entity, slice, flags, &nvmeSliceInfo);
+            if (ret != 0) {
+                SM_LOG_ERROR("hybm export nvme slice failed, result: " << ret);
+                break;
+            }
+            sliceInfos_.push_back(nvmeSliceInfo);
+        }
+
         bzero(&entityInfo_, sizeof(hybm_exchange_info));
         ret = hybm_export(entity, nullptr, HYBM_FLAG_EXPORT_ENTITY, &entityInfo_);
         if (ret != 0) {
@@ -110,6 +129,7 @@ int32_t SmemRallocEntry::Initialize(const hybm_options &options)
     deviceGva_ = hybm_get_memory_ptr(entity, HYBM_MEM_TYPE_DEVICE);
     committedBytes_.store(options.hostVASpace);
     deviceCommittedBytes_.store(options.deviceVASpace);
+    nvmeCommittedBytes_.store(options.nvmeVASpace);
     inited_ = true;
     return 0;
 }
@@ -650,14 +670,18 @@ Result SmemRallocEntry::ExtendLocalMem(smem_ralloc_mem_type_t memType, uint64_t 
         return bootRet;
     }
     SM_ASSERT_RETURN(inited_, SM_NOT_INITIALIZED);
-    SM_ASSERT_RETURN(memType == SMEM_RALLOC_MEM_TYPE_HOST || memType == SMEM_RALLOC_MEM_TYPE_DEVICE,
-        SM_NOT_SUPPORTED);
+    SM_ASSERT_RETURN(memType == SMEM_RALLOC_MEM_TYPE_HOST || memType == SMEM_RALLOC_MEM_TYPE_DEVICE ||
+                         memType == SMEM_RALLOC_MEM_TYPE_NVME,
+                     SM_NOT_SUPPORTED);
     SM_ASSERT_RETURN(size > 0, SM_INVALID_PARAM);
     SM_ASSERT_RETURN(size % SMEM_RALLOC_SIZE_ALIGNMENT == 0, SM_INVALID_PARAM);
     const bool deviceMedia = memType == SMEM_RALLOC_MEM_TYPE_DEVICE;
+    const bool nvmeMedia = memType == SMEM_RALLOC_MEM_TYPE_NVME;
     SM_ASSERT_RETURN(deviceMedia ? (coreOptions_.maxHBMSize > 0) : (coreOptions_.maxDRAMSize > 0),
         SM_NOT_SUPPORTED);
-    const auto hybmMemType = deviceMedia ? HYBM_MEM_TYPE_DEVICE : HYBM_MEM_TYPE_HOST;
+    SM_ASSERT_RETURN(!nvmeMedia || coreOptions_.maxNvmeSize > 0, SM_NOT_SUPPORTED);
+    const auto hybmMemType = deviceMedia ? HYBM_MEM_TYPE_DEVICE
+                                         : (nvmeMedia ? HYBM_MEM_TYPE_NVME : HYBM_MEM_TYPE_HOST);
     std::lock_guard<std::mutex> lock(mutex_);
     // 1.alloc slice
     auto slice = hybm_alloc_local_memory(entity_, hybmMemType, size, 0);
@@ -695,12 +719,16 @@ Result SmemRallocEntry::ExtendLocalMem(smem_ralloc_mem_type_t memType, uint64_t 
         }
         if (deviceMedia) {
             deviceCommittedBytes_.fetch_add(size);
+        } else if (nvmeMedia) {
+            nvmeCommittedBytes_.fetch_add(size);
         } else {
             committedBytes_.fetch_add(size);
         }
         if (info != nullptr) {
             info->rankId = options_.rank;
             info->gva = newGva;
+            /* NVMe extents carry no extra user-visible fields: the nvmf identity rides the
+             * slice exchange info and is already imported into every member's registry */
         }
         SM_LOG_INFO("extend local mem ok, rank: " << options_.rank << " memType: " << memType
                                                   << " gva: " << newGva << " size: " << size);

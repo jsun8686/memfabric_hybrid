@@ -41,8 +41,11 @@ typedef enum {
     SMEMRA_DATA_OP_HOST_TCP = 1U << 2,    /* data operation done by host TCP */
     SMEMRA_DATA_OP_DEVICE_RDMA = 1U << 3, /* data operation done by device RDMA */
     SMEMRA_DATA_OP_HOST_URMA = 1U << 4,   /* data operation done by host URMA */
-    SMEMRA_DATA_OP_HOST_SHM = 1U << 5,    /* same-node host shared memory (no network transport) */
+    SMEMRA_DATA_OP_HOST_SHM = 1U << 5,     /* same-node host shared memory (no network transport) */
     SMEMRA_DATA_OP_DEVICE_SCHEDULE = 1U << 6, /* data operation done by device RDMA and scheduled from the AICore */
+    SMEMRA_DATA_OP_NVME = 1U << 7,         /* remote NVMe SSD blocks served over NVMe-oF, host-initiated
+                                              (smem_ralloc_copy/copy_batch only; the AICore-scheduled
+                                              device_copy* APIs reject NVMe GVA) */
     SMEMRA_DATA_OP_BUTT
 } smem_ralloc_data_op_type;
 typedef smem_ralloc_data_op_type smem_ralloc_data_op_type_t;
@@ -56,6 +59,8 @@ typedef enum {
     SMEM_RALLOC_MEM_TYPE_LOCAL_HOST,       /* memory on local host */
     SMEM_RALLOC_MEM_TYPE_DEVICE,           /* memory on global device */
     SMEM_RALLOC_MEM_TYPE_HOST,             /* memory on global host */
+    SMEM_RALLOC_MEM_TYPE_NVME,             /* remote NVMe SSD block (NVMe-oF): gva maps to an LBA extent
+                                              on the contributor's nvmf target, volatile pool semantics */
     SMEM_RALLOC_MEM_TYPE_BUTT
 } smem_ralloc_mem_type;
 typedef smem_ralloc_mem_type smem_ralloc_mem_type_t;
@@ -109,6 +114,11 @@ typedef struct {
     smem_ralloc_data_op_type dataOpType;   /* data operation type of the pool */
     bool enable56BitsGva;                  /* enable 56-bit GVA when total addr space exceeds 32TB */
     uint32_t flags;                        /* optional flags, default 0 */
+    uint64_t maxNvmeSize;                  /* the max size of one rank NVMe window slot (VA reservation over LBA
+                                              capacity), 2M aligned, 0 means no NVMe window (append-only tail,
+                                              value-init callers keep 0); NVMe blocks come from extend_remote_mem
+                                              with NVME mem type, NVMe windows beyond 32TB total require
+                                              enable56BitsGva just like the memory windows */
 } smem_ralloc_create_option_t;
 
 typedef struct {

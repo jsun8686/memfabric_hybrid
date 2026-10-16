@@ -103,6 +103,7 @@ private:
     Result InitSegment();
     Result InitHbmSegment();
     Result InitDramSegment();
+    Result InitNvmeSegment();
     Result InitTransManager();
     Result InitDataOperator();
     Result InitTagManager();
@@ -124,8 +125,10 @@ private:
     hybm_options options_{};
     void *hbmGva_{nullptr};  // the hbm medium, started gva, no rankId offset
     void *dramGva_{nullptr}; // the dram medium, started gva, no rankId offset
+    void *nvmeGva_{nullptr}; // the nvme medium band base (VA reservation only, never materialized)
     std::shared_ptr<MemSegment> hbmSegment_{nullptr};
     std::shared_ptr<MemSegment> dramSegment_{nullptr};
+    std::shared_ptr<MemSegment> nvmeSegment_{nullptr};
     std::shared_ptr<DataOperator> dataOperator_;
     bool transportPrepared_{false};
     uint32_t extraCtxSize_{0}; /* last extra-context size, to re-publish device meta after QP setup */
