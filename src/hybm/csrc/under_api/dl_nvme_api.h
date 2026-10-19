@@ -169,8 +169,6 @@ private:
     static std::mutex gMutex;
     static void *gEnvHandle;
     static void *gNvmeHandle;
-    static const char *gEnvLibName;
-    static const char *gNvmeLibName;
 };
 
 } // namespace mf

@@ -29,9 +29,9 @@
 using namespace ock::mf;
 
 namespace {
-constexpr void *FAKE_CTRLR = reinterpret_cast<void *>(0x1000);
-constexpr void *FAKE_NS = reinterpret_cast<void *>(0x2000);
-constexpr void *FAKE_QPAIR = reinterpret_cast<void *>(0x3000);
+static void *const FAKE_CTRLR = reinterpret_cast<void *>(0x1000);
+static void *const FAKE_NS = reinterpret_cast<void *>(0x2000);
+static void *const FAKE_QPAIR = reinterpret_cast<void *>(0x3000);
 constexpr uint64_t SECTOR = 512ULL;
 constexpr uint64_t EXTENT_GVA = 0x40000000000ULL;
 

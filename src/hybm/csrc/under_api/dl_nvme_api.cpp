@@ -22,9 +22,6 @@ std::mutex DlNvmeApi::gMutex;
 void *DlNvmeApi::gEnvHandle = nullptr;
 void *DlNvmeApi::gNvmeHandle = nullptr;
 
-const char *DlNvmeApi::gEnvLibName = "libspdk_env_dpdk.so";
-const char *DlNvmeApi::gNvmeLibName = "libspdk_nvme.so";
-
 SpdkEnvDpdkPostInitFunc DlNvmeApi::gSpdkEnvDpdkPostInit;
 SpdkDmaMallocFunc DlNvmeApi::gSpdkDmaMalloc;
 SpdkDmaFreeFunc DlNvmeApi::gSpdkDmaFree;
@@ -40,13 +37,13 @@ SpdkNvmeQpairProcessCompletionsFunc DlNvmeApi::gSpdkNvmeQpairProcessCompletions;
 static const char *EnvLibName()
 {
     const char *env = getenv("MF_NVME_SPDK_ENV_LIB");
-    return (env != nullptr && env[0] != '\0') ? env : DlNvmeApi::gEnvLibName;
+    return (env != nullptr && env[0] != '\0') ? env : "libspdk_env_dpdk.so";
 }
 
 static const char *NvmeLibName()
 {
     const char *env = getenv("MF_NVME_SPDK_NVME_LIB");
-    return (env != nullptr && env[0] != '\0') ? env : DlNvmeApi::gNvmeLibName;
+    return (env != nullptr && env[0] != '\0') ? env : "libspdk_nvme.so";
 }
 
 Result DlNvmeApi::LoadLibrary()
