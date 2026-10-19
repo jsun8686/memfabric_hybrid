@@ -111,7 +111,7 @@ for _ in $(seq 1 30); do [ -S "${RPC_SOCK}" ] && break; sleep 1; done
 # 3) backing bdev: simulated malloc bdev, or the local NVMe drives (multi-drive: raid0 bdev)
 if [ "${SIM}" = 1 ]; then
     $RPC bdev_malloc_delete "${BASE_BDEV}" >/dev/null 2>&1 || true
-    $RPC bdev_malloc_create -b "${BASE_BDEV}" -s "${SIM_SIZE_MB}"
+    $RPC bdev_malloc_create -b "${BASE_BDEV}" -s "${SIM_SIZE_MB}" 512
 else
     $RPC bdev_nvme_attach_controller -b Nvme0 -t PCIe -a 0000:11:00.0 || true
     #    aggregation example for >=2 drives:
