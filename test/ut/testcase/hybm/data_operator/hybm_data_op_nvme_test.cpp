@@ -307,7 +307,10 @@ TEST_F(HybmDataOpNvmeTest, RejectsBadInput_NoLoaderTouched)
     params.dataSize = sizeof(buf);
 
     ASSERT_EQ(op.DataCopy(params, HYBM_LOCAL_HOST_TO_GLOBAL_HOST, ExtOptions{}), BM_INVALID_PARAM);
-    ASSERT_EQ(op.DataCopy(params, HYBM_LOCAL_HOST_TO_GLOBAL_NVME, ExtOptions{}), BM_INVALID_PARAM);
+
+    hybm_copy_params nullParams = params;
+    nullParams.src = nullptr;
+    ASSERT_EQ(op.DataCopy(nullParams, HYBM_LOCAL_HOST_TO_GLOBAL_NVME, ExtOptions{}), BM_INVALID_PARAM);
 
     params.dest = reinterpret_cast<void *>(0x99900000000ULL); /* not registered */
     ASSERT_EQ(op.DataCopy(params, HYBM_LOCAL_HOST_TO_GLOBAL_NVME, ExtOptions{}), BM_INVALID_PARAM);
