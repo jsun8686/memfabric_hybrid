@@ -22,7 +22,7 @@ namespace mf {
  * include/spdk/nvme.h struct spdk_nvme_transport_id exactly (canonical constants:
  * SPDK_NVMF_TRSTRING_MAX_LEN=32 / TRADDR=256 / TRSVCID=32 / NQN=256, arrays +1). */
 struct MfSpdkNvmeTransportId {
-    char trstring[32 + 1];  /* "rdma" for NVMe-oF over RDMA */
+    char trstring[32 + 1];  /* transport name: "rdma" (default) or "tcp" (disk-less simulation) */
     char traddr[256 + 1];   /* target IP string */
     char trsvcid[32 + 1];   /* target port string */
     uint8_t adrfam;         /* address family, 0 = IPv4 */

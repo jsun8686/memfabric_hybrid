@@ -93,6 +93,7 @@ private:
     uint64_t chunkSize_{4ULL * 1024 * 1024}; /* staging chunk, env MF_NVME_BUF_MB */
     uint32_t bufSlots_{4U};                  /* staging pool depth, env MF_NVME_BUF_SLOTS */
     uint32_t qpairsPerCtrlr_{2U};            /* env MF_NVME_QPAIRS */
+    std::string trstring_{"rdma"};           /* NVMe-oF transport, env MF_NVME_TRSTRING ("rdma"/"tcp") */
     char *scratch_{nullptr};                 /* one 512B RMW sector */
 
     std::mutex ioMutex_;                     /* serializes the IO path (batch 2) */

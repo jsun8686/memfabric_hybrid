@@ -9,15 +9,51 @@
 #   export MF_NVME_RPC_SOCK=/var/tmp/spdk.sock
 #   export MF_NVME_BASE_BDEV=Nvme0n1      # bdev backing the pool (raided bdev for multi-drive)
 #   export MF_NVME_LBA_BASE=0             # disjoint nonzero bases when several FAR ranks share one node
-# Usage: sudo ./setup_nvmf_tgt.sh <traddr> [bdev]
+#
+# Disk-less simulation (same host, loopback, no NVMe drive / no RoCE NIC needed):
+#   sudo ./setup_nvmf_tgt.sh 127.0.0.1 --sim
+#   - backs the pool with an in-memory malloc bdev (SIM_SIZE_MB, default 1024)
+#   - speaks NVMe/TCP instead of RDMA on the listener
+#   - initiator side must then run with: export MF_NVME_TRSTRING=tcp
+#
+# Usage: sudo ./setup_nvmf_tgt.sh <traddr> [bdev] [--sim]
 set -euo pipefail
 
-TRADDR="${1:?usage: $0 <traddr> [bdev]}"
-BASE_BDEV="${2:-Nvme0n1}"
+TRADDR=""
+BASE_BDEV=""
+SIM=0
+for arg in "$@"; do
+    case "${arg}" in
+        --sim) SIM=1 ;;
+        *) if [ -z "${TRADDR}" ]; then TRADDR="${arg}"; else BASE_BDEV="${arg}"; fi ;;
+    esac
+done
+: "${TRADDR:?usage: $0 <traddr> [bdev] [--sim]}"
+
+if [ -z "${BASE_BDEV}" ]; then
+    # sim default is the malloc bdev created below, real default is the first NVMe drive
+    if [ "${SIM}" = 1 ]; then BASE_BDEV="Malloc0"; else BASE_BDEV="Nvme0n1"; fi
+fi
 TRSVCID=4420
 NQN="nqn.2016-06.io.spdk:memfabric"
+SIM_SIZE_MB="${SIM_SIZE_MB:-1024}"
+TRANSPORT="RDMA"
+if [ "${SIM}" = 1 ]; then TRANSPORT="TCP"; fi
 RPC_SOCK=/var/tmp/spdk.sock
 RPC="python3 $(command -v spdk_rpc 2>/dev/null || echo rpc.py) -s ${RPC_SOCK}"
+
+# 0) simulation needs DPDK hugepages for the malloc bdev (4G of 2M pages, no-op if already there)
+if [ "${SIM}" = 1 ]; then
+    HUGEPD=/sys/kernel/mm/hugepages/hugepages-2048kB
+    WANT=2048
+    HAVE=$(cat "${HUGEPD}/nr_hugepages")
+    if [ "${HAVE}" -lt "${WANT}" ]; then
+        echo "${WANT}" > "${HUGEPD}/nr_hugepages" || {
+            echo "cannot raise hugepages to ${WANT} (have ${HAVE}); free memory or set SIM_SIZE_MB smaller" >&2
+            exit 1
+        }
+    fi
+fi
 
 # 1) nvmf_tgt as a persistent service (assumes an SPDK build tree or installed package)
 if ! systemctl is-active --quiet spdk-nvmf-tgt; then
@@ -42,21 +78,34 @@ fi
 for _ in $(seq 1 30); do [ -S "${RPC_SOCK}" ] && break; sleep 1; done
 [ -S "${RPC_SOCK}" ] || { echo "nvmf_tgt rpc socket ${RPC_SOCK} never appeared" >&2; exit 1; }
 
-# 3) attach the local NVMe drives (multi-drive: raid0 bdev named the same below)
-$RPC bdev_nvme_attach_controller -b Nvme0 -t PCIe -a 0000:11:00.0 || true
-#    aggregation example for >=2 drives:
-#    $RPC bdev_nvme_attach_controller -b Nvme1 -t PCIe -a 0000:12:00.0
-#    $RPC bdev_raid_create -z raid0 -b "${BASE_BDEV}" -b Nvme1n1 -r 128k
+# 3) backing bdev: simulated malloc bdev, or the local NVMe drives (multi-drive: raid0 bdev)
+if [ "${SIM}" = 1 ]; then
+    $RPC bdev_malloc_delete "${BASE_BDEV}" >/dev/null 2>&1 || true
+    $RPC bdev_malloc_create -b "${BASE_BDEV}" -s "${SIM_SIZE_MB}"
+else
+    $RPC bdev_nvme_attach_controller -b Nvme0 -t PCIe -a 0000:11:00.0 || true
+    #    aggregation example for >=2 drives:
+    #    $RPC bdev_nvme_attach_controller -b Nvme1 -t PCIe -a 0000:12:00.0
+    #    $RPC bdev_raid_create -z raid0 -b "${BASE_BDEV}" -b Nvme1n1 -r 128k
+fi
 
-# 4) RDMA transport + subsystem + listener; any-host auth (pool isolation is the
-#    volatile ns lifecycle, host-nqn ACLs can be tightened later)
-$RPC nvmf_create_transport -t RDMA -u 8192 -m 8
+# 4) transport + subsystem + listener; any-host auth (pool isolation is the
+# volatile ns lifecycle, host-nqn ACLs can be tightened later)
+if [ "${TRANSPORT}" = "RDMA" ]; then
+    $RPC nvmf_create_transport -t RDMA -u 8192 -m 8
+else
+    $RPC nvmf_create_transport -t TCP
+fi
 $RPC nvmf_create_subsystem -s "${NQN}" || true
-$RPC nvmf_subsystem_add_listener -t RDMA -a "${TRADDR}" -s "${TRSVCID}" -f IPv4 "${NQN}" || true
+$RPC nvmf_subsystem_add_listener -t "${TRANSPORT}" -a "${TRADDR}" -s "${TRSVCID}" -f IPv4 "${NQN}" || true
 $RPC nvmf_subsystem_allow_any_host "${NQN}" --allow || true
 
-echo "nvmf target up:"
+echo "nvmf target up (transport=${TRANSPORT}, sim=${SIM}):"
 echo "  nqn        = ${NQN}"
 echo "  listener   = ${TRADDR}:${TRSVCID}"
 echo "  base bdev  = ${BASE_BDEV} (extents are carved as bdev_split + linear runs by the daemon)"
-echo "daemon env  : MF_NVME_NQN=${NQN} MF_NVME_TRADDR=${TRADDR} MF_NVME_BASE_BDEV=${BASE_BDEV}"
+if [ "${SIM}" = 1 ]; then
+    echo "daemon env  : MF_NVME_NQN=${NQN} MF_NVME_TRADDR=${TRADDR} MF_NVME_BASE_BDEV=${BASE_BDEV} MF_NVME_TRSTRING=tcp"
+else
+    echo "daemon env  : MF_NVME_NQN=${NQN} MF_NVME_TRADDR=${TRADDR} MF_NVME_BASE_BDEV=${BASE_BDEV}"
+fi
