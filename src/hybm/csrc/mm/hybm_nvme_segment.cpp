@@ -230,8 +230,8 @@ Result SpdkNvmfAdminClient::AddNs(uint64_t lbaOffset, uint64_t lbaLen, uint32_t 
      * one namespace. The split table covers the WHOLE base bdev exactly once
      * (split_count = capacity/gran, split_size_mb = gran/1M); each extent then owns the
      * run [lbaOffset/gran, (lbaOffset+lbaLen)/gran). NOTE spdk names split bdevs
-     * <base>n<i> with i starting at ONE, and bdev_split_create takes the split size in
-     * MEGAbytes -- both verified against a live 25.05 nvmf_tgt during the sim bring-up. */
+     * <base>p<i> with i starting at ZERO (bdev_get_bdevs on a live 25.05 tgt lists
+     * Malloc0p0..p15), and bdev_split_create takes the split size in MEGAbytes. */
     const uint64_t gran = NvmeEnvU64("MF_NVME_EXTENT_GRAN", 1ULL << 30);
     const std::string baseBdev = NvmeEnvStr("MF_NVME_BASE_BDEV", "Nvme0n1");
     const std::string nqn = GetNqn();
@@ -293,14 +293,14 @@ Result SpdkNvmfAdminClient::AddNs(uint64_t lbaOffset, uint64_t lbaLen, uint32_t 
      * fails the server-side object decode with -32700) */
     std::ostringstream name;
     if (splitCount == 1) {
-        name << baseBdev << "n" << (firstSplit + 1);
+        name << baseBdev << "p" << firstSplit;
     } else {
-        name << baseBdev << "n" << firstSplit << "x" << splitCount;
+        name << baseBdev << "p" << firstSplit << "x" << splitCount;
         std::ostringstream raidReq;
         raidReq << "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"bdev_raid_create\",\"params\":{\"name\":\""
                 << name.str() << "\",\"level\":\"linear\",\"base_bdevs\":[";
         for (uint64_t i = 0; i < splitCount; i++) {
-            raidReq << (i > 0 ? "," : "") << "\"" << baseBdev << "n" << (firstSplit + i + 1) << "\"";
+            raidReq << (i > 0 ? "," : "") << "\"" << baseBdev << "p" << (firstSplit + i) << "\"";
         }
         raidReq << "]}}";
         if (!Roundtrip(raidReq.str(), resp)) {
