@@ -119,7 +119,16 @@ int32_t SmemRallocEntry::Initialize(const hybm_options &options)
     } while (0);
 
     if (ret != 0) {
-        UnInitialize();
+        for (auto acquired : slices_) {
+            hybm_free_local_memory(entity_, acquired, 1, 0);
+        }
+        slices_.clear();
+        sliceInfos_.clear();
+        if (entity_ != nullptr) {
+            hybm_unreserve_mem_space(entity_, 0);
+            hybm_destroy_entity(entity_, 0);
+            entity_ = nullptr;
+        }
         globalGroup_ = nullptr;
         return ret;
     }
