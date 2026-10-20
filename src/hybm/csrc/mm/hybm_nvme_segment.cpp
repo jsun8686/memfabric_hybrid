@@ -312,9 +312,13 @@ Result SpdkNvmfAdminClient::AddNs(uint64_t lbaOffset, uint64_t lbaLen, uint32_t 
         }
     }
 
+    /* this spdk generation nests the namespace attributes in a sub-object and returns
+     * the nsid as a BARE number ({"jsonrpc":"2.0","id":4,"result":1}) -- both verified
+     * with rpc.py -v against the live 25.05 target during the sim bring-up */
     std::ostringstream nsReq;
     nsReq << "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"nvmf_subsystem_add_ns\",\"params\":{\"nqn\":\"" << nqn
-          << "\",\"bdev_name\":\"" << name.str() << "\"}}";
+          << "\",\"namespace\":{\"bdev_name\":\"" << name.str()
+          << "\",\"no_auto_visible\":false,\"hide_metadata\":false}}}";
     if (!Roundtrip(nsReq.str(), resp)) {
         return BM_NOT_CONNECTED;
     }
@@ -323,7 +327,7 @@ Result SpdkNvmfAdminClient::AddNs(uint64_t lbaOffset, uint64_t lbaLen, uint32_t 
         return BM_ERROR;
     }
     int64_t parsedNsid = 0;
-    if (!JsonScanNumber(resp, "nsid", parsedNsid) || parsedNsid <= 0) {
+    if (!JsonScanNumber(resp, "result", parsedNsid) || parsedNsid <= 0) {
         BM_LOG_ERROR("nvme admin: add_ns response carries no nsid: " << resp.substr(0, 200));
         return BM_ERROR;
     }

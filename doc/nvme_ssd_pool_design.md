@@ -28,6 +28,12 @@
 >   原误发 `raid_level`；单 split extent 现直接以 split bdev 为 ns 后端、跳过聚合层）、
 >   executor JOIN_ALLOC 的 Initialize 失败分支补 `UnInitialize()`（此前每轮重试泄漏一条
 >   GVA 带，重试轮地址递增即其表征）。
+>   终局（rpc.py -v 实证）：split bdev 命名 `<base>p<i>` 从 0 起（前述 n1 起亦误）；
+>   `nvmf_subsystem_add_ns` 的 `bdev_name` 须嵌套在 `namespace` 子对象内（平铺被
+>   decode 拒），成功响应为裸数字 `"result":<nsid>`；`nvmf_subsystem_remove_ns` 保持
+>   平铺 `{nqn, nsid}`。失败回滚最终形态：SmemRallocEntry::Initialize 失败自包含回滚
+>   （逐 slice 释放 + unreserve + destroy entity），替代早先在 executor/InitNvmeSegment
+>   打的补丁。
 
 ## 1. 背景与目标
 
