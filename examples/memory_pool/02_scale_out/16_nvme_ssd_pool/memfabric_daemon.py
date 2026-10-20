@@ -34,8 +34,7 @@ NIC_PORT_BASE = 10005        # data-plane nic port base (set_nic); NOT the contr
 RPC_PORT_BASE = 11100        # control rpc port = base + rankId (smem_ralloc_def.h default)
 
 NVME_ENV_KEYS = ("MF_NVME_NQN", "MF_NVME_TRADDR", "MF_NVME_TRSVCID", "MF_NVME_RPC_SOCK",
-                 "MF_NVME_BASE_BDEV", "MF_NVME_LBA_BASE", "MF_NVME_EXTENT_GRAN",
-                 "MF_NVME_TRSTRING")
+                 "MF_NVME_BASE_BDEV", "MF_NVME_LBA_BASE", "MF_NVME_EXTENT_GRAN")
 
 
 def _log(msg):

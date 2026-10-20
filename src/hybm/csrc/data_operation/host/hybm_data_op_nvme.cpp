@@ -48,20 +48,14 @@ uint64_t EnvToU64(const char *name, uint64_t defVal, uint64_t minVal, uint64_t m
     }
     return static_cast<uint64_t>(val);
 }
-
-std::string EnvToStr(const char *name, const char *defVal)
-{
-    const char *env = getenv(name);
-    return (env != nullptr && env[0] != '\0') ? std::string(env) : std::string(defVal);
-}
 } // namespace
 
-HostDataOpNvme::HostDataOpNvme(uint32_t rankId) noexcept : rankId_(rankId)
+HostDataOpNvme::HostDataOpNvme(uint32_t rankId, const std::string &trstring) noexcept : rankId_(rankId)
 {
     chunkSize_ = EnvToU64("MF_NVME_BUF_MB", 4ULL, 1ULL, 1024ULL) * 1024ULL * 1024ULL;
     bufSlots_ = static_cast<uint32_t>(EnvToU64("MF_NVME_BUF_SLOTS", 4ULL, 1ULL, 64ULL));
     qpairsPerCtrlr_ = static_cast<uint32_t>(EnvToU64("MF_NVME_QPAIRS", 2ULL, 1ULL, 16ULL));
-    trstring_ = EnvToStr("MF_NVME_TRSTRING", "rdma");
+    trstring_ = trstring; /* sole source of truth: the pool op bit, no env override */
 }
 
 HostDataOpNvme::~HostDataOpNvme()

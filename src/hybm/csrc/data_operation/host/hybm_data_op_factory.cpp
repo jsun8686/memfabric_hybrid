@@ -38,9 +38,9 @@ DataOperatorPtr DataOperatorFactory::CreateHostShmDataOperator(uint32_t rankId)
     return std::make_shared<HostDataOpHostShm>(rankId);
 }
 
-DataOperatorPtr DataOperatorFactory::CreateNvmeDataOperator(uint32_t rankId)
+DataOperatorPtr DataOperatorFactory::CreateNvmeDataOperator(uint32_t rankId, const std::string &trstring)
 {
-    return std::make_shared<HostDataOpNvme>(rankId);
+    return std::make_shared<HostDataOpNvme>(rankId, trstring);
 }
 } // namespace mf
 } // namespace ock

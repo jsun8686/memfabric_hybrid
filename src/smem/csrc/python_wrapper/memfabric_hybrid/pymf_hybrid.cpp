@@ -1098,9 +1098,10 @@ void DefineRallocConfig(py::module_ &m)
         .value("DEVICE_RDMA", SMEMRA_DATA_OP_DEVICE_RDMA, "data operation done by device RDMA")
         .value("HOST_URMA", SMEMRA_DATA_OP_HOST_URMA, "data operation done by host URMA")
         .value("HOST_SHM", SMEMRA_DATA_OP_HOST_SHM, "same-node host shared memory (no network transport)")
-        .value("NVME", SMEMRA_DATA_OP_NVME,
-               "remote NVMe SSD blocks served over NVMe-oF (host initiator), combine with HOST_RDMA"
-               " for DRAM windows")
+        .value("NVME_TCP", SMEMRA_DATA_OP_NVME_TCP,
+               "remote NVMe SSD blocks over NVMe-oF/TCP (host initiator); mutually exclusive with NVME_RDMA")
+        .value("NVME_RDMA", SMEMRA_DATA_OP_NVME_RDMA,
+               "remote NVMe SSD blocks over NVMe-oF/RDMA (host initiator); mutually exclusive with NVME_TCP")
         .value("DEVICE_SCHEDULE", SMEMRA_DATA_OP_DEVICE_SCHEDULE,
                "ralloc-only modifier: pool is scheduled from the AICore, combine with DEVICE_RDMA");
 
@@ -1182,9 +1183,9 @@ Arguments:
     max_hbm_size(int):             the max size of one rank HBM slot reserved in the window, 2M aligned,
                                    default 0 (no HBM window)
     max_nvme_size(int):            the max size of one rank NVMe slot reserved in the window, 2M aligned,
-                                   default 0 (no NVMe window); requires the NVME op bit in data_op_type
+                                   default 0 (no NVMe window); requires the NVME_TCP or NVME_RDMA op bit
     data_op_type(RallocDataOpType or int): data operation type of the pool, accepts a named member,
-                                   a combined bitmask (e.g. HOST_RDMA | NVME) or its int value,
+                                   a combined bitmask (e.g. HOST_SHM | NVME_TCP) or its int value,
                                    default HOST_RDMA
     enable_56bits_gva(bool):       explicitly enable 56-bit GVA, default false
     flags(int):                    optional flags, default 0

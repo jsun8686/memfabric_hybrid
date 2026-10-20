@@ -62,8 +62,11 @@ Result HostComposeDataOp::Initialize() noexcept
         }
     }
 
-    if (options_.bmDataOpType & HYBM_DOP_TYPE_NVME) {
-        nvmeDataOperator_ = DataOperatorFactory::CreateNvmeDataOperator(options_.rankId);
+    if (options_.bmDataOpType & (HYBM_DOP_TYPE_NVME_TCP | HYBM_DOP_TYPE_NVME_RDMA)) {
+        /* the op bit declares the NVMe-oF protocol the pool's windows speak (the two
+         * bits are validated mutually exclusive at create time) */
+        const bool isTcp = (options_.bmDataOpType & HYBM_DOP_TYPE_NVME_TCP) != 0;
+        nvmeDataOperator_ = DataOperatorFactory::CreateNvmeDataOperator(options_.rankId, isTcp ? "tcp" : "rdma");
         auto ret = nvmeDataOperator_->Initialize();
         if (ret != BM_OK) {
             BM_LOG_ERROR("NVMe data operator init failed, ret:" << ret);
@@ -256,8 +259,12 @@ HostComposeDataOp::DataOperators HostComposeDataOp::GetPrioritedDataOperators(co
     auto opTypes = entityTagInfo_->GetRank2RankOpType(options.srcRankId, options.destRankId);
     /* nvme first: only it accepts NVMe directions, and for other directions it rejects
      * fast without touching the spdk loader */
-    if (nvmeDataOperator_ != nullptr && (opTypes & static_cast<uint32_t>(HYBM_DOP_TYPE_NVME)) != 0U) {
-        dataOperators.emplace_back(HYBM_DOP_TYPE_NVME, nvmeDataOperator_);
+    if (nvmeDataOperator_ != nullptr &&
+        (opTypes & static_cast<uint32_t>(HYBM_DOP_TYPE_NVME_TCP | HYBM_DOP_TYPE_NVME_RDMA)) != 0U) {
+        dataOperators.emplace_back(
+            static_cast<hybm_data_op_type>(opTypes & static_cast<uint32_t>(HYBM_DOP_TYPE_NVME_TCP |
+                                                                          HYBM_DOP_TYPE_NVME_RDMA)),
+            nvmeDataOperator_);
     }
 
     if (sdmaDataOperator_ != nullptr && (opTypes & static_cast<uint32_t>(HYBM_DOP_TYPE_SDMA)) != 0U) {

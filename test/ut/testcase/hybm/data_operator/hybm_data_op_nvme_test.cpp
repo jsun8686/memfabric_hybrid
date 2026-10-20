@@ -304,11 +304,10 @@ protected:
 
 /**
  * RejectsBadInput_NoLoaderTouched
- *  - 非法方向 / 未知 gva / 空指针在触达 SPDK 加载器之前被拒绝。
- */
+ *  - 非法方向 / 未知 gva / 空指针在触达 SPDK 加载器之前被拒绝�? */
 TEST_F(HybmDataOpNvmeTest, RejectsBadInput_NoLoaderTouched)
 {
-    HostDataOpNvme op(0);
+    HostDataOpNvme op(0, "rdma");
     ASSERT_EQ(op.Initialize(), BM_OK);
 
     char buf[64] = {0};
@@ -329,13 +328,12 @@ TEST_F(HybmDataOpNvmeTest, RejectsBadInput_NoLoaderTouched)
 
 /**
  * AlignedWrite_IssuesSingleLbaCommand
- *  - 对齐写：一条 write 命令，LBA = extent.lbaBase + 偏移扇区数，数据逐字节一致，
- *    trid 按 rdma/nqn/traddr/trsvcid 填充。
- */
+ *  - 对齐写：一�?write 命令，LBA = extent.lbaBase + 偏移扇区数，数据逐字节一致，
+ *    trid �?rdma/nqn/traddr/trsvcid 填充�? */
 TEST_F(HybmDataOpNvmeTest, AlignedWrite_IssuesSingleLbaCommand)
 {
     NvmeApiStub stub;
-    HostDataOpNvme op(0);
+    HostDataOpNvme op(0, "rdma");
     ASSERT_EQ(op.Initialize(), BM_OK);
 
     char src[4096];
@@ -366,13 +364,12 @@ TEST_F(HybmDataOpNvmeTest, AlignedWrite_IssuesSingleLbaCommand)
 
 /**
  * LargeAlignedWrite_SplitsByMaxXfer
- *  - 超过 MDTS(128K) 的对齐写被拆成多条 <=maxXfer 的整扇区命令，LBA 连续、数据无缝。
- */
+ *  - 超过 MDTS(128K) 的对齐写被拆成多�?<=maxXfer 的整扇区命令，LBA 连续、数据无缝�? */
 TEST_F(HybmDataOpNvmeTest, LargeAlignedWrite_SplitsByMaxXfer)
 {
     NvmeApiStub stub;
     stub.maxXfer = 128U * 1024U;
-    HostDataOpNvme op(0);
+    HostDataOpNvme op(0, "rdma");
     ASSERT_EQ(op.Initialize(), BM_OK);
 
     const uint64_t len = 512U * 1024U; /* 512KB aligned write -> 4 x 128KB commands */
@@ -398,17 +395,40 @@ TEST_F(HybmDataOpNvmeTest, LargeAlignedWrite_SplitsByMaxXfer)
 }
 
 /**
- * AlignedRead_PollsCompletionsAndReturnsDiskBytes
- *  - 对齐读：数据仅在 ProcessCompletions 触发回调后对调用方可见，读回内容与盘一致。
+ * TcpTransport_BuildsTcpTrid
+ *  - 池 op 位声明的协议经构造参数生效：trid.trstring == "tcp"。
  */
+TEST_F(HybmDataOpNvmeTest, TcpTransport_BuildsTcpTrid)
+{
+    NvmeApiStub stub;
+    HostDataOpNvme op(0, "tcp");
+    ASSERT_EQ(op.Initialize(), BM_OK);
+
+    char src[512] = {0};
+    hybm_copy_params params{};
+    params.src = src;
+    params.dest = reinterpret_cast<void *>(EXTENT_GVA); /* one full aligned sector */
+    params.dataSize = sizeof(src);
+    ASSERT_EQ(op.DataCopy(params, HYBM_LOCAL_HOST_TO_GLOBAL_NVME, ExtOptions{}), BM_OK);
+
+    ASSERT_STREQ(stub.lastTrid.trstring, "tcp");
+    ASSERT_EQ(stub.cmds.size(), 1U); /* full-sector direct path, no RMW */
+    EXPECT_TRUE(stub.cmds[0].write);
+    EXPECT_EQ(stub.cmds[0].lba, 1024U);
+    EXPECT_EQ(stub.cmds[0].count, 1U);
+}
+
+/**
+ * AlignedRead_PollsCompletionsAndReturnsDiskBytes
+ *  - 对齐读：数据仅在 ProcessCompletions 触发回调后对调用方可见，读回内容与盘一致�? */
 TEST_F(HybmDataOpNvmeTest, AlignedRead_PollsCompletionsAndReturnsDiskBytes)
 {
     NvmeApiStub stub;
-    /* extent 内偏移 524288B -> LBA 2048 起 8 个扇区 */
+    /* extent 内偏�?524288B -> LBA 2048 �?8 个扇�?*/
     for (uint64_t lba = 2048; lba < 2048 + 8; ++lba) {
         stub.FillSector(lba, static_cast<char>('a' + lba % 26));
     }
-    HostDataOpNvme op(0);
+    HostDataOpNvme op(0, "rdma");
     ASSERT_EQ(op.Initialize(), BM_OK);
 
     char dst[4096] = {0};
@@ -429,13 +449,12 @@ TEST_F(HybmDataOpNvmeTest, AlignedRead_PollsCompletionsAndReturnsDiskBytes)
 
 /**
  * SubSectorWrite_DoesReadModifyWrite
- *  - 扇区内写：先读整扇区再写回合并结果，盘上其余字节保持原样。
- */
+ *  - 扇区内写：先读整扇区再写回合并结果，盘上其余字节保持原样�? */
 TEST_F(HybmDataOpNvmeTest, SubSectorWrite_DoesReadModifyWrite)
 {
     NvmeApiStub stub;
-    stub.FillSector(1024, 'X'); /* extent 第 0 扇区 */
-    HostDataOpNvme op(0);
+    stub.FillSector(1024, 'X'); /* extent �?0 扇区 */
+    HostDataOpNvme op(0, "rdma");
     ASSERT_EQ(op.Initialize(), BM_OK);
 
     const unsigned char payload[10] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
@@ -461,14 +480,13 @@ TEST_F(HybmDataOpNvmeTest, SubSectorWrite_DoesReadModifyWrite)
 
 /**
  * SpanningWrite_SplitsHeadMidTail
- *  - 跨扇区非对齐区间：头/尾各一次 RMW，中间整扇区一条 write，盘上合并结果正确。
- */
+ *  - 跨扇区非对齐区间：头/尾各一�?RMW，中间整扇区一�?write，盘上合并结果正确�? */
 TEST_F(HybmDataOpNvmeTest, SpanningWrite_SplitsHeadMidTail)
 {
     NvmeApiStub stub;
     stub.FillSector(1024, 'H'); /* head sector */
     stub.FillSector(1026, 'T'); /* tail sector */
-    HostDataOpNvme op(0);
+    HostDataOpNvme op(0, "rdma");
     ASSERT_EQ(op.Initialize(), BM_OK);
 
     const uint64_t offset = 100;
@@ -506,12 +524,11 @@ TEST_F(HybmDataOpNvmeTest, SpanningWrite_SplitsHeadMidTail)
 /**
  * AsyncBatchAndWait_CompleteAndDetach
  *  - DataCopyAsync 语义等同同步；BatchDataCopy 逐项落到盘；Wait 无害；UnInitialize
- *    释放 qpair 并 detach 控制器。
- */
+ *    释放 qpair �?detach 控制器�? */
 TEST_F(HybmDataOpNvmeTest, AsyncBatchAndWait_CompleteAndDetach)
 {
     NvmeApiStub stub;
-    HostDataOpNvme op(0);
+    HostDataOpNvme op(0, "rdma");
     ASSERT_EQ(op.Initialize(), BM_OK);
 
     char src[1024];

@@ -100,6 +100,10 @@ public:
     /* cheap liveness probe: false when the target is unreachable (capacity report drops to 0,
      * placement self-heals on the next extend) */
     virtual bool Healthy() = 0;
+    /* protocol consistency check: the pool op bit (carried to this FAR entity by the
+     * create/JOIN_ALLOC control plane) declares the NVMe-oF transport the initiators
+     * speak; verify the local target actually listens on it, BM_OK only when they match */
+    virtual Result QueryTrtype(const std::string &expectedTrtype) = 0;
 };
 
 /* SPDK JSON-RPC implementation over a unix socket (newline-delimited JSON requests).
@@ -119,6 +123,7 @@ public:
     Result AddNs(uint64_t lbaOffset, uint64_t lbaLen, uint32_t &nsid) override;
     Result RemoveNs(uint32_t nsid) override;
     bool Healthy() override;
+    Result QueryTrtype(const std::string &expectedTrtype) override;
 
     static std::string GetNqn();
     static std::string GetTraddr();

@@ -76,7 +76,11 @@ typedef enum {
     HYBM_DOP_TYPE_HOST_TCP = 1U << 4,
     HYBM_DOP_TYPE_HOST_URMA = 1U << 5,
     HYBM_DOP_TYPE_HOST_SHM = 1U << 6, /* same-node host shared memory (no network transport) */
-    HYBM_DOP_TYPE_NVME = 1U << 7,     /* remote NVMe SSD blocks served over NVMe-oF (host initiator) */
+    /* NVMe-oF transport-explicit bits (same operator class, same spdk library -- the bit
+     * declares the protocol the pool's NVMe windows speak, mirroring the HOST_RDMA/HOST_TCP
+     * convention); the two bits are mutually exclusive */
+    HYBM_DOP_TYPE_NVME_TCP = 1U << 7,   /* NVMe-oF over TCP (host initiator) */
+    HYBM_DOP_TYPE_NVME_RDMA = 1U << 8, /* NVMe-oF over RDMA (host initiator) */
 
     HYBM_DOP_TYPE_BUTT
 } hybm_data_op_type;

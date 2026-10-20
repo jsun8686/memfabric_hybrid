@@ -12,6 +12,7 @@
 
 #include "hybm_nvme_segment.h"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
@@ -172,6 +173,27 @@ static bool JsonScanNumber(const std::string &json, const char *key, int64_t &ou
     return true;
 }
 
+Result SpdkNvmfAdminClient::QueryTrtype(const std::string &expectedTrtype)
+{
+    std::string resp;
+    if (!Roundtrip("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"nvmf_get_transports\"}", resp)) {
+        return BM_NOT_CONNECTED;
+    }
+    /* expected arrives lowercase from the op bit ("tcp"/"rdma"); spdk reports uppercase */
+    std::string want = expectedTrtype;
+    (void)std::transform(want.begin(), want.end(), want.begin(), ::toupper);
+    /* accept both the compact spdk form and a spaced python-json form */
+    const std::string compact = "\"trtype\":\"" + want + "\"";
+    const std::string spaced = "\"trtype\": \"" + want + "\"";
+    if (resp.find(compact) != std::string::npos || resp.find(spaced) != std::string::npos) {
+        return BM_OK;
+    }
+    BM_LOG_ERROR("nvme admin: pool declares NVMe-oF over " << expectedTrtype
+                                                            << " but the target does not listen on it: "
+                                                            << resp.substr(0, 200));
+    return BM_NOT_SUPPORTED;
+}
+
 static bool JsonHasError(const std::string &json)
 {
     return json.find("\"error\":{") != std::string::npos || json.find("\"code\":-") != std::string::npos;
@@ -322,6 +344,25 @@ Result HybmNvmeSegment::ReserveMemorySpace(void **address) noexcept
         /* keep the band: the target may come up later; allocations fail fast meanwhile and the
          * capacity report drops to zero so placement stops choosing this node */
         BM_LOG_WARN("nvme segment: local nvmf target not reachable now, extents cannot be exposed yet");
+    } else {
+        /* protocol consistency: the pool op bit (carried to this FAR entity by the
+         * create/JOIN_ALLOC control plane) declares the transport the initiators speak;
+         * a mismatch blocks the segment instead of failing on every first IO */
+        const char *expected = nullptr;
+        if ((options_.dataOpType & HYBM_DOP_TYPE_NVME_TCP) != 0) {
+            expected = "tcp";
+        } else if ((options_.dataOpType & HYBM_DOP_TYPE_NVME_RDMA) != 0) {
+            expected = "rdma";
+        }
+        if (expected != nullptr) {
+            auto qret = admin_->QueryTrtype(expected);
+            if (qret != BM_OK) {
+                BM_LOG_ERROR("nvme segment: pool op bit declares " << expected
+                                                                   << " but the target does not listen on it");
+                return qret;
+            }
+            BM_LOG_INFO("nvme segment: target transport matches the pool op bit (" << expected << ")");
+        }
     }
     BM_LOG_INFO("nvme segment band reserved, gva: " << VaToStr(reinterpret_cast<uint64_t>(globalVirtualAddress_))
                                                     << " window: " << totalVirtualSize_

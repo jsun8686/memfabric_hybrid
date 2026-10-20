@@ -66,8 +66,12 @@ public:
             resultOpType |= HYBM_DOP_TYPE_HOST_SHM;
         }
 
-        if (smemRallocDataOpType & SMEMRA_DATA_OP_NVME) {
-            resultOpType |= HYBM_DOP_TYPE_NVME;
+        if (smemRallocDataOpType & SMEMRA_DATA_OP_NVME_TCP) {
+            resultOpType |= HYBM_DOP_TYPE_NVME_TCP;
+        }
+
+        if (smemRallocDataOpType & SMEMRA_DATA_OP_NVME_RDMA) {
+            resultOpType |= HYBM_DOP_TYPE_NVME_RDMA;
         }
 
         return static_cast<hybm_data_op_type>(resultOpType);
@@ -100,8 +104,12 @@ public:
             resultOpType |= SMEMRA_DATA_OP_HOST_SHM;
         }
 
-        if (hybmDataOpType & HYBM_DOP_TYPE_NVME) {
-            resultOpType |= SMEMRA_DATA_OP_NVME;
+        if (hybmDataOpType & HYBM_DOP_TYPE_NVME_TCP) {
+            resultOpType |= SMEMRA_DATA_OP_NVME_TCP;
+        }
+
+        if (hybmDataOpType & HYBM_DOP_TYPE_NVME_RDMA) {
+            resultOpType |= SMEMRA_DATA_OP_NVME_RDMA;
         }
 
         return resultOpType;

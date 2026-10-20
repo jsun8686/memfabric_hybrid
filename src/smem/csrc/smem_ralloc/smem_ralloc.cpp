@@ -135,7 +135,8 @@ static inline int32_t SmemRallocDataOpCheck(smem_ralloc_data_op_type dataOpType)
 {
     constexpr uint32_t dataOpTypeMask = SMEMRA_DATA_OP_SDMA | SMEMRA_DATA_OP_HOST_RDMA | SMEMRA_DATA_OP_HOST_URMA |
                                         SMEMRA_DATA_OP_HOST_TCP | SMEMRA_DATA_OP_DEVICE_RDMA |
-                                        SMEMRA_DATA_OP_DEVICE_SCHEDULE | SMEMRA_DATA_OP_NVME;
+                                        SMEMRA_DATA_OP_DEVICE_SCHEDULE | SMEMRA_DATA_OP_NVME_TCP |
+                                        SMEMRA_DATA_OP_NVME_RDMA;
     return (dataOpType & dataOpTypeMask) != 0;
 }
 
@@ -151,8 +152,12 @@ static inline bool SmemRallocCreateOptionCheck(const smem_ralloc_create_option_t
     SM_VALIDATE_RETURN(option->maxNvmeSize % SMEM_RALLOC_SIZE_ALIGNMENT == 0UL, "maxNvmeSize is not 2M aligned",
                        false);
     if (option->maxNvmeSize > 0UL) {
-        SM_VALIDATE_RETURN(option->dataOpType & SMEMRA_DATA_OP_NVME,
-            "maxNvmeSize > 0 requires the SMEMRA_DATA_OP_NVME op bit", false);
+        const bool hasTcp = (option->dataOpType & SMEMRA_DATA_OP_NVME_TCP) != 0U;
+        const bool hasRdma = (option->dataOpType & SMEMRA_DATA_OP_NVME_RDMA) != 0U;
+        SM_VALIDATE_RETURN(hasTcp || hasRdma,
+            "maxNvmeSize > 0 requires the SMEMRA_DATA_OP_NVME_TCP or SMEMRA_DATA_OP_NVME_RDMA op bit", false);
+        SM_VALIDATE_RETURN(!(hasTcp && hasRdma),
+            "SMEMRA_DATA_OP_NVME_TCP and SMEMRA_DATA_OP_NVME_RDMA are mutually exclusive", false);
         SM_VALIDATE_RETURN((option->dataOpType & SMEMRA_DATA_OP_DEVICE_SCHEDULE) == 0U,
             "NVMe media is host-initiated and cannot be combined with DEVICE_SCHEDULE", false);
     }

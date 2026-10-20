@@ -15,7 +15,8 @@
 #   sudo SPDK_ROOT=/path/to/spdk bash ./setup_nvmf_tgt.sh 127.0.0.1 --sim
 #   - backs the pool with an in-memory malloc bdev (SIM_SIZE_MB, default 1024)
 #   - speaks NVMe/TCP instead of RDMA on the listener
-#   - initiator side must then run with: export MF_NVME_TRSTRING=tcp
+#   - initiator side then declares the protocol with the pool op bit:
+#     ralloc.create(..., data_op_type=... | RallocDataOpType.NVME_TCP)
 #
 # SPDK_ROOT (optional): points at an SPDK source tree -- the script then uses
 #   ${SPDK_ROOT}/build/bin/nvmf_tgt and ${SPDK_ROOT}/scripts/rpc.py directly and
@@ -144,9 +145,11 @@ echo "  nqn        = ${NQN}"
 echo "  listener   = ${TRADDR}:${TRSVCID}"
 echo "  base bdev  = ${BASE_BDEV} (extents are carved as bdev_split + linear runs by the daemon)"
 if [ "${SIM}" = 1 ]; then
-    echo "daemon env  : MF_NVME_NQN=${NQN} MF_NVME_TRADDR=${TRADDR} MF_NVME_BASE_BDEV=${BASE_BDEV} MF_NVME_TRSTRING=tcp"
+    echo "daemon env  : MF_NVME_NQN=${NQN} MF_NVME_TRADDR=${TRADDR} MF_NVME_BASE_BDEV=${BASE_BDEV}"
+    echo "client op   : data_op_type = HOST_SHM | NVME_TCP (FAR verifies the TCP listener matches)"
 else
     echo "daemon env  : MF_NVME_NQN=${NQN} MF_NVME_TRADDR=${TRADDR} MF_NVME_BASE_BDEV=${BASE_BDEV}"
+    echo "client op   : data_op_type = <host op> | NVME_RDMA (FAR verifies the RDMA listener matches)"
 fi
 if [ -n "${SPDK_ROOT}" ]; then
     echo "initiator   : export LD_LIBRARY_PATH=${SPDK_ROOT}/build/lib:\${LD_LIBRARY_PATH} (NEAR side dlopen)"

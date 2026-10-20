@@ -24,7 +24,8 @@ public:
     static DataOperatorPtr CreateDevRdmaDataOperator(uint32_t rankId, const transport::TransManagerPtr &tm);
     static DataOperatorPtr CreateHostRdmaDataOperator(uint32_t rankId, const transport::TransManagerPtr &tm);
     static DataOperatorPtr CreateHostShmDataOperator(uint32_t rankId);
-    static DataOperatorPtr CreateNvmeDataOperator(uint32_t rankId);
+    /* trstring: NVMe-oF transport declared by the pool op bit ("tcp" / "rdma") */
+    static DataOperatorPtr CreateNvmeDataOperator(uint32_t rankId, const std::string &trstring);
 };
 } // namespace mf
 } // namespace ock

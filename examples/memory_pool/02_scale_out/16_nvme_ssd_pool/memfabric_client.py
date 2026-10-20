@@ -3,25 +3,23 @@
 # Copyright: (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
 """NVMe SSD pool client (NEAR role) for example 16.
 
-Flow: create a pool with a DRAM window + an NVMe window (HOST_RDMA | NVME ops) ->
-extend_remote_mem(NVME) to get an LBA extent contributed by the FAR node ->
-byte-granular write/read verification through the plain unified copy API
-(aligned bulk copy + sub-sector RMW) -> a read/write bandwidth matrix ->
-the cold-tier prefetch workflow used by 15_hisparse_kv_gather (NVMe block
-prefetched into a DRAM block with two plain copies; the existing v3 gather
-then reads the DRAM block exactly as before).
+Flow: create a pure-NVMe pool (single media, no DRAM/HBM window) with the
+transport-explicit op bit -> extend_remote_mem(NVME) to get an LBA extent
+contributed by the FAR node -> byte-granular write/read verification through
+the plain unified copy API (aligned bulk copy + sub-sector RMW) -> a
+read/write bandwidth matrix.
 
-The whole IO path is host-plane (no NPU/torch needed). The NEAR process dlopens
-the SPDK initiator libraries on the first NVMe IO:
+The whole IO path is host-plane (no NPU/torch needed, no transport library:
+the NVMe op bit never triggers LoadExtendLibrary). The NVMe-oF transport is
+declared by the pool op bit (--nvme-transport tcp|rdma) and verified against
+the target listener on the FAR side. The NEAR process dlopens the SPDK
+initiator libraries on the first NVMe IO:
     export LD_LIBRARY_PATH=/path/to/spdk/build/lib:$LD_LIBRARY_PATH
-and for the disk-less simulation target also:
-    export MF_NVME_TRSTRING=tcp
 """
 
 import argparse
 import ctypes
 import mmap
-import os
 import socket
 import sys
 import time
@@ -33,16 +31,15 @@ DEFAULT_WORLD = 512            # declared world capacity, actual members join dy
 NIC_PORT_BASE = 10005          # data-plane nic port base (set_nic); NOT the control rpc port
 RPC_PORT_BASE = 11100          # control rpc port = base + rankId (smem_ralloc_def.h default)
 DEFAULT_SIZE = "64M"           # NVMe block bytes acquired from the FAR contributor
-DEFAULT_MAX_DRAM = "4G"        # pool DRAM window (prefetch landing zone), GB aligned
 DEFAULT_MAX_NVME = "1G"        # pool NVMe window (per-rank slot VA reservation)
 DEFAULT_BW_SIZES = "4K,64K,1M,16M"
 EXTEND_RETRY_SEC = 5
 EXTEND_TIMEOUT_SEC = 300
-MIB = 1 << 20
 GIB = 1 << 30
 LARGE_PAGE = 2 << 20           # 2M: block/window alignment rule of the pool
 
-DATA_OP = ralloc.RallocDataOpType.HOST_RDMA | ralloc.RallocDataOpType.NVME
+DATA_OP_NVME = {"tcp": ralloc.RallocDataOpType.NVME_TCP,
+                "rdma": ralloc.RallocDataOpType.NVME_RDMA}
 
 
 def _log(msg):
@@ -107,12 +104,13 @@ def main():
     parser.add_argument("--size", default=DEFAULT_SIZE,
                         help=f"NVMe block bytes acquired from the FAR contributor, 2M aligned "
                              f"(K/M/G suffix, default {DEFAULT_SIZE})")
-    parser.add_argument("--max-dram", default=DEFAULT_MAX_DRAM,
-                        help=f"pool DRAM window, GB aligned (default {DEFAULT_MAX_DRAM})")
     parser.add_argument("--max-nvme", default=DEFAULT_MAX_NVME,
                         help=f"pool NVMe window per rank slot, 2M aligned (default {DEFAULT_MAX_NVME})")
     parser.add_argument("--bw-sizes", default=DEFAULT_BW_SIZES,
                         help=f"comma list of copy sizes for the bandwidth matrix (default {DEFAULT_BW_SIZES})")
+    parser.add_argument("--nvme-transport", choices=["tcp", "rdma"], default="tcp",
+                        help="NVMe-oF transport declared by the pool op bit and verified against the "
+                             "target listener on the FAR side, default tcp (loopback simulation)")
     parser.add_argument("--world", type=int, default=DEFAULT_WORLD,
                         help=f"declared world capacity (default {DEFAULT_WORLD})")
     parser.add_argument("--rpc-port-base", type=int, default=RPC_PORT_BASE,
@@ -120,19 +118,15 @@ def main():
     args = parser.parse_args()
 
     size = _parse_size(args.size)
-    max_dram = _parse_size(args.max_dram)
     max_nvme = _parse_size(args.max_nvme)
     bw_sizes = [_parse_size(t) for t in args.bw_sizes.split(",") if t.strip()]
     if size % LARGE_PAGE != 0:
         raise RuntimeError(f"--size ({size}) must be {LARGE_PAGE} aligned")
     if max_nvme % LARGE_PAGE != 0 or size > max_nvme:
         raise RuntimeError(f"--max-nvme ({max_nvme}) must be {LARGE_PAGE} aligned and >= --size ({size})")
-    if max_dram % GIB != 0 or size > max_dram:
-        raise RuntimeError(f"--max-dram ({max_dram}) must be GB aligned and >= --size ({size})")
 
-    _log(f"[client] store: {args.store}, size: {size}, max_dram: {max_dram}, max_nvme: {max_nvme}")
-    _log(f"[client] env MF_NVME_TRSTRING={os.environ.get('MF_NVME_TRSTRING', '<unset>')} (tcp for the "
-         f"loopback simulation target)")
+    _log(f"[client] store: {args.store}, size: {size}, max_nvme: {max_nvme}")
+    _log(f"[client] nvme-transport: {args.nvme_transport}")
     _wait_tcp(args.store, 30)
 
     mf.set_log_level(1)
@@ -151,8 +145,9 @@ def main():
         ralloc_inited = True
         rank = ralloc.get_rank_id()
 
-        pool = ralloc.create(id=0, max_dram_size=max_dram, max_nvme_size=max_nvme, data_op_type=DATA_OP)
-        _log(f"[client rank {rank}] pool created (HOST_RDMA | NVME, dram={max_dram}, nvme={max_nvme})")
+        pool = ralloc.create(id=0, max_nvme_size=max_nvme,
+                             data_op_type=DATA_OP_NVME[args.nvme_transport])
+        _log(f"[client rank {rank}] pure-NVMe pool created (NVMe/{args.nvme_transport}, nvme={max_nvme})")
 
         # ---- 1) NVMe block from the FAR contributor (master placement, never self) ----
         deadline = time.time() + EXTEND_TIMEOUT_SEC
@@ -213,24 +208,6 @@ def main():
                 _copy(pool, nvme_gva, r_addr, s, "bw read")
             t_rd = time.perf_counter() - t0
             _log(f"    {s:>9}  {n * s / t_wr / GIB:10.2f}   {n * s / t_rd / GIB:9.2f}")
-
-        # ---- 5) cold-tier prefetch workflow (the 15_hisparse_kv_gather pattern) ----
-        # NVMe block -> local host buffer -> DRAM pool block, then the DRAM block is
-        # readable exactly like any pool memory: the existing v3 gather semantics are
-        # unchanged, the NVMe tier only feeds it through these two plain copies.
-        ret, dinfo = pool.extend_local_mem(ralloc.RallocMemType.HOST, size)
-        assert ret == 0 and dinfo.get("gva"), f"extend_local_mem(DRAM) failed: {ret} {dinfo}"
-        dram_gva = dinfo["gva"]
-        r_mm[:] = bytes(size)
-        _copy(pool, nvme_gva, r_addr, size, "prefetch NVMe -> host buffer")
-        _copy(pool, r_addr, dram_gva, size, "land host buffer -> DRAM block")
-        v2_mm, v2_addr = _map_buffer(size)
-        bufs.append(v2_mm)
-        v2_mm[:] = bytes(size)
-        _copy(pool, dram_gva, v2_addr, size, "verify DRAM block -> host buffer")
-        assert bytes(v2_mm[:]) == pattern, "prefetched DRAM block mismatch"
-        _log(f"[client] cold-tier prefetch OK (NVMe -> host -> DRAM block gva=0x{dram_gva:x}, "
-             f"v3 gather reads it unchanged)")
 
         pool.destroy()
         mf.get_and_clear_last_err_msg()

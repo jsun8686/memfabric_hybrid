@@ -36,7 +36,10 @@ namespace mf {
  * (batch 2: correctness first, deep pipelining is a follow-up optimization). */
 class HostDataOpNvme : public DataOperator {
 public:
-    explicit HostDataOpNvme(uint32_t rankId) noexcept;
+    /* trstring: NVMe-oF transport declared by the pool op bit ("tcp"/"rdma");
+     * no env override -- the op bit is the sole source of truth and the FAR side
+     * verifies it against the target listener */
+    explicit HostDataOpNvme(uint32_t rankId, const std::string &trstring) noexcept;
     ~HostDataOpNvme() override;
 
     Result Initialize() noexcept override;
@@ -94,7 +97,7 @@ private:
     uint64_t chunkSize_{4ULL * 1024 * 1024}; /* staging chunk, env MF_NVME_BUF_MB */
     uint32_t bufSlots_{4U};                  /* staging pool depth, env MF_NVME_BUF_SLOTS */
     uint32_t qpairsPerCtrlr_{2U};            /* env MF_NVME_QPAIRS */
-    std::string trstring_{"rdma"};           /* NVMe-oF transport, env MF_NVME_TRSTRING ("rdma"/"tcp") */
+    std::string trstring_;                   /* NVMe-oF transport, from the pool op bit ("rdma"/"tcp") */
     char *scratch_{nullptr};                 /* one 512B RMW sector */
 
     std::mutex ioMutex_;                     /* serializes the IO path (batch 2) */

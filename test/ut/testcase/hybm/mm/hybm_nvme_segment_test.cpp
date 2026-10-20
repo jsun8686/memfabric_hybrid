@@ -48,10 +48,18 @@ public:
         return healthy;
     }
 
+    ock::mf::Result QueryTrtype(const std::string &expectedTrtype) override
+    {
+        queriedTrtype = expectedTrtype;
+        return trtypeMatch ? BM_OK : BM_NOT_SUPPORTED;
+    }
+
     std::vector<std::pair<uint64_t, uint64_t>> added;
     std::vector<uint32_t> removed;
+    std::string queriedTrtype;
     uint32_t nextNsid = 0;
     bool healthy = true;
+    bool trtypeMatch = true;
 };
 
 MemSegmentOptions OwnerOptions()
@@ -214,4 +222,46 @@ TEST_F(HybmNvmeSegmentTest, ValidateOptions_RejectsBadWindow)
     opt.maxSize = 1024; /* not 2M aligned */
     HybmNvmeSegment seg(opt, 0, admin);
     ASSERT_NE(seg.ValidateOptions(), BM_OK);
+}
+
+/**
+ * TrtypeCheck_MatchesAndBlocks
+ *  - 池 op 位声明的 NVMe-oF 协议随 create/JOIN_ALLOC 传到 FAR segment：与 target 一致
+ *    放行；不一致阻断（协议错误早失败，而非首个 IO 失败）；未声明（无 NVMe 位）不校验。
+ */
+TEST_F(HybmNvmeSegmentTest, TrtypeCheck_MatchesAndBlocks)
+{
+    /* 1) declared TCP, target matches -> reserve succeeds, query received "tcp" */
+    {
+        auto admin = std::make_shared<MockNvmeAdmin>();
+        MemSegmentOptions opt = OwnerOptions();
+        opt.dataOpType = HYBM_DOP_TYPE_NVME_TCP;
+        HybmNvmeSegment seg(opt, 0, admin);
+        void *band = nullptr;
+        ASSERT_EQ(seg.ReserveMemorySpace(&band), BM_OK);
+        ASSERT_EQ(admin->queriedTrtype, "tcp");
+    }
+
+    /* 2) declared RDMA, target listens something else -> blocked, no band handed out */
+    {
+        auto admin = std::make_shared<MockNvmeAdmin>();
+        admin->trtypeMatch = false;
+        MemSegmentOptions opt = OwnerOptions();
+        opt.dataOpType = HYBM_DOP_TYPE_NVME_RDMA;
+        HybmNvmeSegment seg(opt, 0, admin);
+        void *band = nullptr;
+        ASSERT_EQ(seg.ReserveMemorySpace(&band), BM_NOT_SUPPORTED);
+        ASSERT_EQ(admin->queriedTrtype, "rdma");
+        ASSERT_EQ(band, nullptr);
+    }
+
+    /* 3) no NVMe op bit at all -> no protocol check (legacy/other pools) */
+    {
+        auto admin = std::make_shared<MockNvmeAdmin>();
+        MemSegmentOptions opt = OwnerOptions(); /* dataOpType stays default SDMA */
+        HybmNvmeSegment seg(opt, 0, admin);
+        void *band = nullptr;
+        ASSERT_EQ(seg.ReserveMemorySpace(&band), BM_OK);
+        ASSERT_TRUE(admin->queriedTrtype.empty());
+    }
 }

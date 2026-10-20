@@ -23,7 +23,7 @@
 
 ## NVMe 第三介质环境变量
 
-以下变量仅在启用 NVMe SSD 池（`SMEMRA_DATA_OP_NVME` / `HYBM_DOP_TYPE_NVME`）时读取，其余介质路径完全不感知：
+以下变量仅在启用 NVMe SSD 池（`SMEMRA_DATA_OP_NVME_TCP/NVME_RDMA` / `HYBM_DOP_TYPE_NVME_TCP/NVME_RDMA`）时读取，其余介质路径完全不感知。NVMe-oF 协议本身由池 op 位声明（TCP/RDMA 互斥，唯一真源），FAR 侧对 target 实际监听协议做一致性校验，无协议类环境变量：
 
 | 环境变量名 | 默认值 | 说明 |
 |-----------|-------|------|
@@ -34,7 +34,6 @@
 | `MF_NVME_BASE_BDEV` | `Nvme0n1` | NVMe 池底层的 bdev 名。 |
 | `MF_NVME_LBA_BASE` | 0 | 本贡献者可分配的起始 LBA；多 FAR 进程共享同一节点 target 时需配置不相交区间。 |
 | `MF_NVME_EXTENT_GRAN` | 1G | LBA extent 分配粒度（字节，最小 2M，需 2M 对齐）。 |
-| `MF_NVME_TRSTRING` | `rdma` | NVMe-oF transport 类型（`rdma` 或 `tcp`）。无 RoCE 网卡的模拟/功能验证场景用 `tcp`（如 `setup_nvmf_tgt.sh --sim` 起的 loopback target）。 |
 | `MF_NVME_SPDK_NVME_LIB` | `libspdk_nvme.so` | NEAR 侧 dlopen 的 SPDK nvme initiator 库名（数据面，配置于 `hybm_data_op_nvme`）。 |
 | `MF_NVME_SPDK_ENV_LIB` | `libspdk_env_dpdk.so` | SPDK env 库名（提供 DMA 内存分配器）。 |
 | `MF_NVME_BUF_MB` | 4 | 数据面 staging 缓冲单块大小（MB，1-1024），大块拷贝按此分片。 |

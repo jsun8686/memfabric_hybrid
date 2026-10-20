@@ -86,8 +86,12 @@ Result MemEntityDefault::InitTagManager()
         compatibleInfo << localTag << ":" << HybmEntityTagInfo::GetOpTypeStr(HYBM_DOP_TYPE_HOST_SHM) << ":" << localTag
                        << ",";
     }
-    if (options_.bmDataOpType & HYBM_DOP_TYPE_NVME) {
-        compatibleInfo << localTag << ":" << HybmEntityTagInfo::GetOpTypeStr(HYBM_DOP_TYPE_NVME) << ":" << localTag
+    if (options_.bmDataOpType & HYBM_DOP_TYPE_NVME_TCP) {
+        compatibleInfo << localTag << ":" << HybmEntityTagInfo::GetOpTypeStr(HYBM_DOP_TYPE_NVME_TCP) << ":" << localTag
+                       << ",";
+    }
+    if (options_.bmDataOpType & HYBM_DOP_TYPE_NVME_RDMA) {
+        compatibleInfo << localTag << ":" << HybmEntityTagInfo::GetOpTypeStr(HYBM_DOP_TYPE_NVME_RDMA) << ":" << localTag
                        << ",";
     }
     BM_ASSERT_LOG_AND_RETURN(tagManager_->AddTagOpInfo(compatibleInfo.str()) == BM_OK,
@@ -1079,7 +1083,13 @@ int MemEntityDefault::CheckOptions(const hybm_options *options) noexcept
         return BM_INVALID_PARAM;
     }
 
-    if ((options->bmDataOpType & HYBM_DOP_TYPE_NVME) != 0) {
+    const uint32_t nvmeOpBits = static_cast<uint32_t>(HYBM_DOP_TYPE_NVME_TCP) |
+                                static_cast<uint32_t>(HYBM_DOP_TYPE_NVME_RDMA);
+    if ((options->bmDataOpType & nvmeOpBits) != 0) {
+        if ((options->bmDataOpType & nvmeOpBits) == nvmeOpBits) {
+            BM_LOG_ERROR("NVME_TCP and NVME_RDMA op types are mutually exclusive");
+            return BM_INVALID_PARAM;
+        }
         if (options->bmType == HYBM_TYPE_AI_CORE_INITIATE) {
             BM_LOG_ERROR("NVME op type requires the host-initiated bmType (no DEVICE_SCHEDULE)");
             return BM_INVALID_PARAM;
@@ -1460,10 +1470,10 @@ hybm_data_op_type MemEntityDefault::CanReachDataOperators(uint32_t remoteRank) c
         supportDataOp |= HYBM_DOP_TYPE_HOST_URMA;
     }
 
-    if (options_.bmDataOpType & HYBM_DOP_TYPE_NVME) {
+    if (options_.bmDataOpType & (HYBM_DOP_TYPE_NVME_TCP | HYBM_DOP_TYPE_NVME_RDMA)) {
         /* the NVMe path is media-local (host initiator to the owner's nvmf target): reachability
          * is not rank-pair dependent, mirror the HOST_RDMA treatment */
-        supportDataOp |= HYBM_DOP_TYPE_NVME;
+        supportDataOp |= options_.bmDataOpType & (HYBM_DOP_TYPE_NVME_TCP | HYBM_DOP_TYPE_NVME_RDMA);
     }
     return static_cast<hybm_data_op_type>(supportDataOp);
 }

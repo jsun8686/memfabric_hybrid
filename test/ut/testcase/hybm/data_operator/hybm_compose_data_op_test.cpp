@@ -113,7 +113,8 @@ public:
     CreateDevRdmaDataOperator(uint32_t rankId, const std::shared_ptr<ock::mf::transport::TransportManager> &tm);
     static std::shared_ptr<ock::mf::DataOperator>
     CreateHostRdmaDataOperator(uint32_t rankId, const std::shared_ptr<ock::mf::transport::TransportManager> &tm);
-    static std::shared_ptr<ock::mf::DataOperator> CreateNvmeDataOperator(uint32_t rankId);
+    static std::shared_ptr<ock::mf::DataOperator> CreateNvmeDataOperator(uint32_t rankId,
+                                                                        const std::string &trstring);
 
 protected:
     uint32_t OpOr()
@@ -178,7 +179,8 @@ HybmComposeDataOpTest::CreateHostRdmaDataOperator(uint32_t rankId,
     return hostRdmaDataOpMock;
 }
 
-std::shared_ptr<ock::mf::DataOperator> HybmComposeDataOpTest::CreateNvmeDataOperator(uint32_t rankId)
+std::shared_ptr<ock::mf::DataOperator> HybmComposeDataOpTest::CreateNvmeDataOperator(uint32_t rankId,
+                                                                                    const std::string &trstring)
 {
     return nvmeDataOpMock;
 }
@@ -375,7 +377,8 @@ TEST_F(HybmComposeDataOpTest, initialize_with_nvme_op)
 {
     hybm_options options{};
     options.bmType = HYBM_TYPE_HOST_INITIATE;
-    options.bmDataOpType = static_cast<hybm_data_op_type>(OpOr(HYBM_DOP_TYPE_NVME, HYBM_DOP_TYPE_HOST_RDMA));
+    options.bmDataOpType =
+        static_cast<hybm_data_op_type>(OpOr(HYBM_DOP_TYPE_NVME_TCP, HYBM_DOP_TYPE_HOST_RDMA));
     auto tag = std::make_shared<ock::mf::HybmEntityTagInfo>();
     tag->TagInfoInit(options);
 
@@ -397,7 +400,8 @@ TEST_F(HybmComposeDataOpTest, data_copy_nvme_direction_uses_nvme_op_first)
 {
     hybm_options options{};
     options.bmType = HYBM_TYPE_HOST_INITIATE;
-    options.bmDataOpType = static_cast<hybm_data_op_type>(OpOr(HYBM_DOP_TYPE_NVME, HYBM_DOP_TYPE_HOST_RDMA));
+    options.bmDataOpType =
+        static_cast<hybm_data_op_type>(OpOr(HYBM_DOP_TYPE_NVME_RDMA, HYBM_DOP_TYPE_HOST_RDMA));
     auto tag = std::make_shared<ock::mf::HybmEntityTagInfo>();
     tag->TagInfoInit(options);
 
@@ -406,7 +410,7 @@ TEST_F(HybmComposeDataOpTest, data_copy_nvme_direction_uses_nvme_op_first)
         uint32_t (*mocker)(ock::mf::HybmEntityTagInfo *, uint32_t, uint32_t);
     } u;
     u.getRank2RankOpType = &ock::mf::HybmEntityTagInfo::GetRank2RankOpType;
-    MOCKER(u.mocker).stubs().will(returnValue(OpOr(HYBM_DOP_TYPE_NVME, HYBM_DOP_TYPE_HOST_RDMA)));
+    MOCKER(u.mocker).stubs().will(returnValue(OpOr(HYBM_DOP_TYPE_NVME_RDMA, HYBM_DOP_TYPE_HOST_RDMA)));
     MOCKER(ock::mf::DataOperatorFactory::CreateNvmeDataOperator).stubs().will(invoke(CreateNvmeDataOperator));
     MOCKER(ock::mf::DataOperatorFactory::CreateHostRdmaDataOperator).stubs().will(invoke(CreateHostRdmaDataOperator));
 

@@ -11,7 +11,12 @@
 >   `smem_ralloc_mem_info_t` 保持 `{rankId, gva}` 两字段（NVMe 细节走进程级 extent 注册表，不进用户 API）；
 > - 数据面 loader 命名为 `dl_nvme_api`（设计稿为 `dl_spdk_api`）；
 > - 联调发现并已修复两个真 bug：transport id `adrfam` 必须显式 `IPv4(1)`（0=INVALID 被拒）、
->   单命令必须按控制器 MDTS（nvmf TCP 默认 128KB）拆分（SPDK 不代拆）。
+>   单命令必须按控制器 MDTS（nvmf TCP 默认 128KB）拆分（SPDK 不代拆）；
+> - 实施后重构（2026-10-20）：NVMe op 位按协议显式化为 `NVME_TCP(1<<7)/NVME_RDMA(1<<8)`
+>   （替换原 `NVME` 位，同一算子类、位决定协议，与 host 面 HOST_RDMA/HOST_TCP 惯例对称；
+>   两位互斥）。协议随 create/JOIN_ALLOC 控制面传到 FAR，FAR 在 NVMe 段预留时查询 target
+>   实际监听 transport（nvmf_get_transports）做一致性校验，不一致阻断；协议唯一真源是
+>   op 位（曾存在的 `MF_NVME_TRSTRING` env 已删除，避免打破声明/校验闭环）。
 
 ## 1. 背景与目标
 
