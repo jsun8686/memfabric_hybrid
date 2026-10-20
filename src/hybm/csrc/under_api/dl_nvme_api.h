@@ -31,6 +31,14 @@ struct MfSpdkNvmeTransportId {
 };
 static_assert(sizeof(MfSpdkNvmeTransportId) == 588, "must match sizeof(struct spdk_nvme_transport_id)");
 
+/* mirrors spdk_nvmf_adrfam: 0 = INVALID, 1 = IPv4, 2 = IPv6 (the TCP/RDMA clients
+ * reject an INVALID adrfam with "Unhandled ADRFAM 0", it must be set explicitly) */
+enum MfSpdkNvmfAdrfam {
+    MF_SPDK_NVMF_ADRFAM_INVALID = 0,
+    MF_SPDK_NVMF_ADRFAM_IPV4 = 1,
+    MF_SPDK_NVMF_ADRFAM_IPV6 = 2,
+};
+
 /* callback of an NVMe IO command; cpl points to struct spdk_nvme_cpl (opaque here) */
 using MfSpdkNvmeCmdCb = void (*)(void *ctx, const void *cpl);
 
@@ -42,6 +50,7 @@ using SpdkNvmeDetachFunc = int (*)(void *ctrlr);
 using SpdkNvmeCtrlrGetNsFunc = void *(*)(void *ctrlr, uint32_t nsid);
 using SpdkNvmeCtrlrAllocIoQpairFunc = void *(*)(void *ctrlr, const void *opts, size_t optsSize);
 using SpdkNvmeCtrlrFreeIoQpairFunc = int (*)(void *qpair);
+using SpdkNvmeCtrlrGetMaxXferSizeFunc = uint32_t (*)(void *ctrlr);
 using SpdkNvmeNsCmdReadFunc = int (*)(void *ns, void *qpair, void *buf, uint64_t lba, uint32_t lbaCount,
                                       MfSpdkNvmeCmdCb cb, void *ctx, uint32_t ioFlags);
 using SpdkNvmeNsCmdWriteFunc = int (*)(void *ns, void *qpair, void *buf, uint64_t lba, uint32_t lbaCount,
@@ -124,6 +133,15 @@ public:
         }
     }
 
+    /* controller MDTS (max bytes per IO command); 0 when unknown -> caller clamps */
+    static inline uint32_t MaxXferSize(void *ctrlr)
+    {
+        if (gSpdkNvmeCtrlrGetMaxXferSize == nullptr || ctrlr == nullptr) {
+            return 0;
+        }
+        return gSpdkNvmeCtrlrGetMaxXferSize(ctrlr);
+    }
+
     static inline int NsCmdRead(void *ns, void *qpair, void *buf, uint64_t lba, uint32_t lbaCount,
                                 MfSpdkNvmeCmdCb cb, void *ctx)
     {
@@ -160,6 +178,7 @@ public:
     static SpdkNvmeCtrlrGetNsFunc gSpdkNvmeCtrlrGetNs;
     static SpdkNvmeCtrlrAllocIoQpairFunc gSpdkNvmeCtrlrAllocIoQpair;
     static SpdkNvmeCtrlrFreeIoQpairFunc gSpdkNvmeCtrlrFreeIoQpair;
+    static SpdkNvmeCtrlrGetMaxXferSizeFunc gSpdkNvmeCtrlrGetMaxXferSize;
     static SpdkNvmeNsCmdReadFunc gSpdkNvmeNsCmdRead;
     static SpdkNvmeNsCmdWriteFunc gSpdkNvmeNsCmdWrite;
     static SpdkNvmeQpairProcessCompletionsFunc gSpdkNvmeQpairProcessCompletions;

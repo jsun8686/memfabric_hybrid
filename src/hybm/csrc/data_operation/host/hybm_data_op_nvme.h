@@ -62,6 +62,7 @@ private:
         void *ns{nullptr};
         std::vector<void *> qpairs;
         uint32_t nextQpair{0};
+        uint32_t maxXferBytes{128U * 1024U}; /* per-command cap (ctrlr MDTS), spdk does not split */
     };
     using NvmeEndpointPtr = std::shared_ptr<NvmeEndpoint>;
 

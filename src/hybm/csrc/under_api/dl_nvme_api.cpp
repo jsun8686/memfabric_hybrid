@@ -30,6 +30,7 @@ SpdkNvmeDetachFunc DlNvmeApi::gSpdkNvmeDetach;
 SpdkNvmeCtrlrGetNsFunc DlNvmeApi::gSpdkNvmeCtrlrGetNs;
 SpdkNvmeCtrlrAllocIoQpairFunc DlNvmeApi::gSpdkNvmeCtrlrAllocIoQpair;
 SpdkNvmeCtrlrFreeIoQpairFunc DlNvmeApi::gSpdkNvmeCtrlrFreeIoQpair;
+SpdkNvmeCtrlrGetMaxXferSizeFunc DlNvmeApi::gSpdkNvmeCtrlrGetMaxXferSize;
 SpdkNvmeNsCmdReadFunc DlNvmeApi::gSpdkNvmeNsCmdRead;
 SpdkNvmeNsCmdWriteFunc DlNvmeApi::gSpdkNvmeNsCmdWrite;
 SpdkNvmeQpairProcessCompletionsFunc DlNvmeApi::gSpdkNvmeQpairProcessCompletions;
@@ -84,6 +85,9 @@ Result DlNvmeApi::LoadLibrary()
                 "spdk_nvme_ctrlr_alloc_io_qpair");
     DL_LOAD_SYM(gSpdkNvmeCtrlrFreeIoQpair, SpdkNvmeCtrlrFreeIoQpairFunc, gNvmeHandle,
                 "spdk_nvme_ctrlr_free_io_qpair");
+    /* optional: absent on exotic builds, the operator then clamps to the 128K default */
+    DL_LOAD_SYM_OPTIONAL(gSpdkNvmeCtrlrGetMaxXferSize, SpdkNvmeCtrlrGetMaxXferSizeFunc, gNvmeHandle,
+                         "spdk_nvme_ctrlr_get_max_xfer_size");
     DL_LOAD_SYM(gSpdkNvmeNsCmdRead, SpdkNvmeNsCmdReadFunc, gNvmeHandle, "spdk_nvme_ns_cmd_read");
     DL_LOAD_SYM(gSpdkNvmeNsCmdWrite, SpdkNvmeNsCmdWriteFunc, gNvmeHandle, "spdk_nvme_ns_cmd_write");
     DL_LOAD_SYM(gSpdkNvmeQpairProcessCompletions, SpdkNvmeQpairProcessCompletionsFunc, gNvmeHandle,
@@ -109,6 +113,7 @@ void DlNvmeApi::CleanupLibrary()
     gSpdkNvmeCtrlrGetNs = nullptr;
     gSpdkNvmeCtrlrAllocIoQpair = nullptr;
     gSpdkNvmeCtrlrFreeIoQpair = nullptr;
+    gSpdkNvmeCtrlrGetMaxXferSize = nullptr;
     gSpdkNvmeNsCmdRead = nullptr;
     gSpdkNvmeNsCmdWrite = nullptr;
     gSpdkNvmeQpairProcessCompletions = nullptr;

@@ -57,6 +57,7 @@ public:
         saved_.getNs = DlNvmeApi::gSpdkNvmeCtrlrGetNs;
         saved_.allocQpair = DlNvmeApi::gSpdkNvmeCtrlrAllocIoQpair;
         saved_.freeQpair = DlNvmeApi::gSpdkNvmeCtrlrFreeIoQpair;
+        saved_.maxXfer = DlNvmeApi::gSpdkNvmeCtrlrGetMaxXferSize;
         saved_.read = DlNvmeApi::gSpdkNvmeNsCmdRead;
         saved_.write = DlNvmeApi::gSpdkNvmeNsCmdWrite;
         saved_.process = DlNvmeApi::gSpdkNvmeQpairProcessCompletions;
@@ -73,6 +74,7 @@ public:
         DlNvmeApi::gSpdkNvmeCtrlrGetNs = FakeGetNs;
         DlNvmeApi::gSpdkNvmeCtrlrAllocIoQpair = FakeAllocQpair;
         DlNvmeApi::gSpdkNvmeCtrlrFreeIoQpair = FakeFreeQpair;
+        DlNvmeApi::gSpdkNvmeCtrlrGetMaxXferSize = FakeGetMaxXferSize;
         DlNvmeApi::gSpdkNvmeNsCmdRead = FakeRead;
         DlNvmeApi::gSpdkNvmeNsCmdWrite = FakeWrite;
         DlNvmeApi::gSpdkNvmeQpairProcessCompletions = FakeProcessCompletions;
@@ -90,6 +92,7 @@ public:
         DlNvmeApi::gSpdkNvmeCtrlrGetNs = saved_.getNs;
         DlNvmeApi::gSpdkNvmeCtrlrAllocIoQpair = saved_.allocQpair;
         DlNvmeApi::gSpdkNvmeCtrlrFreeIoQpair = saved_.freeQpair;
+        DlNvmeApi::gSpdkNvmeCtrlrGetMaxXferSize = saved_.maxXfer;
         DlNvmeApi::gSpdkNvmeNsCmdRead = saved_.read;
         DlNvmeApi::gSpdkNvmeNsCmdWrite = saved_.write;
         DlNvmeApi::gSpdkNvmeQpairProcessCompletions = saved_.process;
@@ -116,6 +119,7 @@ public:
     uint32_t connectCalls = 0;
     uint32_t detachCalls = 0;
     uint32_t nsidSeen = 0;
+    uint32_t maxXfer = 128U * 1024U; /* reported MDTS, per-test adjustable */
     MfSpdkNvmeTransportId lastTrid{};
 
 private:
@@ -128,6 +132,7 @@ private:
         SpdkNvmeCtrlrGetNsFunc getNs;
         SpdkNvmeCtrlrAllocIoQpairFunc allocQpair;
         SpdkNvmeCtrlrFreeIoQpairFunc freeQpair;
+        SpdkNvmeCtrlrGetMaxXferSizeFunc maxXfer;
         SpdkNvmeNsCmdReadFunc read;
         SpdkNvmeNsCmdWriteFunc write;
         SpdkNvmeQpairProcessCompletionsFunc process;
@@ -189,6 +194,12 @@ private:
     {
         (void)qpair;
         return 0;
+    }
+
+    static uint32_t FakeGetMaxXferSize(void *ctrlr)
+    {
+        (void)ctrlr;
+        return Instance().maxXfer;
     }
 
     static int FakeRead(void *ns, void *qpair, void *buf, uint64_t lba, uint32_t lbaCount,
@@ -340,6 +351,7 @@ TEST_F(HybmDataOpNvmeTest, AlignedWrite_IssuesSingleLbaCommand)
     ASSERT_EQ(stub.connectCalls, 1U);
     ASSERT_EQ(stub.nsidSeen, 2U);
     ASSERT_STREQ(stub.lastTrid.trstring, "rdma");
+    ASSERT_EQ(stub.lastTrid.adrfam, 1U); /* IPv4, an INVALID(0) adrfam is rejected by spdk clients */
     ASSERT_STREQ(stub.lastTrid.traddr, "10.90.22.35");
     ASSERT_STREQ(stub.lastTrid.trsvcid, "4420");
     ASSERT_STREQ(stub.lastTrid.subnqn, "nqn.2016-06.io.spdk:cnode1");
@@ -350,6 +362,39 @@ TEST_F(HybmDataOpNvmeTest, AlignedWrite_IssuesSingleLbaCommand)
     EXPECT_EQ(stub.cmds[0].count, 8U);
     ASSERT_EQ(stub.cmds[0].data.size(), sizeof(src));
     EXPECT_EQ(0, memcmp(stub.cmds[0].data.data(), src, sizeof(src)));
+}
+
+/**
+ * LargeAlignedWrite_SplitsByMaxXfer
+ *  - 超过 MDTS(128K) 的对齐写被拆成多条 <=maxXfer 的整扇区命令，LBA 连续、数据无缝。
+ */
+TEST_F(HybmDataOpNvmeTest, LargeAlignedWrite_SplitsByMaxXfer)
+{
+    NvmeApiStub stub;
+    stub.maxXfer = 128U * 1024U;
+    HostDataOpNvme op(0);
+    ASSERT_EQ(op.Initialize(), BM_OK);
+
+    const uint64_t len = 512U * 1024U; /* 512KB aligned write -> 4 x 128KB commands */
+    std::vector<char> payload(len);
+    for (uint64_t i = 0; i < len; ++i) {
+        payload[i] = static_cast<char>('A' + (i / 4096U) % 26U);
+    }
+    hybm_copy_params params{};
+    params.src = payload.data();
+    params.dest = reinterpret_cast<void *>(EXTENT_GVA); /* sector-aligned, offset 0 */
+    params.dataSize = len;
+    ASSERT_EQ(op.DataCopy(params, HYBM_LOCAL_HOST_TO_GLOBAL_NVME, ExtOptions{}), BM_OK);
+
+    ASSERT_EQ(stub.cmds.size(), 4U);
+    for (uint32_t c = 0; c < 4U; ++c) {
+        EXPECT_TRUE(stub.cmds[c].write);
+        EXPECT_EQ(stub.cmds[c].lba, 1024U + c * 256U); /* 128KB == 256 sectors per command */
+        EXPECT_EQ(stub.cmds[c].count, 256U);
+        ASSERT_EQ(stub.cmds[c].data.size(), 128U * 1024U);
+        EXPECT_EQ(0, memcmp(stub.cmds[c].data.data(), payload.data() + static_cast<size_t>(c) * 128U * 1024U,
+                            128U * 1024U));
+    }
 }
 
 /**

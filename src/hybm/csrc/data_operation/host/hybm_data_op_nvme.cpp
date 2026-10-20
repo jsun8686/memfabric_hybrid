@@ -185,7 +185,7 @@ Result HostDataOpNvme::GetEndpoint(const HybmNvmeExtent &extent, NvmeEndpointPtr
     (void)strncpy(trid.traddr, extent.traddr, sizeof(trid.traddr) - 1);
     (void)strncpy(trid.trsvcid, trsvcid.c_str(), sizeof(trid.trsvcid) - 1);
     (void)strncpy(trid.subnqn, extent.nqn, sizeof(trid.subnqn) - 1);
-    trid.adrfam = 0; /* IPv4 */
+    trid.adrfam = MF_SPDK_NVMF_ADRFAM_IPV4;
 
     Result ret = DlNvmeApi::Connect(trid, candidate->ctrlr);
     if (ret != BM_OK) {
@@ -197,6 +197,10 @@ Result HostDataOpNvme::GetEndpoint(const HybmNvmeExtent &extent, NvmeEndpointPtr
         BM_LOG_ERROR("nvme get ns " << extent.nsid << " failed, ret:" << ret);
         DlNvmeApi::Detach(candidate->ctrlr);
         return ret;
+    }
+    const uint32_t xfer = DlNvmeApi::MaxXferSize(candidate->ctrlr);
+    if (xfer >= NVME_SECTOR_SIZE) {
+        candidate->maxXferBytes = (xfer / NVME_SECTOR_SIZE) * NVME_SECTOR_SIZE;
     }
     for (uint32_t i = 0; i < qpairsPerCtrlr_; ++i) {
         void *qpair = nullptr;
@@ -315,10 +319,20 @@ Result HostDataOpNvme::SubmitRange(const NvmeEndpointPtr &endpoint, const HybmNv
     }
 
     if (midLen != 0) {
-        auto ret = SubmitAndWait(endpoint, NextQpair(endpoint), isWrite, extent.lbaBase + (midStart >> 9),
-                                 static_cast<uint32_t>(midLen >> 9), const_cast<char *>(bytes + headBytes));
-        if (ret != BM_OK) {
-            return ret;
+        /* split by the controller MDTS: spdk_nvme_ns_cmd_write does not split oversized
+         * IO itself, a target (e.g. nvmf TCP, 128K default) would reject it */
+        uint64_t submitted = 0;
+        while (submitted < midLen) {
+            uint64_t n = std::min<uint64_t>(endpoint->maxXferBytes, midLen - submitted);
+            n = (n / NVME_SECTOR_SIZE) * NVME_SECTOR_SIZE;
+            auto ret = SubmitAndWait(endpoint, NextQpair(endpoint), isWrite,
+                                      extent.lbaBase + ((midStart + submitted) >> 9),
+                                      static_cast<uint32_t>(n >> 9),
+                                      const_cast<char *>(bytes + headBytes + submitted));
+            if (ret != BM_OK) {
+                return ret;
+            }
+            submitted += n;
         }
     }
 
