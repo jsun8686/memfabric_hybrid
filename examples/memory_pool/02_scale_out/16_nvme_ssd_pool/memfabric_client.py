@@ -145,7 +145,7 @@ def main():
         ralloc_inited = True
         rank = ralloc.get_rank_id()
 
-        pool = ralloc.create(id=0, max_nvme_size=max_nvme,
+        pool = ralloc.create(id=0, max_dram_size=0, max_nvme_size=max_nvme,
                              data_op_type=DATA_OP_NVME[args.nvme_transport])
         _log(f"[client rank {rank}] pure-NVMe pool created (NVMe/{args.nvme_transport}, nvme={max_nvme})")
 
