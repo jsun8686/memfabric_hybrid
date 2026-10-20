@@ -133,7 +133,7 @@ $RPC nvmf_subsystem_add_listener -t "${TRANSPORT}" -a "${TRADDR}" -s "${TRSVCID}
 $RPC nvmf_subsystem_allow_any_host "${NQN}" || true
 
 # 5) hard verification: the || true above must not mask a dead target
-SUBSYS_JSON=$($RPC nvmf_subsystem_get_subsystems)
+SUBSYS_JSON=$($RPC nvmf_get_subsystems)
 echo "${SUBSYS_JSON}" | grep -q "\"${NQN}\"" \
     || { echo "subsystem ${NQN} not registered - target NOT functional" >&2; exit 1; }
 echo "${SUBSYS_JSON}" | grep -q "\"${TRADDR}\"" \
