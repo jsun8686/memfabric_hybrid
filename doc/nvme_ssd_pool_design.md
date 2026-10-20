@@ -16,7 +16,14 @@
 >   （替换原 `NVME` 位，同一算子类、位决定协议，与 host 面 HOST_RDMA/HOST_TCP 惯例对称；
 >   两位互斥）。协议随 create/JOIN_ALLOC 控制面传到 FAR，FAR 在 NVMe 段预留时查询 target
 >   实际监听 transport（nvmf_get_transports）做一致性校验，不一致阻断；协议唯一真源是
->   op 位（曾存在的 `MF_NVME_TRSTRING` env 已删除，避免打破声明/校验闭环）。
+>   op 位（曾存在的 `MF_NVME_TRSTRING` env 已删除，避免打破声明/校验闭环）；
+> - 进程级全流程首跑（2026-10-20，sim loopback）又暴露管理面签发链三个协议适配 bug，已修复：
+>   `bdev_split_create` 的切分大小参数是 `split_size_mb`（MB 单位，原误发扇区数 `split_size` 被拒）；
+>   split bdev 命名从 `n1` 起（原按 `n0` 拼接错位）；split 表须按全盘容量一次建齐
+>   （`bdev_get_bdevs` 查几何，各 extent 引用连续段，原误发本 extent 的 count）。
+>   附带修复：非法参数被盲容忍后 target 断链导致下一条 RPC EPIPE（现仅容忍 "exist" 类错误）、
+>   `NvmeEnvU64` 不识别 `64M` 类后缀（曾被解析为 64 字节再钳到 2M）、
+>   失败重试路径 GVA 带泄漏（entity 重初始化前先释放旧段）。
 
 ## 1. 背景与目标
 

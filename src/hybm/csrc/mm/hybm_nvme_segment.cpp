@@ -94,7 +94,32 @@ static uint64_t NvmeEnvU64(const char *name, uint64_t dft)
     if (val == nullptr || val[0] == '\0') {
         return dft;
     }
-    return strtoull(val, nullptr, 0);
+    char *end = nullptr;
+    unsigned long long v = strtoull(val, &end, 0);
+    if (end == val) {
+        return dft;
+    }
+    /* size suffix (K/M/G, optional trailing B/iB); plain numbers stay bytes */
+    uint64_t mult = 1;
+    switch (*end) {
+        case 'g':
+        case 'G':
+            mult = 1ULL << 30;
+            break;
+        case 'm':
+        case 'M':
+            mult = 1ULL << 20;
+            break;
+        case 'k':
+        case 'K':
+            mult = 1ULL << 10;
+            break;
+        case '\0':
+            break;
+        default:
+            return dft; /* garbage suffix: fall back to the default */
+    }
+    return v * mult;
 }
 
 std::string SpdkNvmfAdminClient::GetNqn()
@@ -201,9 +226,12 @@ static bool JsonHasError(const std::string &json)
 
 Result SpdkNvmfAdminClient::AddNs(uint64_t lbaOffset, uint64_t lbaLen, uint32_t &nsid)
 {
-    /* extent -> run of same-size splits of the base bdev -> one linear bdev -> one namespace.
-     * the split table is created once (uniform split granularity); each extent then owns
-     * [lbaOffset/gran, (lbaOffset+lbaLen)/gran) consecutive splits */
+    /* extent -> consecutive run of uniform splits of the base bdev -> one linear bdev ->
+     * one namespace. The split table covers the WHOLE base bdev exactly once
+     * (split_count = capacity/gran, split_size_mb = gran/1M); each extent then owns the
+     * run [lbaOffset/gran, (lbaOffset+lbaLen)/gran). NOTE spdk names split bdevs
+     * <base>n<i> with i starting at ONE, and bdev_split_create takes the split size in
+     * MEGAbytes -- both verified against a live 25.05 nvmf_tgt during the sim bring-up. */
     const uint64_t gran = NvmeEnvU64("MF_NVME_EXTENT_GRAN", 1ULL << 30);
     const std::string baseBdev = NvmeEnvStr("MF_NVME_BASE_BDEV", "Nvme0n1");
     const std::string nqn = GetNqn();
@@ -213,49 +241,83 @@ Result SpdkNvmfAdminClient::AddNs(uint64_t lbaOffset, uint64_t lbaLen, uint32_t 
     }
     const uint64_t firstSplit = lbaOffset / gran;
     const uint64_t splitCount = lbaLen / gran;
-    std::ostringstream req;
-    req << "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"bdev_split_create\",\"params\":{\"base_bdev\":\""
-        << baseBdev << "\",\"split_size\":" << (gran / 512ULL) << ",\"split_count\":" << splitCount << "}}";
+
+    /* 1) base bdev capacity decides the whole split table */
+    std::ostringstream getReq;
+    getReq << "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"bdev_get_bdevs\",\"params\":{\"name\":\"" << baseBdev
+           << "\"}}";
     std::string resp;
+    if (!Roundtrip(getReq.str(), resp)) {
+        return BM_NOT_CONNECTED;
+    }
+    if (JsonHasError(resp)) {
+        BM_LOG_ERROR("nvme admin: bdev_get_bdevs(" << baseBdev << ") failed: " << resp.substr(0, 200));
+        return BM_ERROR;
+    }
+    int64_t numBlocks = 0;
+    int64_t blockSize = 0;
+    if (!JsonScanNumber(resp, "num_blocks", numBlocks) || !JsonScanNumber(resp, "block_size", blockSize) ||
+        numBlocks <= 0 || blockSize <= 0) {
+        BM_LOG_ERROR("nvme admin: bdev_get_bdevs response carries no geometry: " << resp.substr(0, 200));
+        return BM_ERROR;
+    }
+    const uint64_t totalSplits = (static_cast<uint64_t>(numBlocks) * static_cast<uint64_t>(blockSize)) / gran;
+    if (totalSplits == 0 || firstSplit + splitCount > totalSplits) {
+        BM_LOG_ERROR("nvme admin: extent [" << lbaOffset << ", " << lbaOffset + lbaLen
+                                            << ") exceeds the split table (" << totalSplits << " splits of "
+                                            << gran << "B) of " << baseBdev);
+        return BM_INVALID_PARAM;
+    }
+
+    /* 2) whole-table split create -- only a genuine "already exists" is tolerated, any
+     * other error is fatal (a blind tolerate left a dead socket + EPIPE on the next call) */
+    std::ostringstream req;
+    req << "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"bdev_split_create\",\"params\":{\"base_bdev\":\""
+        << baseBdev << "\",\"split_count\":" << totalSplits << ",\"split_size_mb\":" << (gran >> 20) << "}}";
     if (!Roundtrip(req.str(), resp)) {
         return BM_NOT_CONNECTED;
     }
     if (JsonHasError(resp)) {
-        /* table may already exist (same granularity): tolerate and continue */
-        BM_LOG_WARN("nvme admin: bdev_split_create returned an error (may pre-exist): " << resp);
+        if (resp.find("xist") == std::string::npos) { /* exist/exists/Exist... */
+            BM_LOG_ERROR("nvme admin: bdev_split_create failed: " << resp.substr(0, 200));
+            return BM_ERROR;
+        }
+        BM_LOG_WARN("nvme admin: split table of " << baseBdev
+                                                  << " already exists -- assuming the same granularity "
+                                                  << gran << "B (deployment keeps one granularity)");
     }
 
-    /* linear bdev over this extent's split run */
+    /* 3) linear bdev over this extent's split run (split names are 1-based) */
     std::ostringstream name;
     name << baseBdev << "n" << firstSplit << "x" << splitCount;
     std::ostringstream raidReq;
-    raidReq << "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"bdev_raid_create\",\"params\":{\"name\":\""
+    raidReq << "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"bdev_raid_create\",\"params\":{\"name\":\""
             << name.str() << "\",\"raid_level\":\"linear\",\"base_bdevs\":[";
     for (uint64_t i = 0; i < splitCount; i++) {
-        raidReq << (i > 0 ? "," : "") << "\"" << baseBdev << "n" << (firstSplit + i) << "\"";
+        raidReq << (i > 0 ? "," : "") << "\"" << baseBdev << "n" << (firstSplit + i + 1) << "\"";
     }
     raidReq << "]}}";
     if (!Roundtrip(raidReq.str(), resp)) {
         return BM_NOT_CONNECTED;
     }
     if (JsonHasError(resp)) {
-        BM_LOG_ERROR("nvme admin: bdev_raid_create failed: " << resp);
+        BM_LOG_ERROR("nvme admin: bdev_raid_create failed: " << resp.substr(0, 200));
         return BM_ERROR;
     }
 
     std::ostringstream nsReq;
-    nsReq << "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"nvmf_subsystem_add_ns\",\"params\":{\"nqn\":\"" << nqn
+    nsReq << "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"nvmf_subsystem_add_ns\",\"params\":{\"nqn\":\"" << nqn
           << "\",\"bdev_name\":\"" << name.str() << "\"}}";
     if (!Roundtrip(nsReq.str(), resp)) {
         return BM_NOT_CONNECTED;
     }
     if (JsonHasError(resp)) {
-        BM_LOG_ERROR("nvme admin: nvmf_subsystem_add_ns failed: " << resp);
+        BM_LOG_ERROR("nvme admin: nvmf_subsystem_add_ns failed: " << resp.substr(0, 200));
         return BM_ERROR;
     }
     int64_t parsedNsid = 0;
     if (!JsonScanNumber(resp, "nsid", parsedNsid) || parsedNsid <= 0) {
-        BM_LOG_ERROR("nvme admin: add_ns response carries no nsid: " << resp);
+        BM_LOG_ERROR("nvme admin: add_ns response carries no nsid: " << resp.substr(0, 200));
         return BM_ERROR;
     }
     nsid = static_cast<uint32_t>(parsedNsid);

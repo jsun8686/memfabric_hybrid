@@ -1360,6 +1360,14 @@ Result MemEntityDefault::InitNvmeSegment()
         return BM_OK;
     }
 
+    /* a previously failed join may have left a reserved (but unusable) band behind:
+     * release it before rebuilding, otherwise every retry leaks one GVA band */
+    if (nvmeSegment_ != nullptr) {
+        BM_LOG_WARN("nvme segment already exists on re-init, releasing the stale band first");
+        (void)nvmeSegment_->UnReserveMemorySpace();
+        nvmeSegment_ = nullptr;
+    }
+
     MemSegmentOptions segmentOptions;
     segmentOptions.size = options_.nvmeVASpace;
     segmentOptions.maxSize = options_.maxNvmeSize;
