@@ -1,8 +1,17 @@
 # NVMe-oF 远端 NVMe SSD 池管理设计方案
 
-> 状态：定稿（2026-10-15）。本文档为 `docs` 下归档的设计基线，实施按第 12 节阶段计划推进；
+> 状态：**已实施（批 1-3 完成，2026-10-20）**。定稿于 2026-10-15；
+> 批 1（ABI 骨架 + HybmNvmeSegment，UT 4/4）、批 2（dl_nvme_api + HostDataOpNvme + compose/pymf，
+> UT 7/7 + 23/23）、批 3（example 16 + 文档）均已落地；
+> 无盘模拟联调（malloc bdev + NVMe/TCP loopback）通过，identify 连通性验证 OK（P0 项：
+> SPDK TCP initiator 可用性通过）。
 > 历史讨论中的中间形态（FAR staging 块缓存、ralloc 层 block API、ralloc 层 admin 模块）均已废弃，
-> 以本文档的归属口径为准。
+> 以本文档的归属口径为准。实施偏差记录：
+> - RPC 报文为 v3（160B，仅追加 `maxNvmeSize`/`nvmeCommittedBytes` 两控制面字段），
+>   `smem_ralloc_mem_info_t` 保持 `{rankId, gva}` 两字段（NVMe 细节走进程级 extent 注册表，不进用户 API）；
+> - 数据面 loader 命名为 `dl_nvme_api`（设计稿为 `dl_spdk_api`）；
+> - 联调发现并已修复两个真 bug：transport id `adrfam` 必须显式 `IPv4(1)`（0=INVALID 被拒）、
+>   单命令必须按控制器 MDTS（nvmf TCP 默认 128KB）拆分（SPDK 不代拆）。
 
 ## 1. 背景与目标
 
