@@ -79,6 +79,19 @@ fi
 
 # 1) target daemon: systemd service when available, direct nohup launch otherwise
 #    (containers usually have no systemd as PID 1)
+start_tgt_direct() {
+    # a --with-shared build links DPDK libs from <spdk>/dpdk/build/lib -- prepend it
+    # so a bare invocation without an exported LD_LIBRARY_PATH still works
+    local dpdk_lib="${SPDK_ROOT}/dpdk/build/lib"
+    local ld_path="${LD_LIBRARY_PATH:-}"
+    if [ -n "${SPDK_ROOT}" ] && [ -d "${dpdk_lib}" ]; then
+        ld_path="${dpdk_lib}:${ld_path}"
+    fi
+    LD_LIBRARY_PATH="${ld_path}" nohup "${NVMF_TGT}" -m 0x3 -s 2048 -r "${RPC_SOCK}" >/tmp/nvmf_tgt.log 2>&1 &
+    echo "nvmf_tgt started directly (no systemd in this environment)"
+    echo "  log: /tmp/nvmf_tgt.log   stop: pkill nvmf_tgt"
+}
+
 if command -v systemctl >/dev/null 2>&1; then
     if ! systemctl is-active --quiet spdk-nvmf-tgt; then
         cat >/etc/systemd/system/spdk-nvmf-tgt.service <<EOF
@@ -97,12 +110,16 @@ EOF
         systemctl daemon-reload
         systemctl enable --now spdk-nvmf-tgt
     fi
-elif [ -S "${RPC_SOCK}" ]; then
-    echo "nvmf_tgt rpc socket ${RPC_SOCK} already exists, reusing the running target"
+elif [ -S "${RPC_SOCK}" ] && $RPC spdk_get_version >/dev/null 2>&1; then
+    echo "nvmf_tgt rpc socket ${RPC_SOCK} alive, reusing the running target"
 else
-    nohup "${NVMF_TGT}" -m 0x3 -s 2048 -r "${RPC_SOCK}" >/tmp/nvmf_tgt.log 2>&1 &
-    echo "nvmf_tgt started directly (no systemd in this environment)"
-    echo "  log: /tmp/nvmf_tgt.log   stop: pkill nvmf_tgt"
+    # a leftover socket file without a listener (the process died without unlinking
+    # it) must not be mistaken for a running target: probe, remove, relaunch
+    if [ -S "${RPC_SOCK}" ]; then
+        echo "stale rpc socket ${RPC_SOCK} (no listener), removing and relaunching"
+        rm -f "${RPC_SOCK}" "${RPC_SOCK}.lock"
+    fi
+    start_tgt_direct
 fi
 
 # 2) wait for the rpc socket
@@ -143,14 +160,15 @@ echo "${SUBSYS_JSON}" | grep -q "\"${TRADDR}\"" \
 echo "nvmf target up (transport=${TRANSPORT}, sim=${SIM}):"
 echo "  nqn        = ${NQN}"
 echo "  listener   = ${TRADDR}:${TRSVCID}"
-echo "  base bdev  = ${BASE_BDEV} (extents are carved as bdev_split + linear runs by the daemon)"
+echo "  base bdev  = ${BASE_BDEV} (extents are carved as uniform splits by the daemon)"
 if [ "${SIM}" = 1 ]; then
     echo "daemon env  : MF_NVME_NQN=${NQN} MF_NVME_TRADDR=${TRADDR} MF_NVME_BASE_BDEV=${BASE_BDEV}"
-    echo "client op   : data_op_type = HOST_SHM | NVME_TCP (FAR verifies the TCP listener matches)"
+    echo "client op   : data_op_type = NVME_TCP (single media; FAR verifies the TCP listener matches)"
 else
     echo "daemon env  : MF_NVME_NQN=${NQN} MF_NVME_TRADDR=${TRADDR} MF_NVME_BASE_BDEV=${BASE_BDEV}"
     echo "client op   : data_op_type = <host op> | NVME_RDMA (FAR verifies the RDMA listener matches)"
 fi
 if [ -n "${SPDK_ROOT}" ]; then
-    echo "initiator   : export LD_LIBRARY_PATH=${SPDK_ROOT}/build/lib:\${LD_LIBRARY_PATH} (NEAR side dlopen)"
+    # --with-shared builds also need the DPDK libs from <spdk>/dpdk/build/lib
+    echo "initiator   : export LD_LIBRARY_PATH=${SPDK_ROOT}/dpdk/build/lib:${SPDK_ROOT}/build/lib:\${LD_LIBRARY_PATH}"
 fi

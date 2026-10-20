@@ -47,12 +47,29 @@ static const char *NvmeLibName()
     return (env != nullptr && env[0] != '\0') ? env : "libspdk_nvme.so";
 }
 
+/* libspdk_util references OpenSSL symbols (EVP_MD_CTX_free, ...) but the as-linked
+ * shared objects may not record libcrypto in DT_NEEDED -- native spdk apps get it
+ * from their link-time -lcrypto, a dlopen host must inject it into the global
+ * namespace itself, or RTLD_NOW fails with "undefined symbol: EVP_MD_CTX_free" */
+static void PreloadCrypto()
+{
+    static const char *candidates[] = {"libcrypto.so.3", "libcrypto.so.1.1", "libcrypto.so"};
+    for (const char *name : candidates) {
+        if (dlopen(name, RTLD_NOW | RTLD_GLOBAL) != nullptr) {
+            return; /* process-wide lifetime: the handle is intentionally leaked */
+        }
+    }
+    /* not fatal: the host process may already carry the OpenSSL symbols */
+}
+
 Result DlNvmeApi::LoadLibrary()
 {
     std::lock_guard<std::mutex> guard(gMutex);
     if (gLoaded) {
         return BM_OK;
     }
+
+    PreloadCrypto();
 
     /* the env library exports the DMA allocator, load it GLOBAL so the nvme library
      * resolves its env dependency through the same mapping */

@@ -21,9 +21,9 @@
 
 | 项 | 说明 |
 |---|---|
-| SPDK | 源码树（`SPDK_ROOT`，推荐）或包安装；仅需 `nvmf_tgt`、`rpc.py`、`build/lib` 下 `libspdk_nvme.so`/`libspdk_env_dpdk.so` |
+| SPDK | 源码树（`SPDK_ROOT`，推荐）或包安装；**须以 `./configure --with-shared` 构建**（默认只产 `.a` 静态库，NEAR 数据面 dlopen 需要 `.so`；共享形态同时依赖 `<spdk>/dpdk/build/lib` 下的 DPDK 库）。需要 `nvmf_tgt`、`rpc.py`、`build/lib` 下 `libspdk_nvme.so`/`libspdk_env_dpdk.so` |
 | memfabric_hybrid | python 包装载可用（`import memfabric_hybrid`） |
-| nvmf target | `setup_nvmf_tgt.sh` 部署（见下）；容器内无 systemd 时脚本自动降级直拉 |
+| nvmf target | `setup_nvmf_tgt.sh` 部署（见下）；容器内无 systemd 时脚本自动降级直拉（stale socket 自动探测清理） |
 
 ## 快速开始（单机无盘模拟，容器友好）
 
@@ -41,7 +41,8 @@ export MF_NVME_EXTENT_GRAN=64M        # 重要：默认 1G 粒度下 1G 模拟�
 python3 memfabric_daemon.py --store tcp://127.0.0.1:8588
 
 # 3) client（NEAR 角色）：纯 NVMe 池，协议由 op 位声明（默认 NVMe/TCP，无需任何传输库）
-export LD_LIBRARY_PATH=/home/s00799406/spdk/build/lib:$LD_LIBRARY_PATH
+#    注意双库路径：spdk/build/lib（spdk .so）+ spdk/dpdk/build/lib（DPDK 依赖）
+export LD_LIBRARY_PATH=/home/s00799406/spdk/dpdk/build/lib:/home/s00799406/spdk/build/lib:$LD_LIBRARY_PATH
 python3 memfabric_client.py --store tcp://127.0.0.1:8588
 #    双节点/跨容器：--nvme-transport rdma（RDMA target）
 ```
@@ -115,4 +116,5 @@ sim（TCP loopback + malloc 盘）数值仅用于功能验证，一般远低于�
 | 大块写被 target 拒绝 | 已按 MDTS 自动拆分；若仍现，检查 `MF_NVME_BUF_MB` 与 target `max_io_size` |
 | create 报协议不一致（NOT_SUPPORTED） | 池 op 位声明的协议与 target 监听不符：sim target 是 TCP，需 `NVME_TCP` 位/`--nvme-transport tcp` |
 | extend_remote_mem(NVME) 一直失败 | daemon 侧 `MF_NVME_*` 是否齐全、target 是否可达（`rpc.py nvmf_get_subsystems`）、粒度是否大于盘容量 |
-| client 首次 IO 报库加载失败 | `LD_LIBRARY_PATH` 未含 SPDK `build/lib` |
+| client 首次 IO 报库加载失败 | `LD_LIBRARY_PATH` 须含**双路径**（`<spdk>/build/lib` + `<spdk>/dpdk/build/lib`）；SPDK 须 `--with-shared` 构建（否则只有 `.a`） |
+| `undefined symbol: EVP_MD_CTX_free` | libspdk_util 的 OpenSSL 依赖未进 DT_NEEDED——加载器已内置 libcrypto 预加载（RTLD_GLOBAL 注入），重编后即消 |

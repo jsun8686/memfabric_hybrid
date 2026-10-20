@@ -20,6 +20,7 @@ initiator libraries on the first NVMe IO:
 import argparse
 import ctypes
 import mmap
+import os
 import socket
 import sys
 import time
@@ -127,11 +128,19 @@ def main():
 
     _log(f"[client] store: {args.store}, size: {size}, max_nvme: {max_nvme}")
     _log(f"[client] nvme-transport: {args.nvme_transport}")
+    # dlopen resolves the search path at process start: a missing path cannot be fixed
+    # later from python, so fail loudly BEFORE the pool setup walks into it
+    ld_path = os.environ.get("LD_LIBRARY_PATH", "")
+    if "spdk" not in ld_path:
+        _log("[client] WARN: LD_LIBRARY_PATH contains no spdk library dir -- the first NVMe IO "
+             "will fail dlopen(libspdk_env_dpdk.so). Export both <spdk>/build/lib and "
+             "<spdk>/dpdk/build/lib before launching.")
     _wait_tcp(args.store, 30)
 
     mf.set_log_level(1)
     assert mf.initialize() == 0, "mf.initialize failed"
     ralloc_inited = False
+    pool = None
     bufs = []
     try:
         cfg = ralloc.RallocConfig()
@@ -210,9 +219,15 @@ def main():
             _log(f"    {s:>9}  {n * s / t_wr / GIB:10.2f}   {n * s / t_rd / GIB:9.2f}")
 
         pool.destroy()
+        pool = None
         mf.get_and_clear_last_err_msg()
         _log(f"[client rank {rank}] pool destroyed, exiting")
     finally:
+        # destroy on the failure path too, BEFORE the global uninit (a pool object
+        # surviving into GC after ralloc.uninitialize trips Assert g_smemRallocInited)
+        if pool is not None:
+            pool.destroy()
+            pool = None
         for b in bufs:
             b.close()
         if ralloc_inited:
