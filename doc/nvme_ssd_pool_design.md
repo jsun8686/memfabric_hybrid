@@ -24,6 +24,10 @@
 >   附带修复：非法参数被盲容忍后 target 断链导致下一条 RPC EPIPE（现仅容忍 "exist" 类错误）、
 >   `NvmeEnvU64` 不识别 `64M` 类后缀（曾被解析为 64 字节再钳到 2M）、
 >   失败重试路径 GVA 带泄漏（entity 重初始化前先释放旧段）。
+>   随后二轮：`bdev_raid_create` 的 JSON-RPC 键是 `level`（未知键致服务端解码失败 -32700，
+>   原误发 `raid_level`；单 split extent 现直接以 split bdev 为 ns 后端、跳过聚合层）、
+>   executor JOIN_ALLOC 的 Initialize 失败分支补 `UnInitialize()`（此前每轮重试泄漏一条
+>   GVA 带，重试轮地址递增即其表征）。
 
 ## 1. 背景与目标
 

@@ -287,22 +287,29 @@ Result SpdkNvmfAdminClient::AddNs(uint64_t lbaOffset, uint64_t lbaLen, uint32_t 
                                                   << gran << "B (deployment keeps one granularity)");
     }
 
-    /* 3) linear bdev over this extent's split run (split names are 1-based) */
+    /* 3) backing bdev for the namespace: a single split needs no aggregation layer --
+     * the split bdev itself is the ns backend; multiple splits go through a linear
+     * raid bdev (the jsonrpc key is "level" from rpc.py's -l/--level, an unknown key
+     * fails the server-side object decode with -32700) */
     std::ostringstream name;
-    name << baseBdev << "n" << firstSplit << "x" << splitCount;
-    std::ostringstream raidReq;
-    raidReq << "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"bdev_raid_create\",\"params\":{\"name\":\""
-            << name.str() << "\",\"raid_level\":\"linear\",\"base_bdevs\":[";
-    for (uint64_t i = 0; i < splitCount; i++) {
-        raidReq << (i > 0 ? "," : "") << "\"" << baseBdev << "n" << (firstSplit + i + 1) << "\"";
-    }
-    raidReq << "]}}";
-    if (!Roundtrip(raidReq.str(), resp)) {
-        return BM_NOT_CONNECTED;
-    }
-    if (JsonHasError(resp)) {
-        BM_LOG_ERROR("nvme admin: bdev_raid_create failed: " << resp.substr(0, 200));
-        return BM_ERROR;
+    if (splitCount == 1) {
+        name << baseBdev << "n" << (firstSplit + 1);
+    } else {
+        name << baseBdev << "n" << firstSplit << "x" << splitCount;
+        std::ostringstream raidReq;
+        raidReq << "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"bdev_raid_create\",\"params\":{\"name\":\""
+                << name.str() << "\",\"level\":\"linear\",\"base_bdevs\":[";
+        for (uint64_t i = 0; i < splitCount; i++) {
+            raidReq << (i > 0 ? "," : "") << "\"" << baseBdev << "n" << (firstSplit + i + 1) << "\"";
+        }
+        raidReq << "]}}";
+        if (!Roundtrip(raidReq.str(), resp)) {
+            return BM_NOT_CONNECTED;
+        }
+        if (JsonHasError(resp)) {
+            BM_LOG_ERROR("nvme admin: bdev_raid_create failed: " << resp.substr(0, 200));
+            return BM_ERROR;
+        }
     }
 
     std::ostringstream nsReq;

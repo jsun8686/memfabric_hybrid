@@ -210,6 +210,9 @@ Result SmemRallocExecutor::OnJoinAlloc(SmemRallocRpcMsg &msg)
         SM_LOG_ERROR("join alloc entry init failed, result: " << ret);
         entry->MarkBootstrapDone(false);
         manager.NotifyPlacementFailure(msg);
+        /* tear the half-initialized entry down (releases the reserved GVA bands of every
+         * media): without this every retry leaked one band on the process-wide manager */
+        entry->UnInitialize();
         (void)manager.RemoveEntryByPtr(reinterpret_cast<uintptr_t>(entry.Get()));
         return ret;
     }
