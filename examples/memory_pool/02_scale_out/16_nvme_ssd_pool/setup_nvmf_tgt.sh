@@ -120,15 +120,21 @@ else
 fi
 
 # 4) transport + subsystem + listener; any-host auth (pool isolation is the
-# volatile ns lifecycle, host-nqn ACLs can be tightened later)
+#    volatile ns lifecycle, host-nqn ACLs can be tightened later).
+#    NOTE: this SPDK generation takes the NQN as a positional argument, and
+#    allow_any_host defaults to enabled (--allow/--enable do not exist)
 if [ "${TRANSPORT}" = "RDMA" ]; then
     $RPC nvmf_create_transport -t RDMA -u 8192 -m 8
 else
     $RPC nvmf_create_transport -t TCP
 fi
-$RPC nvmf_create_subsystem -n "${NQN}" || true
+$RPC nvmf_create_subsystem "${NQN}" || true
 $RPC nvmf_subsystem_add_listener -t "${TRANSPORT}" -a "${TRADDR}" -s "${TRSVCID}" -f IPv4 "${NQN}" || true
-$RPC nvmf_subsystem_allow_any_host "${NQN}" --allow || true
+$RPC nvmf_subsystem_allow_any_host "${NQN}" || true
+
+# 5) hard verification: the || true above must not mask a dead target
+$RPC nvmf_subsystem_get_subsystems | grep -q "\"${NQN}\"" \
+    || { echo "subsystem ${NQN} not registered - target NOT functional" >&2; exit 1; }
 
 echo "nvmf target up (transport=${TRANSPORT}, sim=${SIM}):"
 echo "  nqn        = ${NQN}"
