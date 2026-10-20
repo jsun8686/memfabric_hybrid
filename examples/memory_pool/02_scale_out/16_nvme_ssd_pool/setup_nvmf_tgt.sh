@@ -124,17 +124,20 @@ fi
 #    NOTE: this SPDK generation takes the NQN as a positional argument, and
 #    allow_any_host defaults to enabled (--allow/--enable do not exist)
 if [ "${TRANSPORT}" = "RDMA" ]; then
-    $RPC nvmf_create_transport -t RDMA -u 8192 -m 8
+    $RPC nvmf_create_transport -t RDMA -u 8192 -m 8 || true
 else
-    $RPC nvmf_create_transport -t TCP
+    $RPC nvmf_create_transport -t TCP || true
 fi
 $RPC nvmf_create_subsystem "${NQN}" || true
 $RPC nvmf_subsystem_add_listener -t "${TRANSPORT}" -a "${TRADDR}" -s "${TRSVCID}" -f IPv4 "${NQN}" || true
 $RPC nvmf_subsystem_allow_any_host "${NQN}" || true
 
 # 5) hard verification: the || true above must not mask a dead target
-$RPC nvmf_subsystem_get_subsystems | grep -q "\"${NQN}\"" \
+SUBSYS_JSON=$($RPC nvmf_subsystem_get_subsystems)
+echo "${SUBSYS_JSON}" | grep -q "\"${NQN}\"" \
     || { echo "subsystem ${NQN} not registered - target NOT functional" >&2; exit 1; }
+echo "${SUBSYS_JSON}" | grep -q "\"${TRADDR}\"" \
+    || { echo "listener ${TRADDR}:${TRSVCID} not registered - target NOT functional" >&2; exit 1; }
 
 echo "nvmf target up (transport=${TRANSPORT}, sim=${SIM}):"
 echo "  nqn        = ${NQN}"
