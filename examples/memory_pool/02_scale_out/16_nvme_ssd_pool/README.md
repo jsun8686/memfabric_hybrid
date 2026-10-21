@@ -70,6 +70,33 @@ python3 memfabric_client.py --store tcp://127.0.0.1:8588
 sim（TCP loopback + malloc 盘）数值仅用于功能验证，一般远低于真盘；真盘参考目标为多盘聚合
 20GB/s+（RDMA transport）。
 
+## 跨机 RDMA（模拟盘）
+
+单机 TCP sim 之外，还可用**真实 RDMA 网络背书模拟盘**跨机验证（FAR/NEAR 两节点）：
+
+**拓扑**（示例 IP，按实际替换）：
+
+| 角色 | 节点 | RDMA 口（数据面 4420） | 管理口（store/group RPC） |
+|---|---|---|---|
+| FAR（target+daemon） | 33 | 192.168.200.10（mlx5） | 10.90.22.33 |
+| NEAR（client） | 35 | 192.168.200.11（mlx5） | 10.90.22.35 |
+
+**前置**（两节点）：`/dev/infiniband/uverbs*` 容器内可访问；rdma-core（`libibverbs.so.1`/`librdmacm.so.1`）；RoCE 口互通（ping）。仅 FAR 侧：SPDK 须以 `./configure --with-shared --with-rdma` **重编**（增量 make 不感知 configure 变化，需 `make clean` 后全量）+ isa-l 共享库部署（见前置条件）；hugepages ≥2048×2M。NEAR 侧：从 FAR 同步 `spdk/build/lib` 与 `spdk/dpdk/build/lib` 至同路径 + 安装同版 whl。
+
+**命令序列**：
+
+```bash
+# FAR(33)：模拟盘 + RDMA listener（traddr 用本机 RoCE IP）
+sudo SPDK_ROOT=/home/s00799406/spdk bash ./setup_nvmf_tgt.sh 192.168.200.10 --sim --rdma
+# daemon：MF_NVME_TRADDR=192.168.200.10（其余 env 同单机 sim），--store tcp://10.90.22.33:8588
+
+# NEAR(35)：双库路径 + RDMA 协议位
+export LD_LIBRARY_PATH=/home/s00799406/spdk/dpdk/build/lib:/home/s00799406/spdk/build/lib:$LD_LIBRARY_PATH
+python3 memfabric_client.py --store tcp://10.90.22.33:8588 --nvme-transport rdma
+```
+
+控制面走管理口（store 8588 / rpc 端口段），数据面走 RDMA 口 4420——两网段均须互通。
+
 ## 双节点真盘变体
 
 1. FAR 节点：`sudo bash ./setup_nvmf_tgt.sh <存储面IP>`（默认 RDMA transport；脚本内

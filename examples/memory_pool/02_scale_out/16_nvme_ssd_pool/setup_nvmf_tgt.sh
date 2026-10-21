@@ -23,7 +23,9 @@
 #   prints the LD_LIBRARY_PATH the NEAR side needs for dlopen. Without SPDK_ROOT
 #   a package install layout is assumed (systemd unit + rpc.py on PATH).
 #
-# Usage: sudo [SPDK_ROOT=...] bash ./setup_nvmf_tgt.sh <traddr> [bdev] [--sim]
+# Usage: sudo [SPDK_ROOT=...] bash ./setup_nvmf_tgt.sh <traddr> [bdev] [--sim] [--tcp|--rdma|--transport=TCP|RDMA]
+#   transport defaults to TCP with --sim (loopback) and RDMA otherwise;
+#   "--sim --rdma" = simulated malloc disk behind a real RDMA listener (cross-node)
 # (bash is required; invoking via sh re-execs bash automatically)
 
 # re-exec under bash when mistakenly invoked via sh/dash (dash lacks pipefail)
@@ -33,13 +35,16 @@ set -eu
 TRADDR=""
 BASE_BDEV=""
 SIM=0
+TRANSPORT=""
 for arg in "$@"; do
     case "${arg}" in
         --sim) SIM=1 ;;
+        --tcp|--transport=TCP|--transport=tcp) TRANSPORT="TCP" ;;
+        --rdma|--transport=RDMA|--transport=rdma) TRANSPORT="RDMA" ;;
         *) if [ -z "${TRADDR}" ]; then TRADDR="${arg}"; else BASE_BDEV="${arg}"; fi ;;
     esac
 done
-: "${TRADDR:?usage: $0 <traddr> [bdev] [--sim]}"
+: "${TRADDR:?usage: $0 <traddr> [bdev] [--sim] [--tcp|--rdma|--transport=TCP|RDMA]}"
 
 if [ -z "${BASE_BDEV}" ]; then
     # sim default is the malloc bdev created below, real default is the first NVMe drive
@@ -48,8 +53,12 @@ fi
 TRSVCID=4420
 NQN="nqn.2016-06.io.spdk:memfabric"
 SIM_SIZE_MB="${SIM_SIZE_MB:-1024}"
-TRANSPORT="RDMA"
-if [ "${SIM}" = 1 ]; then TRANSPORT="TCP"; fi
+# transport defaults to loopback TCP for the disk-less simulation, RDMA otherwise;
+# "--sim --rdma" combines a simulated malloc bdev with a real RDMA listener
+# (cross-node runs: traddr = this node's RoCE IP, build SPDK with --with-rdma)
+if [ -z "${TRANSPORT}" ]; then
+    if [ "${SIM}" = 1 ]; then TRANSPORT="TCP"; else TRANSPORT="RDMA"; fi
+fi
 RPC_SOCK=/var/tmp/spdk.sock
 
 SPDK_ROOT="${SPDK_ROOT:-}"
@@ -64,8 +73,9 @@ else
 fi
 RPC="python3 ${RPC_PY} -s ${RPC_SOCK}"
 
-# 0) simulation needs DPDK hugepages for the malloc bdev (4G of 2M pages, no-op if already there)
-if [ "${SIM}" = 1 ]; then
+# 0) the malloc bdev (sim) and the RDMA transport buffers both need DPDK hugepages
+#    (4G of 2M pages, no-op if already there)
+if [ "${SIM}" = 1 ] || [ "${TRANSPORT}" = "RDMA" ]; then
     HUGEPD=/sys/kernel/mm/hugepages/hugepages-2048kB
     WANT=2048
     HAVE=$(cat "${HUGEPD}/nr_hugepages")
@@ -168,7 +178,11 @@ echo "  listener   = ${TRADDR}:${TRSVCID}"
 echo "  base bdev  = ${BASE_BDEV} (extents are carved as uniform splits by the daemon)"
 if [ "${SIM}" = 1 ]; then
     echo "daemon env  : MF_NVME_NQN=${NQN} MF_NVME_TRADDR=${TRADDR} MF_NVME_BASE_BDEV=${BASE_BDEV}"
-    echo "client op   : data_op_type = NVME_TCP (single media; FAR verifies the TCP listener matches)"
+    if [ "${TRANSPORT}" = "RDMA" ]; then
+        echo "client op   : data_op_type = NVME_RDMA (simulated disk, real RDMA listener)"
+    else
+        echo "client op   : data_op_type = NVME_TCP (single media; FAR verifies the TCP listener matches)"
+    fi
 else
     echo "daemon env  : MF_NVME_NQN=${NQN} MF_NVME_TRADDR=${TRADDR} MF_NVME_BASE_BDEV=${BASE_BDEV}"
     echo "client op   : data_op_type = <host op> | NVME_RDMA (FAR verifies the RDMA listener matches)"
