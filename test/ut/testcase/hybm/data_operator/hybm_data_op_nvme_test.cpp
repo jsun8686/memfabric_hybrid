@@ -71,7 +71,7 @@ public:
         DlNvmeApi::gSpdkDmaMalloc = FakeDmaMalloc;
         DlNvmeApi::gSpdkDmaFree = FakeDmaFree;
         DlNvmeApi::gSpdkNvmeConnect = FakeConnect;
-        DlNvmeApi::gSpdkNvmeGetDefaultCtrlrOpts = nullptr; /* exercise the zero-init fallback */
+        DlNvmeApi::gSpdkNvmeGetDefaultCtrlrOpts = FakeGetDefaultCtrlrOpts; /* main 856-byte path */
         DlNvmeApi::gSpdkNvmeDetach = FakeDetach;
         DlNvmeApi::gSpdkNvmeCtrlrGetNs = FakeGetNs;
         DlNvmeApi::gSpdkNvmeCtrlrAllocIoQpair = FakeAllocQpair;
@@ -148,6 +148,14 @@ private:
     {
         (void)legacyMem;
         return 0;
+    }
+
+    /* fills a pseudo-default opts block; the sentinel KAT proves the operator
+     * really overrides it to 0 (disabled) on its connect path */
+    static void FakeGetDefaultCtrlrOpts(void *opts, size_t optsSize)
+    {
+        memset(opts, 0, optsSize);
+        static_cast<MfSpdkNvmeCtrlrOptsPrefix *>(opts)->keepAliveTimeoutMs = 12345;
     }
 
     static void *FakeDmaMalloc(size_t size, size_t align, uint64_t *phys)
