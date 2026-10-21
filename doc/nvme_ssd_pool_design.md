@@ -282,6 +282,7 @@ SPDK 共享库（`--with-shared` 构建）的部分运行时依赖**不进 DT_NE
 | 2 | `crc16_t10dif` | `libisal.so.2/.so` | SPDK 默认把 isa-l 静态链入 target，需 `<spdk>/isa-l` 子目录手动 `autogen/configure/make` 产共享版并部署到 `build/lib`（SPDK 重编后重做） |
 | 3 | `rte_mempool_ops_table` 等 | DPDK 全家 `librte_*.so*` | 目录扫描预载：`MF_NVME_DPDK_LIB_DIR` 显式优先，默认遍历 `LD_LIBRARY_PATH`（部署要求含 `<spdk>/build/lib` 与 `<spdk>/dpdk/build/lib` 双路径） |
 | 4 | `OPENSSL_init_ssl` | `libssl.so.3/.1.1` | 系统包 |
+| 5 | `sock connection error`（连接从未发起） | `libspdk_sock_posix.so` | sock 实现经 `SPDK_NET_IMPL_REGISTER_DEFAULT` **constructor** 注册进框架注册表并设默认实现（v25.05.x `sock_module.h`）；constructor 仅在库加载时运行，且该库不在任何 DT_NEEDED（应用靠链接期显式带入）。dlopen 宿主不预载则 `spdk_sock_connect_ext` 对空注册表**静默返回 NULL**（`sock.c` 循环零次），内核 `connect()` 从不发起。诊断特征：strace 无对应 connect 系统调用 |
 
 ### external-EAL 初始化（SPDK dynamic 注册模式）
 

@@ -97,9 +97,15 @@ static void PreloadDeps()
     static const char *cryptoSo[] = {"libcrypto.so.3", "libcrypto.so.1.1", "libcrypto.so"};
     static const char *isalSo[] = {"libisal.so.2", "libisal.so"};
     static const char *sslSo[] = {"libssl.so.3", "libssl.so.1.1", "libssl.so"};
+    /* the sock implementations register themselves (and set the default impl) via
+     * SPDK_NET_IMPL_REGISTER_DEFAULT constructors that only run when the library is
+     * loaded -- apps pull them in at link time, a dlopen host must preload them or
+     * spdk_sock_connect_ext silently returns NULL without ever calling connect() */
+    static const char *sockSo[] = {"libspdk_sock_posix.so"};
     PreloadFirstOf(cryptoSo, sizeof(cryptoSo) / sizeof(cryptoSo[0]));
     PreloadFirstOf(isalSo, sizeof(isalSo) / sizeof(isalSo[0]));
     PreloadFirstOf(sslSo, sizeof(sslSo) / sizeof(sslSo[0]));
+    PreloadFirstOf(sockSo, sizeof(sockSo) / sizeof(sockSo[0]));
 
     /* DPDK libraries: an explicit dir wins, otherwise scan every LD_LIBRARY_PATH
      * entry (the deployment already puts <spdk>/dpdk/build/lib there) */
