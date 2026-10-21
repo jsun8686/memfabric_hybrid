@@ -29,6 +29,7 @@ SpdkEnvDpdkPostInitFunc DlNvmeApi::gSpdkEnvDpdkPostInit;
 SpdkDmaMallocFunc DlNvmeApi::gSpdkDmaMalloc;
 SpdkDmaFreeFunc DlNvmeApi::gSpdkDmaFree;
 SpdkNvmeConnectFunc DlNvmeApi::gSpdkNvmeConnect;
+SpdkNvmeGetDefaultCtrlrOptsFunc DlNvmeApi::gSpdkNvmeGetDefaultCtrlrOpts;
 SpdkNvmeDetachFunc DlNvmeApi::gSpdkNvmeDetach;
 SpdkNvmeCtrlrGetNsFunc DlNvmeApi::gSpdkNvmeCtrlrGetNs;
 SpdkNvmeCtrlrAllocIoQpairFunc DlNvmeApi::gSpdkNvmeCtrlrAllocIoQpair;
@@ -166,6 +167,10 @@ Result DlNvmeApi::LoadLibrary()
     DL_LOAD_SYM(gSpdkDmaMalloc, SpdkDmaMallocFunc, gEnvHandle, "spdk_dma_malloc");
     DL_LOAD_SYM(gSpdkDmaFree, SpdkDmaFreeFunc, gEnvHandle, "spdk_dma_free");
     DL_LOAD_SYM(gSpdkNvmeConnect, SpdkNvmeConnectFunc, gNvmeHandle, "spdk_nvme_connect");
+    /* optional: fills the ctrlr opts prefix with library defaults; absent builds
+     * fall back to a zero-initialized prefix (only keepAliveTimeoutMs=0 matters) */
+    DL_LOAD_SYM_OPTIONAL(gSpdkNvmeGetDefaultCtrlrOpts, SpdkNvmeGetDefaultCtrlrOptsFunc, gNvmeHandle,
+                         "spdk_nvme_ctrlr_get_default_ctrlr_opts");
     DL_LOAD_SYM(gSpdkNvmeDetach, SpdkNvmeDetachFunc, gNvmeHandle, "spdk_nvme_detach");
     DL_LOAD_SYM(gSpdkNvmeCtrlrGetNs, SpdkNvmeCtrlrGetNsFunc, gNvmeHandle, "spdk_nvme_ctrlr_get_ns");
     DL_LOAD_SYM(gSpdkNvmeCtrlrAllocIoQpair, SpdkNvmeCtrlrAllocIoQpairFunc, gNvmeHandle,
@@ -233,6 +238,7 @@ void DlNvmeApi::CleanupLibrary()
     gSpdkDmaMalloc = nullptr;
     gSpdkDmaFree = nullptr;
     gSpdkNvmeConnect = nullptr;
+    gSpdkNvmeGetDefaultCtrlrOpts = nullptr;
     gSpdkNvmeDetach = nullptr;
     gSpdkNvmeCtrlrGetNs = nullptr;
     gSpdkNvmeCtrlrAllocIoQpair = nullptr;

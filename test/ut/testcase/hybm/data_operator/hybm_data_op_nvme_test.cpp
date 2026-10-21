@@ -53,6 +53,7 @@ public:
         saved_.dmaMalloc = DlNvmeApi::gSpdkDmaMalloc;
         saved_.dmaFree = DlNvmeApi::gSpdkDmaFree;
         saved_.connect = DlNvmeApi::gSpdkNvmeConnect;
+        saved_.getDefaultOpts = DlNvmeApi::gSpdkNvmeGetDefaultCtrlrOpts;
         saved_.detach = DlNvmeApi::gSpdkNvmeDetach;
         saved_.getNs = DlNvmeApi::gSpdkNvmeCtrlrGetNs;
         saved_.allocQpair = DlNvmeApi::gSpdkNvmeCtrlrAllocIoQpair;
@@ -70,6 +71,7 @@ public:
         DlNvmeApi::gSpdkDmaMalloc = FakeDmaMalloc;
         DlNvmeApi::gSpdkDmaFree = FakeDmaFree;
         DlNvmeApi::gSpdkNvmeConnect = FakeConnect;
+        DlNvmeApi::gSpdkNvmeGetDefaultCtrlrOpts = nullptr; /* exercise the zero-init fallback */
         DlNvmeApi::gSpdkNvmeDetach = FakeDetach;
         DlNvmeApi::gSpdkNvmeCtrlrGetNs = FakeGetNs;
         DlNvmeApi::gSpdkNvmeCtrlrAllocIoQpair = FakeAllocQpair;
@@ -88,6 +90,7 @@ public:
         DlNvmeApi::gSpdkDmaMalloc = saved_.dmaMalloc;
         DlNvmeApi::gSpdkDmaFree = saved_.dmaFree;
         DlNvmeApi::gSpdkNvmeConnect = saved_.connect;
+        DlNvmeApi::gSpdkNvmeGetDefaultCtrlrOpts = saved_.getDefaultOpts;
         DlNvmeApi::gSpdkNvmeDetach = saved_.detach;
         DlNvmeApi::gSpdkNvmeCtrlrGetNs = saved_.getNs;
         DlNvmeApi::gSpdkNvmeCtrlrAllocIoQpair = saved_.allocQpair;
@@ -121,6 +124,8 @@ public:
     uint32_t nsidSeen = 0;
     uint32_t maxXfer = 128U * 1024U; /* reported MDTS, per-test adjustable */
     MfSpdkNvmeTransportId lastTrid{};
+    size_t lastOptsSize = 0;
+    uint32_t lastKeepAliveMs = 0xFFFFFFFF;
 
 private:
     struct Saved {
@@ -128,6 +133,7 @@ private:
         SpdkDmaMallocFunc dmaMalloc;
         SpdkDmaFreeFunc dmaFree;
         SpdkNvmeConnectFunc connect;
+        SpdkNvmeGetDefaultCtrlrOptsFunc getDefaultOpts;
         SpdkNvmeDetachFunc detach;
         SpdkNvmeCtrlrGetNsFunc getNs;
         SpdkNvmeCtrlrAllocIoQpairFunc allocQpair;
@@ -162,10 +168,13 @@ private:
     static void *FakeConnect(const MfSpdkNvmeTransportId *trid, const void *opts, size_t optsSize)
     {
         auto &s = Instance();
-        (void)opts;
-        (void)optsSize;
         s.connectCalls += 1;
         s.lastTrid = *trid;
+        s.lastOptsSize = optsSize;
+        s.lastKeepAliveMs = 0xFFFFFFFF;
+        if (opts != nullptr && optsSize >= sizeof(MfSpdkNvmeCtrlrOptsPrefix)) {
+            s.lastKeepAliveMs = static_cast<const MfSpdkNvmeCtrlrOptsPrefix *>(opts)->keepAliveTimeoutMs;
+        }
         return FAKE_CTRLR;
     }
 
@@ -348,6 +357,8 @@ TEST_F(HybmDataOpNvmeTest, AlignedWrite_IssuesSingleLbaCommand)
     ASSERT_EQ(op.DataCopy(params, HYBM_LOCAL_HOST_TO_GLOBAL_NVME, ExtOptions{}), BM_OK);
 
     ASSERT_EQ(stub.connectCalls, 1U);
+    ASSERT_EQ(stub.lastOptsSize, sizeof(MfSpdkNvmeCtrlrOptsPrefix)); /* opts_size ABI prefix */
+    ASSERT_EQ(stub.lastKeepAliveMs, 0U); /* KAT disabled: the host never polls the admin qpair */
     ASSERT_EQ(stub.nsidSeen, 2U);
     ASSERT_STREQ(stub.lastTrid.trstring, "rdma");
     ASSERT_EQ(stub.lastTrid.trtype, 1U); /* RDMA: nvme-oF spec trtype, must be set explicitly */

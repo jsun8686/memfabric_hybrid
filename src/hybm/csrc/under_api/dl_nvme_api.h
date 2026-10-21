@@ -50,6 +50,24 @@ enum MfSpdkNvmfAdrfam {
     MF_SPDK_NVMF_ADRFAM_IPV6 = 2,
 };
 
+/* Leading fields of upstream struct spdk_nvme_ctrlr_opts (v25.05 include/spdk/nvme.h,
+ * field order verified). spdk_nvme_connect() takes the caller-declared size and
+ * populates the remaining fields with defaults, so a 20-byte prefix is ABI-legal. */
+struct MfSpdkNvmeCtrlrOptsPrefix {
+    uint32_t numIoQueues;          /* 0 = driver default */
+    bool useCmbSqs;
+    bool noShnNotification;
+    bool enableInterrupts;
+    uint8_t reserved7;             /* upstream hole at byte 7 */
+    uint32_t arbMechanism;         /* enum spdk_nvme_cc_ams */
+    uint8_t arbitrationBurst;
+    uint8_t lowPriorityWeight;
+    uint8_t mediumPriorityWeight;
+    uint8_t highPriorityWeight;
+    uint32_t keepAliveTimeoutMs;   /* 0 = disabled */
+};
+static_assert(sizeof(MfSpdkNvmeCtrlrOptsPrefix) == 20, "must match the upstream opts prefix layout");
+
 /* callback of an NVMe IO command; cpl points to struct spdk_nvme_cpl (opaque here) */
 using MfSpdkNvmeCmdCb = void (*)(void *ctx, const void *cpl);
 
@@ -59,6 +77,7 @@ using SpdkDmaFreeFunc = void (*)(void *buf);
 /* v25.05 ABI: spdk_nvme_connect carries (opts, opts_size) -- opts==NULL with
  * opts_size==0 selects the default options (no TLS/PSK keys) */
 using SpdkNvmeConnectFunc = void *(*)(const MfSpdkNvmeTransportId *trid, const void *opts, size_t optsSize);
+using SpdkNvmeGetDefaultCtrlrOptsFunc = void (*)(void *opts, size_t optsSize);
 using SpdkNvmeDetachFunc = int (*)(void *ctrlr);
 using SpdkNvmeCtrlrGetNsFunc = void *(*)(void *ctrlr, uint32_t nsid);
 using SpdkNvmeCtrlrAllocIoQpairFunc = void *(*)(void *ctrlr, const void *opts, size_t optsSize);
@@ -114,7 +133,16 @@ public:
         if (gSpdkNvmeConnect == nullptr) {
             return BM_UNDER_API_UNLOAD;
         }
-        ctrlr = gSpdkNvmeConnect(&trid, nullptr, 0);
+        /* keep-alive MUST be disabled: this host never polls the admin qpair, so the
+         * library would never submit KAT commands and the target disconnects us after
+         * the default 10s timeout (verified: nvmf_ctrlr_keep_alive_poll disconnect).
+         * The opts_size ABI accepts just the leading fields, the rest get defaults. */
+        MfSpdkNvmeCtrlrOptsPrefix opts {};
+        if (gSpdkNvmeGetDefaultCtrlrOpts != nullptr) {
+            gSpdkNvmeGetDefaultCtrlrOpts(&opts, sizeof(opts));
+        }
+        opts.keepAliveTimeoutMs = 0;
+        ctrlr = gSpdkNvmeConnect(&trid, &opts, sizeof(opts));
         return ctrlr != nullptr ? BM_OK : BM_ERROR;
     }
 
@@ -192,6 +220,7 @@ public:
     static SpdkDmaMallocFunc gSpdkDmaMalloc;
     static SpdkDmaFreeFunc gSpdkDmaFree;
     static SpdkNvmeConnectFunc gSpdkNvmeConnect;
+    static SpdkNvmeGetDefaultCtrlrOptsFunc gSpdkNvmeGetDefaultCtrlrOpts;
     static SpdkNvmeDetachFunc gSpdkNvmeDetach;
     static SpdkNvmeCtrlrGetNsFunc gSpdkNvmeCtrlrGetNs;
     static SpdkNvmeCtrlrAllocIoQpairFunc gSpdkNvmeCtrlrAllocIoQpair;

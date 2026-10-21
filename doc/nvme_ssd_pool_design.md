@@ -288,6 +288,10 @@ SPDK 共享库（`--with-shared` 构建）的部分运行时依赖**不进 DT_NE
 
 `spdk_dma_malloc`/qpair 缓冲依赖活的 DPDK EAL；`spdk_env_dpdk_post_init` 的前提是宿主已自行 `rte_eal_init`。`DlNvmeApi::InitDpdkEnv` 已内置：`dlsym(RTLD_DEFAULT,"rte_eal_init")`（DPDK 全家已预载故符号必在）→ `rte_eal_init("memfabric-nvme","--in-memory")`——**免 hugepage、免共享配置文件**，容器 sim 零依赖；幂等（二次调用 ALREADY 被忽略）；无 DPDK 符号（UT stub 场景）返回 NOT_SUPPORTED 由 `EnsureReady` 容忍。
 
+### Keep-Alive 必须禁用（target 侧 keep alive timeout 断链，实证）
+
+SPDK 默认 `keep_alive_timeout_ms=10000`，库自动发 KAT 的前提是宿主**周期轮询 admin qpair**（官方文档明示）。本库按需只轮询 io qpair → KAT 从未发送 → target 侧 `nvmf_ctrlr_keep_alive_poll` 在 connect 后整 10s 断链（target/client 日志毫秒级吻合），在飞的 IO 报 `CQ transport error -6 (ENXIO)`。周期轮询 admin qpair 不可行（IO 空闲 >10s 仍断链，且需常驻线程违背按需设计），故 connect 时经 **opts_size 前缀 ABI**（`MfSpdkNvmeCtrlrOptsPrefix`，20 字节，仅声明前缀字段、其余库默认）显式 `keep_alive_timeout_ms=0` 禁用 target 端监控。
+
 ### SPDK v25.05 initiator ABI 三坑（gdb 栈实证）
 
 | 坑 | 现象与机理 | 对策（已内置） |
