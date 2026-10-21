@@ -272,6 +272,17 @@ SPDK 的 MR 只覆盖 NEAR pinned host DRAM，永远看不到 HBM/GVA——两�
 
 ## 15. 实施联调记录（持续追加）
 
+### 联调终态（2026-10-21，commit 12cd6b9/bb9157b）
+
+**sim 双形态数据面全通，均含 64MB round-trip / 子扇区 RMW / MDTS 拆分 BW 矩阵 / 干净退出**：
+
+| 形态 | 拓扑 | 传输 | 峰值 BW |
+|---|---|---|---|
+| 单机无盘模拟 | 单容器（33） | NVMe/TCP loopback | 0.02-0.03 GB/s（正确性验证） |
+| **跨机 RDMA 模拟盘** | FAR 33（192.168.200.10, mlx5）↔ NEAR 35（192.168.200.11, mlx5） | NVMe/RoCE 真实网卡 | **3.37 GB/s** |
+
+控制面跨机（store/group 走管理口 10.90.22.x）、FAR 侧协议一致性校验（op bit ↔ target transport）、NEAR 角色本地无 target 的降级路径（DEBUG 化）均验证。UT：HybmDataOpNvme 8/8（含 opts 前缀偏移/trtype/KAT=0 哨兵断言）。
+
 ### dlopen 宿主依赖链（SPDK 25.05 实证）
 
 SPDK 共享库（`--with-shared` 构建）的部分运行时依赖**不进 DT_NEEDED**（原生程序如 `nvmf_tgt` 靠链接期全家桶），dlopen 宿主必须自行以 `RTLD_NOW|RTLD_GLOBAL` 预载注入全局符号表，否则 `undefined symbol`。实证四环，`dl_nvme_api.cpp` 的 `PreloadDeps` 已内置：

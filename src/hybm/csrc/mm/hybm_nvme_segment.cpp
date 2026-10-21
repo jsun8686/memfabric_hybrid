@@ -150,8 +150,14 @@ bool SpdkNvmfAdminClient::Roundtrip(const std::string &request, std::string &res
     addr.sun_family = AF_UNIX;
     (void)strncpy(addr.sun_path, sockPath.c_str(), sizeof(addr.sun_path) - 1);
     if (connect(fd, reinterpret_cast<struct sockaddr *>(&addr), sizeof(addr)) != 0) {
-        BM_LOG_ERROR("nvme admin: connect " << sockPath << " failed, errno: " << errno
-                                            << " -- is the nvmf target up?");
+        /* ENOENT = no local target at all: the steady state on a NEAR node (the admin
+         * checks below are FAR-only), not worth an ERROR line */
+        if (errno == ENOENT) {
+            BM_LOG_DEBUG("nvme admin: no local nvmf target at " << sockPath << " (NEAR role)");
+        } else {
+            BM_LOG_ERROR("nvme admin: connect " << sockPath << " failed, errno: " << errno
+                                                << " -- is the nvmf target up?");
+        }
         close(fd);
         return false;
     }
@@ -415,8 +421,9 @@ Result HybmNvmeSegment::ReserveMemorySpace(void **address) noexcept
 
     if (!admin_->Healthy()) {
         /* keep the band: the target may come up later; allocations fail fast meanwhile and the
-         * capacity report drops to zero so placement stops choosing this node */
-        BM_LOG_WARN("nvme segment: local nvmf target not reachable now, extents cannot be exposed yet");
+         * capacity report drops to zero so placement stops choosing this node. Also the steady
+         * state on a NEAR node (no local target), hence DEBUG not WARN */
+        BM_LOG_DEBUG("nvme segment: local nvmf target not reachable now, extents cannot be exposed yet");
     } else {
         /* protocol consistency: the pool op bit (carried to this FAR entity by the
          * create/JOIN_ALLOC control plane) declares the transport the initiators speak;
