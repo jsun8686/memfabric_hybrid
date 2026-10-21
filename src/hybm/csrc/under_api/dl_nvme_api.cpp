@@ -11,6 +11,9 @@
  */
 #include "dl_nvme_api.h"
 #include <cstdlib>
+#include <cstring>
+#include <string>
+#include <dirent.h>
 #include <dlfcn.h>
 #include "hybm_define.h"
 
@@ -47,19 +50,79 @@ static const char *NvmeLibName()
     return (env != nullptr && env[0] != '\0') ? env : "libspdk_nvme.so";
 }
 
-/* libspdk_util references OpenSSL symbols (EVP_MD_CTX_free, ...) but the as-linked
- * shared objects may not record libcrypto in DT_NEEDED -- native spdk apps get it
- * from their link-time -lcrypto, a dlopen host must inject it into the global
- * namespace itself, or RTLD_NOW fails with "undefined symbol: EVP_MD_CTX_free" */
-static void PreloadCrypto()
+/* try each soname variant of one dependency, first hit wins; handles are leaked
+ * on purpose: process-wide lifetime */
+static void PreloadFirstOf(const char *const *candidates, size_t count)
 {
-    static const char *candidates[] = {"libcrypto.so.3", "libcrypto.so.1.1", "libcrypto.so"};
-    for (const char *name : candidates) {
-        if (dlopen(name, RTLD_NOW | RTLD_GLOBAL) != nullptr) {
-            return; /* process-wide lifetime: the handle is intentionally leaked */
+    for (size_t i = 0; i < count; i++) {
+        if (dlopen(candidates[i], RTLD_NOW | RTLD_GLOBAL) != nullptr) {
+            return;
         }
     }
-    /* not fatal: the host process may already carry the OpenSSL symbols */
+    /* not fatal: the host process may already carry the symbols */
+}
+
+/* dlopen() every librte_*.so* found in dir (symlink variants resolve to the same
+ * object, the refcount bump is idempotent); returns how many were loaded */
+static int PreloadDpdkDir(const char *dir)
+{
+    DIR *dirHandle = opendir(dir);
+    if (dirHandle == nullptr) {
+        return 0;
+    }
+    int loaded = 0;
+    struct dirent *entry = nullptr;
+    while ((entry = readdir(dirHandle)) != nullptr) {
+        if (strncmp(entry->d_name, "librte_", strlen("librte_")) != 0 || strstr(entry->d_name, ".so") == nullptr) {
+            continue;
+        }
+        std::string path(dir);
+        path += "/";
+        path += entry->d_name;
+        if (dlopen(path.c_str(), RTLD_NOW | RTLD_GLOBAL) != nullptr) {
+            loaded++;
+        }
+    }
+    closedir(dirHandle);
+    return loaded;
+}
+
+/* SPDK shared objects omit several runtime deps from DT_NEEDED (native apps such
+ * as nvmf_tgt get them at link time); a dlopen host must inject them into the
+ * global namespace itself, or RTLD_NOW fails with "undefined symbol". Verified
+ * dependency chain: libcrypto (EVP_MD_CTX_free) -> libisal (crc16_t10dif) ->
+ * DPDK set (rte_mempool_ops_table, ...) -> libssl (OPENSSL_init_ssl) */
+static void PreloadDeps()
+{
+    static const char *cryptoSo[] = {"libcrypto.so.3", "libcrypto.so.1.1", "libcrypto.so"};
+    static const char *isalSo[] = {"libisal.so.2", "libisal.so"};
+    static const char *sslSo[] = {"libssl.so.3", "libssl.so.1.1", "libssl.so"};
+    PreloadFirstOf(cryptoSo, sizeof(cryptoSo) / sizeof(cryptoSo[0]));
+    PreloadFirstOf(isalSo, sizeof(isalSo) / sizeof(isalSo[0]));
+    PreloadFirstOf(sslSo, sizeof(sslSo) / sizeof(sslSo[0]));
+
+    /* DPDK libraries: an explicit dir wins, otherwise scan every LD_LIBRARY_PATH
+     * entry (the deployment already puts <spdk>/dpdk/build/lib there) */
+    int dpdkLoaded = 0;
+    const char *dpdkDir = getenv("MF_NVME_DPDK_LIB_DIR");
+    if (dpdkDir != nullptr && dpdkDir[0] != '\0') {
+        dpdkLoaded = PreloadDpdkDir(dpdkDir);
+    } else {
+        const char *libPath = getenv("LD_LIBRARY_PATH");
+        if (libPath != nullptr) {
+            std::string dirs(libPath);
+            size_t pos = 0;
+            while (pos != std::string::npos) {
+                size_t colon = dirs.find(':', pos);
+                std::string dir = dirs.substr(pos, (colon == std::string::npos) ? std::string::npos : colon - pos);
+                if (!dir.empty()) {
+                    dpdkLoaded += PreloadDpdkDir(dir.c_str());
+                }
+                pos = (colon == std::string::npos) ? std::string::npos : colon + 1;
+            }
+        }
+    }
+    BM_LOG_DEBUG("nvme dependency preload done, dpdk libraries loaded: " << dpdkLoaded);
 }
 
 Result DlNvmeApi::LoadLibrary()
@@ -69,7 +132,7 @@ Result DlNvmeApi::LoadLibrary()
         return BM_OK;
     }
 
-    PreloadCrypto();
+    PreloadDeps();
 
     /* the env library exports the DMA allocator, load it GLOBAL so the nvme library
      * resolves its env dependency through the same mapping */

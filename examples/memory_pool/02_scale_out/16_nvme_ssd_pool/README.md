@@ -22,6 +22,8 @@
 | 项 | 说明 |
 |---|---|
 | SPDK | 源码树（`SPDK_ROOT`，推荐）或包安装；**须以 `./configure --with-shared` 构建**（默认只产 `.a` 静态库，NEAR 数据面 dlopen 需要 `.so`；共享形态同时依赖 `<spdk>/dpdk/build/lib` 下的 DPDK 库）。需要 `nvmf_tgt`、`rpc.py`、`build/lib` 下 `libspdk_nvme.so`/`libspdk_env_dpdk.so` |
+| isa-l 共享库 | SPDK 默认把 isa-l **静态链入** target，dlopen 宿主拿不到其符号，需手动产共享版并部署（SPDK 重编后需重做）：`cd <spdk>/isa-l && ./autogen.sh && ./configure && make -j && cp .libs/libisal.so* <spdk>/build/lib/` |
+| OpenSSL | 系统包提供 `libcrypto` 与 `libssl`（含 `EVP_MD_CTX_free`/`OPENSSL_init_ssl`，即 OpenSSL 1.1+/3.x） |
 | memfabric_hybrid | python 包装载可用（`import memfabric_hybrid`） |
 | nvmf target | `setup_nvmf_tgt.sh` 部署（见下）；容器内无 systemd 时脚本自动降级直拉（stale socket 自动探测清理） |
 
@@ -117,4 +119,4 @@ sim（TCP loopback + malloc 盘）数值仅用于功能验证，一般远低于�
 | create 报协议不一致（NOT_SUPPORTED） | 池 op 位声明的协议与 target 监听不符：sim target 是 TCP，需 `NVME_TCP` 位/`--nvme-transport tcp` |
 | extend_remote_mem(NVME) 一直失败 | daemon 侧 `MF_NVME_*` 是否齐全、target 是否可达（`rpc.py nvmf_get_subsystems`）、粒度是否大于盘容量 |
 | client 首次 IO 报库加载失败 | `LD_LIBRARY_PATH` 须含**双路径**（`<spdk>/build/lib` + `<spdk>/dpdk/build/lib`）；SPDK 须 `--with-shared` 构建（否则只有 `.a`） |
-| `undefined symbol: EVP_MD_CTX_free` | libspdk_util 的 OpenSSL 依赖未进 DT_NEEDED——加载器已内置 libcrypto 预加载（RTLD_GLOBAL 注入），重编后即消 |
+| dlopen 报 `undefined symbol: XXX` | SPDK 共享库的部分依赖未进 DT_NEEDED（原生程序靠链接期全家桶），加载器已内置预载（`RTLD_GLOBAL` 注入）：libcrypto → libisal → DPDK 全家 → libssl。符号对照：`EVP_MD_CTX_free`→libcrypto；`crc16_t10dif`→libisal（见前置条件）；`rte_*`→DPDK 目录扫描（默认扫 `LD_LIBRARY_PATH`，可用 `MF_NVME_DPDK_LIB_DIR` 显式指定）；`OPENSSL_init_ssl`→libssl。仍缺则按符号归属补系统库 |
