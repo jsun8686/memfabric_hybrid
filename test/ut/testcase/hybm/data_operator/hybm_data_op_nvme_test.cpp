@@ -138,10 +138,9 @@ private:
         SpdkNvmeQpairProcessCompletionsFunc process;
     };
 
-    static int FakePostInit(bool legacyMem, void *ctx)
+    static int FakePostInit(bool legacyMem)
     {
         (void)legacyMem;
-        (void)ctx;
         return 0;
     }
 
@@ -160,9 +159,11 @@ private:
         free(buf);
     }
 
-    static void *FakeConnect(MfSpdkNvmeTransportId *trid)
+    static void *FakeConnect(const MfSpdkNvmeTransportId *trid, const void *opts, size_t optsSize)
     {
         auto &s = Instance();
+        (void)opts;
+        (void)optsSize;
         s.connectCalls += 1;
         s.lastTrid = *trid;
         return FAKE_CTRLR;
@@ -349,6 +350,7 @@ TEST_F(HybmDataOpNvmeTest, AlignedWrite_IssuesSingleLbaCommand)
     ASSERT_EQ(stub.connectCalls, 1U);
     ASSERT_EQ(stub.nsidSeen, 2U);
     ASSERT_STREQ(stub.lastTrid.trstring, "rdma");
+    ASSERT_EQ(stub.lastTrid.trtype, 1U); /* RDMA: nvme-oF spec trtype, must be set explicitly */
     ASSERT_EQ(stub.lastTrid.adrfam, 1U); /* IPv4, an INVALID(0) adrfam is rejected by spdk clients */
     ASSERT_STREQ(stub.lastTrid.traddr, "10.90.22.35");
     ASSERT_STREQ(stub.lastTrid.trsvcid, "4420");
@@ -412,6 +414,7 @@ TEST_F(HybmDataOpNvmeTest, TcpTransport_BuildsTcpTrid)
     ASSERT_EQ(op.DataCopy(params, HYBM_LOCAL_HOST_TO_GLOBAL_NVME, ExtOptions{}), BM_OK);
 
     ASSERT_STREQ(stub.lastTrid.trstring, "tcp");
+    ASSERT_EQ(stub.lastTrid.trtype, 2U); /* TCP trtype, mapped from the transport string */
     ASSERT_EQ(stub.cmds.size(), 1U); /* full-sector direct path, no RMW */
     EXPECT_TRUE(stub.cmds[0].write);
     EXPECT_EQ(stub.cmds[0].lba, 1024U);

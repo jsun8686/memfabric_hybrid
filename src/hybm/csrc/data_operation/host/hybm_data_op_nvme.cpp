@@ -179,6 +179,7 @@ Result HostDataOpNvme::GetEndpoint(const HybmNvmeExtent &extent, NvmeEndpointPtr
     auto candidate = std::make_shared<NvmeEndpoint>();
     MfSpdkNvmeTransportId trid{};
     (void)strncpy(trid.trstring, trstring_.c_str(), sizeof(trid.trstring) - 1);
+    trid.trtype = (trstring_ == "tcp") ? MF_SPDK_NVME_TRTYPE_TCP : MF_SPDK_NVME_TRTYPE_RDMA;
     (void)strncpy(trid.traddr, extent.traddr, sizeof(trid.traddr) - 1);
     (void)strncpy(trid.trsvcid, trsvcid.c_str(), sizeof(trid.trsvcid) - 1);
     (void)strncpy(trid.subnqn, extent.nqn, sizeof(trid.subnqn) - 1);

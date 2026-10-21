@@ -286,3 +286,11 @@ SPDK 共享库（`--with-shared` 构建）的部分运行时依赖**不进 DT_NE
 ### external-EAL 初始化（SPDK dynamic 注册模式）
 
 `spdk_dma_malloc`/qpair 缓冲依赖活的 DPDK EAL；`spdk_env_dpdk_post_init` 的前提是宿主已自行 `rte_eal_init`。`DlNvmeApi::InitDpdkEnv` 已内置：`dlsym(RTLD_DEFAULT,"rte_eal_init")`（DPDK 全家已预载故符号必在）→ `rte_eal_init("memfabric-nvme","--in-memory")`——**免 hugepage、免共享配置文件**，容器 sim 零依赖；幂等（二次调用 ALREADY 被忽略）；无 DPDK 符号（UT stub 场景）返回 NOT_SUPPORTED 由 `EnsureReady` 容忍。
+
+### SPDK v25.05 initiator ABI 三坑（gdb 栈实证）
+
+| 坑 | 现象与机理 | 对策（已内置） |
+|---|---|---|
+| `spdk_nvme_connect` 自 24.09 起为 **三参** `(trid, opts, opts_size)` | 旧单参调用把 x1/x2 寄存器残留垃圾当 opts/opts_size，垃圾 opts 尾部的 `tls_psk`/`dhchap_key` 指针进 keyring 解引用 → SIGSEGV（栈顶 `spdk_key_get_name(key=0xffffffff)` ← `nvme_tcp_generate_tls_credentials`） | typedef 三参，调用传 `(trid, nullptr, 0)`（官方"opts 为 NULL 则 opts_size 须 0"路径，零 TLS） |
+| `struct spdk_nvme_transport_id` 布局 = `trstring / trtype(4B) / adrfam(4B) / traddr / trsvcid / subnqn / priority`，sizeof=604 | 自声明结构若缺 trtype 或 adrfam 位置在 traddr 之后，我们填的 traddr 字节会被 SPDK 当作 trtype/adrfam 读取 | `MfSpdkNvmeTransportId` 按上游字段序重排 + `static_assert(sizeof==604)`；`GetEndpoint` 显式填 `trtype`（tcp→2/rdma→1） |
+| `spdk_env_dpdk_post_init(bool legacy_mem)` 单 bool 参数 | 多余第二参在 ABI 上无害但属未定义行为边缘 | typedef 对齐单参 |

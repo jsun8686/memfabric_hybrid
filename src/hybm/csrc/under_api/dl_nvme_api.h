@@ -19,17 +19,26 @@ namespace mf {
 
 /* Minimal self-declared SPDK ABI subset -- the build never requires the SPDK SDK, the
  * symbols are resolved with dlopen at runtime. Layout below mirrors upstream
- * include/spdk/nvme.h struct spdk_nvme_transport_id exactly (canonical constants:
- * SPDK_NVMF_TRSTRING_MAX_LEN=32 / TRADDR=256 / TRSVCID=32 / NQN=256, arrays +1). */
+ * include/spdk/nvme.h struct spdk_nvme_transport_id exactly: field ORDER matters
+ * (trtype/adrfam are 4-byte enums placed before traddr), canonical constants:
+ * SPDK_NVMF_TRSTRING_MAX_LEN=32 / TRADDR=256 / TRSVCID=32 / NQN=256, arrays +1. */
 struct MfSpdkNvmeTransportId {
     char trstring[32 + 1];  /* transport name: "rdma" (default) or "tcp" (disk-less simulation) */
+    uint32_t trtype;        /* enum spdk_nvme_transport_type: NVMe-oF spec value, 8-bit range */
+    uint32_t adrfam;        /* enum spdk_nvmf_adrfam: 0 = INVALID, 1 = IPv4, 2 = IPv6 */
     char traddr[256 + 1];   /* target IP string */
     char trsvcid[32 + 1];   /* target port string */
-    uint8_t adrfam;         /* address family, 0 = IPv4 */
     char subnqn[256 + 1];   /* subsystem NQN */
-    uint32_t priority;      /* not used */
+    int32_t priority;       /* not used */
 };
-static_assert(sizeof(MfSpdkNvmeTransportId) == 588, "must match sizeof(struct spdk_nvme_transport_id)");
+static_assert(sizeof(MfSpdkNvmeTransportId) == 604, "must match sizeof(struct spdk_nvme_transport_id)");
+
+/* trtype values of enum spdk_nvme_transport_type for fabrics transports (the
+ * TCP/RDMA clients reject ADRFAM_INVALID, both trtype and adrfam must be set) */
+enum MfSpdkNvmeTrtype {
+    MF_SPDK_NVME_TRTYPE_RDMA = 1,
+    MF_SPDK_NVME_TRTYPE_TCP = 2,
+};
 
 /* mirrors spdk_nvmf_adrfam: 0 = INVALID, 1 = IPv4, 2 = IPv6 (the TCP/RDMA clients
  * reject an INVALID adrfam with "Unhandled ADRFAM 0", it must be set explicitly) */
@@ -42,10 +51,12 @@ enum MfSpdkNvmfAdrfam {
 /* callback of an NVMe IO command; cpl points to struct spdk_nvme_cpl (opaque here) */
 using MfSpdkNvmeCmdCb = void (*)(void *ctx, const void *cpl);
 
-using SpdkEnvDpdkPostInitFunc = int (*)(bool legacyMem, void *ctx);
+using SpdkEnvDpdkPostInitFunc = int (*)(bool legacyMem);
 using SpdkDmaMallocFunc = void *(*)(size_t size, size_t align, uint64_t *physAddr);
 using SpdkDmaFreeFunc = void (*)(void *buf);
-using SpdkNvmeConnectFunc = void *(*)(MfSpdkNvmeTransportId *trid);
+/* v25.05 ABI: spdk_nvme_connect carries (opts, opts_size) -- opts==NULL with
+ * opts_size==0 selects the default options (no TLS/PSK keys) */
+using SpdkNvmeConnectFunc = void *(*)(const MfSpdkNvmeTransportId *trid, const void *opts, size_t optsSize);
 using SpdkNvmeDetachFunc = int (*)(void *ctrlr);
 using SpdkNvmeCtrlrGetNsFunc = void *(*)(void *ctrlr, uint32_t nsid);
 using SpdkNvmeCtrlrAllocIoQpairFunc = void *(*)(void *ctrlr, const void *opts, size_t optsSize);
@@ -77,7 +88,7 @@ public:
         if (gSpdkEnvDpdkPostInit == nullptr) {
             return -1;
         }
-        return gSpdkEnvDpdkPostInit(legacyMem, nullptr);
+        return gSpdkEnvDpdkPostInit(legacyMem);
     }
 
     static inline Result DmaMalloc(size_t size, size_t align, void *&buf)
@@ -101,7 +112,7 @@ public:
         if (gSpdkNvmeConnect == nullptr) {
             return BM_UNDER_API_UNLOAD;
         }
-        ctrlr = gSpdkNvmeConnect(&trid);
+        ctrlr = gSpdkNvmeConnect(&trid, nullptr, 0);
         return ctrlr != nullptr ? BM_OK : BM_ERROR;
     }
 
