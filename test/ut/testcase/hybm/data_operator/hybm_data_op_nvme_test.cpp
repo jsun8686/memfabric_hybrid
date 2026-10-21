@@ -357,7 +357,7 @@ TEST_F(HybmDataOpNvmeTest, AlignedWrite_IssuesSingleLbaCommand)
     ASSERT_EQ(op.DataCopy(params, HYBM_LOCAL_HOST_TO_GLOBAL_NVME, ExtOptions{}), BM_OK);
 
     ASSERT_EQ(stub.connectCalls, 1U);
-    ASSERT_EQ(stub.lastOptsSize, sizeof(MfSpdkNvmeCtrlrOptsPrefix)); /* opts_size ABI prefix */
+    ASSERT_EQ(stub.lastOptsSize, MF_NVME_CTRLR_OPTS_SIZE); /* full upstream size, not a prefix */
     ASSERT_EQ(stub.lastKeepAliveMs, 0U); /* KAT disabled: the host never polls the admin qpair */
     ASSERT_EQ(stub.nsidSeen, 2U);
     ASSERT_STREQ(stub.lastTrid.trstring, "rdma");

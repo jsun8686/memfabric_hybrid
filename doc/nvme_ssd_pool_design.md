@@ -290,7 +290,9 @@ SPDK 共享库（`--with-shared` 构建）的部分运行时依赖**不进 DT_NE
 
 ### Keep-Alive 必须禁用（target 侧 keep alive timeout 断链，实证）
 
-SPDK 默认 `keep_alive_timeout_ms=10000`，库自动发 KAT 的前提是宿主**周期轮询 admin qpair**（官方文档明示）。本库按需只轮询 io qpair → KAT 从未发送 → target 侧 `nvmf_ctrlr_keep_alive_poll` 在 connect 后整 10s 断链（target/client 日志毫秒级吻合），在飞的 IO 报 `CQ transport error -6 (ENXIO)`。周期轮询 admin qpair 不可行（IO 空闲 >10s 仍断链，且需常驻线程违背按需设计），故 connect 时经 **opts_size 前缀 ABI**（`MfSpdkNvmeCtrlrOptsPrefix`，20 字节，仅声明前缀字段、其余库默认）显式 `keep_alive_timeout_ms=0` 禁用 target 端监控。
+SPDK 默认 `keep_alive_timeout_ms=10000`，库自动发 KAT 的前提是宿主**周期轮询 admin qpair**（官方文档明示）。本库按需只轮询 io qpair → KAT 从未发送 → target 侧 `nvmf_ctrlr_keep_alive_poll` 在 connect 后整 10s 断链（target/client 日志毫秒级吻合），在飞的 IO 报 `CQ transport error -6 (ENXIO)`。周期轮询 admin qpair 不可行（IO 空闲 >10s 仍断链，且需常驻线程违背按需设计），故 connect 时显式 `keep_alive_timeout_ms=0` 禁用 target 端监控。
+
+**opts_size 契约（教训记录）**：nvme.h 明示 `opts_size "Must be set to sizeof(struct spdk_nvme_ctrlr_opts), or 0 if opts is NULL"`——nvme.c 的 `nvme_ctrlr_opts_init` 只在 opts_size 范围内 default 填充与拷贝，**其内部 856B opts 的其余字段保持未初始化**；曾误按 DPDK sock_opts 的"前缀 ABI"模式传 20 字节前缀，导致内部 opts 尾部的 `tls_psk/dhchap_key` 指针域为栈垃圾 → connect 阶段 keyring 解引用 SIGSEGV。正确做法：856 字节不透明 buffer → `spdk_nvme_ctrlr_get_default_ctrlr_opts(buf, 856)` 全量默认 → 按前缀结构偏移写 `keepAliveTimeoutMs=0` → `connect(trid, buf, 856)`；`MfSpdkNvmeCtrlrOptsPrefix`（20B）仅作字段偏移定位，**不得作为 opts_size 传递**。
 
 ### SPDK v25.05 initiator ABI 三坑（gdb 栈实证）
 

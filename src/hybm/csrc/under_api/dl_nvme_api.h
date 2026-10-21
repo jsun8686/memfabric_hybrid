@@ -51,8 +51,11 @@ enum MfSpdkNvmfAdrfam {
 };
 
 /* Leading fields of upstream struct spdk_nvme_ctrlr_opts (v25.05 include/spdk/nvme.h,
- * field order verified). spdk_nvme_connect() takes the caller-declared size and
- * populates the remaining fields with defaults, so a 20-byte prefix is ABI-legal. */
+ * field order verified). OFFSET USE ONLY -- spdk_nvme_connect()'s opts_size MUST be
+ * sizeof(struct spdk_nvme_ctrlr_opts) (or 0 with opts==NULL): the library only
+ * default-fills/copies within opts_size and leaves the rest of its internal opts
+ * UNINITIALIZED, so a short prefix here feeds garbage pointers (tls_psk/dhchap)
+ * into the fabric connect and crashes. */
 struct MfSpdkNvmeCtrlrOptsPrefix {
     uint32_t numIoQueues;          /* 0 = driver default */
     bool useCmbSqs;
@@ -67,6 +70,11 @@ struct MfSpdkNvmeCtrlrOptsPrefix {
     uint32_t keepAliveTimeoutMs;   /* 0 = disabled */
 };
 static_assert(sizeof(MfSpdkNvmeCtrlrOptsPrefix) == 20, "must match the upstream opts prefix layout");
+
+/* mirrors upstream SPDK_STATIC_ASSERT(sizeof(struct spdk_nvme_ctrlr_opts) == 856);
+ * the buffer is opaque below -- field access goes through the prefix offsets only */
+static constexpr size_t MF_NVME_CTRLR_OPTS_SIZE = 856;
+static_assert(MF_NVME_CTRLR_OPTS_SIZE % alignof(uint64_t) == 0, "keeps uint64 fields aligned");
 
 /* callback of an NVMe IO command; cpl points to struct spdk_nvme_cpl (opaque here) */
 using MfSpdkNvmeCmdCb = void (*)(void *ctx, const void *cpl);
@@ -136,13 +144,18 @@ public:
         /* keep-alive MUST be disabled: this host never polls the admin qpair, so the
          * library would never submit KAT commands and the target disconnects us after
          * the default 10s timeout (verified: nvmf_ctrlr_keep_alive_poll disconnect).
-         * The opts_size ABI accepts just the leading fields, the rest get defaults. */
-        MfSpdkNvmeCtrlrOptsPrefix opts {};
+         * opts_size must be the FULL upstream size -- see MfSpdkNvmeCtrlrOptsPrefix. */
         if (gSpdkNvmeGetDefaultCtrlrOpts != nullptr) {
-            gSpdkNvmeGetDefaultCtrlrOpts(&opts, sizeof(opts));
+            alignas(8) uint8_t optsBuf[MF_NVME_CTRLR_OPTS_SIZE];
+            gSpdkNvmeGetDefaultCtrlrOpts(optsBuf, sizeof(optsBuf));
+            auto *opts = reinterpret_cast<MfSpdkNvmeCtrlrOptsPrefix *>(optsBuf);
+            opts->keepAliveTimeoutMs = 0;
+            ctrlr = gSpdkNvmeConnect(&trid, optsBuf, sizeof(optsBuf));
+        } else {
+            /* symbol absent (exotic build): fall back to library defaults -- accepts
+             * the default KAT rather than risking an undersized opts */
+            ctrlr = gSpdkNvmeConnect(&trid, nullptr, 0);
         }
-        opts.keepAliveTimeoutMs = 0;
-        ctrlr = gSpdkNvmeConnect(&trid, &opts, sizeof(opts));
         return ctrlr != nullptr ? BM_OK : BM_ERROR;
     }
 
