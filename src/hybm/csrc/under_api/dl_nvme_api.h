@@ -33,11 +33,13 @@ struct MfSpdkNvmeTransportId {
 };
 static_assert(sizeof(MfSpdkNvmeTransportId) == 596, "must match sizeof(struct spdk_nvme_transport_id)");
 
-/* trtype values of enum spdk_nvme_transport_type for fabrics transports (the
- * TCP/RDMA clients reject ADRFAM_INVALID, both trtype and adrfam must be set) */
+/* trtype values of enum spdk_nvme_transport_type for fabrics transports (NVMe
+ * spec: 1=RDMA, 2=FC, 3=TCP; transport ROUTING is by trstring, but trtype is
+ * decoded in logs and checked by spdk internals -- both fields must be set) */
 enum MfSpdkNvmeTrtype {
     MF_SPDK_NVME_TRTYPE_RDMA = 1,
-    MF_SPDK_NVME_TRTYPE_TCP = 2,
+    MF_SPDK_NVME_TRTYPE_FC = 2,
+    MF_SPDK_NVME_TRTYPE_TCP = 3,
 };
 
 /* mirrors spdk_nvmf_adrfam: 0 = INVALID, 1 = IPv4, 2 = IPv6 (the TCP/RDMA clients

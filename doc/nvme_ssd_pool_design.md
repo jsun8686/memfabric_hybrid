@@ -292,5 +292,5 @@ SPDK 共享库（`--with-shared` 构建）的部分运行时依赖**不进 DT_NE
 | 坑 | 现象与机理 | 对策（已内置） |
 |---|---|---|
 | `spdk_nvme_connect` 自 24.09 起为 **三参** `(trid, opts, opts_size)` | 旧单参调用把 x1/x2 寄存器残留垃圾当 opts/opts_size，垃圾 opts 尾部的 `tls_psk`/`dhchap_key` 指针进 keyring 解引用 → SIGSEGV（栈顶 `spdk_key_get_name(key=0xffffffff)` ← `nvme_tcp_generate_tls_credentials`） | typedef 三参，调用传 `(trid, nullptr, 0)`（官方"opts 为 NULL 则 opts_size 须 0"路径，零 TLS） |
-| `struct spdk_nvme_transport_id` 布局 = `trstring / trtype(4B) / adrfam(4B) / traddr / trsvcid / subnqn / priority`，sizeof=596（char 数组后无对齐垫） | 自声明结构若缺 trtype 或 adrfam 位置在 traddr 之后，我们填的 traddr 字节会被 SPDK 当作 trtype/adrfam 读取 | `MfSpdkNvmeTransportId` 按上游字段序重排 + `static_assert(sizeof==596)`；`GetEndpoint` 显式填 `trtype`（tcp→2/rdma→1） |
+| `struct spdk_nvme_transport_id` 布局 = `trstring / trtype(4B) / adrfam(4B) / traddr / trsvcid / subnqn / priority`，sizeof=596（char 数组后无对齐垫） | 自声明结构若缺 trtype 或 adrfam 位置在 traddr 之后，我们填的 traddr 字节会被 SPDK 当作 trtype/adrfam 读取 | `MfSpdkNvmeTransportId` 按上游字段序重排 + `static_assert(sizeof==596)`；`GetEndpoint` 显式填 `trtype`（NVMe spec：tcp→3/rdma→1，FC=2 勿混淆——transport 路由按 trstring，trtype 用于日志与内部检查） |
 | `spdk_env_dpdk_post_init(bool legacy_mem)` 单 bool 参数 | 多余第二参在 ABI 上无害但属未定义行为边缘 | typedef 对齐单参 |

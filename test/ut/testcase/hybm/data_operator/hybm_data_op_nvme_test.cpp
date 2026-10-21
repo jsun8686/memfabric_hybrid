@@ -414,7 +414,7 @@ TEST_F(HybmDataOpNvmeTest, TcpTransport_BuildsTcpTrid)
     ASSERT_EQ(op.DataCopy(params, HYBM_LOCAL_HOST_TO_GLOBAL_NVME, ExtOptions{}), BM_OK);
 
     ASSERT_STREQ(stub.lastTrid.trstring, "tcp");
-    ASSERT_EQ(stub.lastTrid.trtype, 2U); /* TCP trtype, mapped from the transport string */
+    ASSERT_EQ(stub.lastTrid.trtype, 3U); /* TCP trtype, mapped from the transport string */
     ASSERT_EQ(stub.cmds.size(), 1U); /* full-sector direct path, no RMW */
     EXPECT_TRUE(stub.cmds[0].write);
     EXPECT_EQ(stub.cmds[0].lba, 1024U);
