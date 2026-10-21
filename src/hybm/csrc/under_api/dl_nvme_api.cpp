@@ -51,7 +51,8 @@ static const char *NvmeLibName()
 }
 
 /* try each soname variant of one dependency, first hit wins; handles are leaked
- * on purpose: process-wide lifetime */
+ * on purpose: process-wide lifetime; when every variant fails the last dlerror is
+ * surfaced as a WARN -- silent tolerance here cost three debugging rounds once */
 static void PreloadFirstOf(const char *const *candidates, size_t count)
 {
     for (size_t i = 0; i < count; i++) {
@@ -60,6 +61,12 @@ static void PreloadFirstOf(const char *const *candidates, size_t count)
         }
     }
     /* not fatal: the host process may already carry the symbols */
+    const char *err = dlerror();
+    if (err != nullptr) {
+        BM_LOG_WARN("preload of " << candidates[0] << " failed (harmless when the host provides the symbols): " << err);
+    } else {
+        BM_LOG_WARN("preload of " << candidates[0] << " failed");
+    }
 }
 
 /* dlopen() every librte_*.so* found in dir (symlink variants resolve to the same
@@ -97,15 +104,9 @@ static void PreloadDeps()
     static const char *cryptoSo[] = {"libcrypto.so.3", "libcrypto.so.1.1", "libcrypto.so"};
     static const char *isalSo[] = {"libisal.so.2", "libisal.so"};
     static const char *sslSo[] = {"libssl.so.3", "libssl.so.1.1", "libssl.so"};
-    /* the sock implementations register themselves (and set the default impl) via
-     * SPDK_NET_IMPL_REGISTER_DEFAULT constructors that only run when the library is
-     * loaded -- apps pull them in at link time, a dlopen host must preload them or
-     * spdk_sock_connect_ext silently returns NULL without ever calling connect() */
-    static const char *sockSo[] = {"libspdk_sock_posix.so"};
     PreloadFirstOf(cryptoSo, sizeof(cryptoSo) / sizeof(cryptoSo[0]));
     PreloadFirstOf(isalSo, sizeof(isalSo) / sizeof(isalSo[0]));
     PreloadFirstOf(sslSo, sizeof(sslSo) / sizeof(sslSo[0]));
-    PreloadFirstOf(sockSo, sizeof(sockSo) / sizeof(sockSo[0]));
 
     /* DPDK libraries: an explicit dir wins, otherwise scan every LD_LIBRARY_PATH
      * entry (the deployment already puts <spdk>/dpdk/build/lib there) */
@@ -181,6 +182,17 @@ Result DlNvmeApi::LoadLibrary()
 
     gLoaded = true;
     BM_LOG_INFO("load SPDK env/nvme libraries for DlNvmeApi success");
+
+    /* the sock implementations register themselves (and set the default impl) via
+     * SPDK_NET_IMPL_REGISTER_DEFAULT constructors that only run when the library is
+     * loaded -- apps pull them in at link time, a dlopen host must load them or
+     * spdk_sock_connect_ext silently returns NULL without ever calling connect().
+     * ORDER MATTERS and is verified the hard way: libspdk_util references env-layer
+     * symbols (spdk_realloc) whose provider libspdk_env_dpdk.so is NOT recorded in
+     * its DT_NEEDED -- loading the sock impl before the env library fails with
+     * "undefined symbol: spdk_realloc", so this must run after the loads above */
+    static const char *sockSo[] = {"libspdk_sock_posix.so"};
+    PreloadFirstOf(sockSo, sizeof(sockSo) / sizeof(sockSo[0]));
     return BM_OK;
 }
 

@@ -120,6 +120,6 @@ sim（TCP loopback + malloc 盘）数值仅用于功能验证，一般远低于�
 | extend_remote_mem(NVME) 一直失败 | daemon 侧 `MF_NVME_*` 是否齐全、target 是否可达（`rpc.py nvmf_get_subsystems`）、粒度是否大于盘容量 |
 | client 首次 IO 报库加载失败 | `LD_LIBRARY_PATH` 须含**双路径**（`<spdk>/build/lib` + `<spdk>/dpdk/build/lib`）；SPDK 须 `--with-shared` 构建（否则只有 `.a`） |
 | dlopen 报 `undefined symbol: XXX` | SPDK 共享库的部分依赖未进 DT_NEEDED（原生程序靠链接期全家桶），加载器已内置预载（`RTLD_GLOBAL` 注入）：libcrypto → libisal → DPDK 全家 → libssl。符号对照：`EVP_MD_CTX_free`→libcrypto；`crc16_t10dif`→libisal（见前置条件）；`rte_*`→DPDK 目录扫描（默认扫 `LD_LIBRARY_PATH`，可用 `MF_NVME_DPDK_LIB_DIR` 显式指定）；`OPENSSL_init_ssl`→libssl。仍缺则按符号归属补系统库 |
-| connect 报 `sock connection error` 但 strace 看不到 `connect()` 系统调用 | sock 实现（`libspdk_sock_posix.so`）未注册：其 constructor（`SPDK_NET_IMPL_REGISTER_DEFAULT`）只在库被加载时运行，且不在任何 DT_NEEDED 里——加载器已内置预载第 5 环，随库重编生效 |
+| connect 报 `sock connection error` 但 strace 看不到 `connect()` 系统调用 | sock 实现（`libspdk_sock_posix.so`）未注册：其 constructor（`SPDK_NET_IMPL_REGISTER_DEFAULT`）只在库被加载时运行，且不在任何 DT_NEEDED 里。加载器已内置第 5 环预载，且**必须在 env 库之后**加载——`libspdk_util` 引用的 `spdk_realloc`（env 层符号）在 env 库进全局表前无法解析；预载失败会打 WARN（含 dlerror），随库重编生效 |
 | IO 前报 `alloc rmw scratch failed` | DPDK EAL 未初始化——`spdk_dma_malloc` 无内存子系统可用；加载器已内置 `rte_eal_init --in-memory`（**无需 hugepage 配置**），随库重编生效 |
 | connect 阶段段错误（keyring/TLS 栈） | SPDK 24.09+ 的 `spdk_nvme_connect` 为三参 ABI，旧单参调用把寄存器垃圾当 opts（含 TLS key 指针）；已按 v25.05 对齐三参与 trid 布局（sizeof 604），随库重编生效 |

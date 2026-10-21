@@ -71,7 +71,7 @@ if [ "${SIM}" = 1 ]; then
     HAVE=$(cat "${HUGEPD}/nr_hugepages")
     if [ "${HAVE}" -lt "${WANT}" ]; then
         echo "${WANT}" > "${HUGEPD}/nr_hugepages" || {
-            echo "cannot raise hugepages to ${WANT} (have ${HAVE}); free memory or set SIM_SIZE_MB smaller" >&2
+            echo "cannot raise hugepages to ${WANT} (have ${HAVE}); run with sudo, free memory, or set SIM_SIZE_MB smaller" >&2
             exit 1
         }
     fi
@@ -80,19 +80,24 @@ fi
 # 1) target daemon: systemd service when available, direct nohup launch otherwise
 #    (containers usually have no systemd as PID 1)
 start_tgt_direct() {
-    # a --with-shared build links DPDK libs from <spdk>/dpdk/build/lib -- prepend it
-    # so a bare invocation without an exported LD_LIBRARY_PATH still works
-    local dpdk_lib="${SPDK_ROOT}/dpdk/build/lib"
+    # a --with-shared build resolves its own module libs from <spdk>/build/lib and the
+    # DPDK libs from <spdk>/dpdk/build/lib -- prepend BOTH so a bare invocation without
+    # an exported LD_LIBRARY_PATH still works
     local ld_path="${LD_LIBRARY_PATH:-}"
-    if [ -n "${SPDK_ROOT}" ] && [ -d "${dpdk_lib}" ]; then
-        ld_path="${dpdk_lib}:${ld_path}"
+    if [ -n "${SPDK_ROOT}" ]; then
+        local spdk_lib="${SPDK_ROOT}/build/lib"
+        local dpdk_lib="${SPDK_ROOT}/dpdk/build/lib"
+        [ -d "${spdk_lib}" ] && ld_path="${spdk_lib}:${ld_path}"
+        [ -d "${dpdk_lib}" ] && ld_path="${dpdk_lib}:${ld_path}"
     fi
     LD_LIBRARY_PATH="${ld_path}" nohup "${NVMF_TGT}" -m 0x3 -s 2048 -r "${RPC_SOCK}" >/tmp/nvmf_tgt.log 2>&1 &
     echo "nvmf_tgt started directly (no systemd in this environment)"
     echo "  log: /tmp/nvmf_tgt.log   stop: pkill nvmf_tgt"
 }
 
-if command -v systemctl >/dev/null 2>&1; then
+# systemd path only when systemd actually runs (PID 1): a container with the
+# systemctl binary but no systemd manager must fall through to the direct launch
+if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
     if ! systemctl is-active --quiet spdk-nvmf-tgt; then
         cat >/etc/systemd/system/spdk-nvmf-tgt.service <<EOF
 [Unit]
