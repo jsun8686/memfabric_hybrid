@@ -269,3 +269,20 @@ SPDK 的 MR 只覆盖 NEAR pinned host DRAM，永远看不到 HBM/GVA——两�
 | `test/ut/testcase/hybm/mm/hybm_nvme_segment_test.cpp` | `hybm_vmm_based_segment_test.cpp`（AIO 文件 bdev，无需真盘） |
 | `test/ut/testcase/hybm/data_operator/hybm_data_op_nvme_test.cpp` | 既有 per-op UT（mock loader） |
 | 触点 | compose 加档(~6 行)、方向枚举/VaManager 扩类、两层 op-bit 映射、`smem_ralloc_def.h/.h`、`smem_ralloc.cpp`、executor/master、`pymf_hybrid.cpp`、`examples/memory_pool/02_scale_out/16_nvme_ssd_pool/` |
+
+## 15. 实施联调记录（持续追加）
+
+### dlopen 宿主依赖链（SPDK 25.05 实证）
+
+SPDK 共享库（`--with-shared` 构建）的部分运行时依赖**不进 DT_NEEDED**（原生程序如 `nvmf_tgt` 靠链接期全家桶），dlopen 宿主必须自行以 `RTLD_NOW|RTLD_GLOBAL` 预载注入全局符号表，否则 `undefined symbol`。实证四环，`dl_nvme_api.cpp` 的 `PreloadDeps` 已内置：
+
+| 环 | 符号 | 库 | 来源 |
+|---|---|---|---|
+| 1 | `EVP_MD_CTX_free` | `libcrypto.so.3/.1.1` | 系统包（OpenSSL 1.1+/3.x） |
+| 2 | `crc16_t10dif` | `libisal.so.2/.so` | SPDK 默认把 isa-l 静态链入 target，需 `<spdk>/isa-l` 子目录手动 `autogen/configure/make` 产共享版并部署到 `build/lib`（SPDK 重编后重做） |
+| 3 | `rte_mempool_ops_table` 等 | DPDK 全家 `librte_*.so*` | 目录扫描预载：`MF_NVME_DPDK_LIB_DIR` 显式优先，默认遍历 `LD_LIBRARY_PATH`（部署要求含 `<spdk>/build/lib` 与 `<spdk>/dpdk/build/lib` 双路径） |
+| 4 | `OPENSSL_init_ssl` | `libssl.so.3/.1.1` | 系统包 |
+
+### external-EAL 初始化（SPDK dynamic 注册模式）
+
+`spdk_dma_malloc`/qpair 缓冲依赖活的 DPDK EAL；`spdk_env_dpdk_post_init` 的前提是宿主已自行 `rte_eal_init`。`DlNvmeApi::InitDpdkEnv` 已内置：`dlsym(RTLD_DEFAULT,"rte_eal_init")`（DPDK 全家已预载故符号必在）→ `rte_eal_init("memfabric-nvme","--in-memory")`——**免 hugepage、免共享配置文件**，容器 sim 零依赖；幂等（二次调用 ALREADY 被忽略）；无 DPDK 符号（UT stub 场景）返回 NOT_SUPPORTED 由 `EnsureReady` 容忍。

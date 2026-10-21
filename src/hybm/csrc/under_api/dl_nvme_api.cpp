@@ -178,6 +178,32 @@ Result DlNvmeApi::LoadLibrary()
     return BM_OK;
 }
 
+Result DlNvmeApi::InitDpdkEnv()
+{
+    /* spdk_dma_malloc and the qpair socket buffers need a live DPDK EAL; the
+     * post-init path assumes the host brought it up itself, so do it here:
+     * --in-memory avoids hugepage and shared-config-file dependencies entirely */
+    static bool attempted = false;
+    if (attempted) {
+        return BM_OK;
+    }
+    attempted = true;
+
+    using RteEalInitFunc = int (*)(int, char **);
+    auto rteEalInit = reinterpret_cast<RteEalInitFunc>(dlsym(RTLD_DEFAULT, "rte_eal_init"));
+    if (rteEalInit == nullptr) {
+        return BM_NOT_SUPPORTED; /* no DPDK mapped in: a pre-inited host, or UT stubs */
+    }
+
+    /* static storage: EAL keeps pointers into argv for the process lifetime */
+    static char arg0[] = "memfabric-nvme";
+    static char arg1[] = "--in-memory";
+    char *argv[] = {arg0, arg1, nullptr};
+    int rc = rteEalInit(2, argv); /* negative return is tolerated: EAL may already be up */
+    BM_LOG_DEBUG("rte_eal_init --in-memory rc:" << rc);
+    return BM_OK;
+}
+
 void DlNvmeApi::CleanupLibrary()
 {
     std::lock_guard<std::mutex> guard(gMutex);

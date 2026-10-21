@@ -65,6 +65,11 @@ public:
     static Result LoadLibrary();
     static void CleanupLibrary();
 
+    /* bring the DPDK EAL up inside the host process (external-init mode):
+     * rte_eal_init("--in-memory") -- no hugepages, no shared config files; safe to
+     * call repeatedly, absent symbols fall through to BM_NOT_SUPPORTED */
+    static Result InitDpdkEnv();
+
     /* the SPDK env may also be initialized externally (e.g. embedded in the caller);
      * the post-init call is optional, a missing symbol is not an error */
     static inline int EnvDpdkPostInit(bool legacyMem)

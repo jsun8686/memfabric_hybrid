@@ -142,9 +142,12 @@ Result HostDataOpNvme::EnsureReady() noexcept
         return ret;
     }
 
-    /* switch the (externally pre-inited or fresh) SPDK env to dynamic memory
-     * registration mode; failure is tolerated, connect will surface real problems */
-    if (DlNvmeApi::EnvDpdkPostInit(true) != 0) {
+    /* the host process owns the EAL lifecycle: bring DPDK up ourselves (in-memory,
+     * no hugepages) before switching spdk to dynamic memory registration mode */
+    if (DlNvmeApi::InitDpdkEnv() != BM_OK) {
+        BM_LOG_DEBUG("dpdk eal init skipped: absent symbols or pre-inited by the host");
+    }
+    if (DlNvmeApi::EnvDpdkPostInit(false) != 0) {
         BM_LOG_WARN("spdk_env_dpdk_post_init failed or absent, nvme io may fail on unregistered buffers");
     }
 
