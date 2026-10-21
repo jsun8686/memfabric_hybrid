@@ -31,7 +31,7 @@ struct MfSpdkNvmeTransportId {
     char subnqn[256 + 1];   /* subsystem NQN */
     int32_t priority;       /* not used */
 };
-static_assert(sizeof(MfSpdkNvmeTransportId) == 604, "must match sizeof(struct spdk_nvme_transport_id)");
+static_assert(sizeof(MfSpdkNvmeTransportId) == 596, "must match sizeof(struct spdk_nvme_transport_id)");
 
 /* trtype values of enum spdk_nvme_transport_type for fabrics transports (the
  * TCP/RDMA clients reject ADRFAM_INVALID, both trtype and adrfam must be set) */
