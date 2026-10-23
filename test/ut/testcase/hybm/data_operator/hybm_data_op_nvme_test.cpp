@@ -657,8 +657,9 @@ TEST_F(HybmDataOpNvmeTest, AsyncBatchAndWait_CompleteAndDetach)
 
 /**
  * WarmupFailure_FailsImport
- *  - 连接失败时 Register 硬失败（回滚条目），extent 不可见，后续 IO 报 NOT_CONNECTED
- *    —— 部署错误在 import/JOIN 时暴露，而不是首 IO。
+ *  - 连接失败时 Register 硬失败并自包含回滚（条目撤销、extent 完全不可见），后续 IO
+ *    在 gva 查表处即被拒绝 —— 部署错误在 import/JOIN 时暴露，而不是首 IO。
+ *    （NOT_CONNECTED 路径由 GetEndpointMissing_Errors 单独覆盖。）
  */
 TEST_F(HybmDataOpNvmeTest, WarmupFailure_FailsImport)
 {
@@ -676,7 +677,9 @@ TEST_F(HybmDataOpNvmeTest, WarmupFailure_FailsImport)
     params.src = src;
     params.dest = reinterpret_cast<void *>(EXTENT_GVA);
     params.dataSize = sizeof(src);
-    EXPECT_EQ(op.DataCopy(params, HYBM_LOCAL_HOST_TO_GLOBAL_NVME, ExtOptions{}), BM_NOT_CONNECTED);
+    /* the rollback removed the extent entirely: the copy is rejected at the gva lookup,
+     * it never reaches GetEndpoint */
+    EXPECT_EQ(op.DataCopy(params, HYBM_LOCAL_HOST_TO_GLOBAL_NVME, ExtOptions{}), BM_INVALID_PARAM);
 }
 
 /**
