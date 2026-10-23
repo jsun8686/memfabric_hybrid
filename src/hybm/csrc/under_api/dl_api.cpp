@@ -90,8 +90,9 @@ Result DlApi::LoadExtendLibrary(DlApiExtendLibraryType libraryType)
         return DlHcomApi::LoadLibrary();
     }
 
-    /* optional library: the nvme data operator also lazy-loads on first IO, this entry
-     * only exists for callers that want to preload and fail early */
+    /* the pool-create path preloads via this entry (hard fail, see MemEntityDefault::
+     * LoadExtendLibrary); the nvme data operator itself no longer lazy-loads on first
+     * IO -- endpoints are warmed up at extent import time */
     if (libraryType == DlApiExtendLibraryType::DL_EXT_LIB_NVME) {
         return DlNvmeApi::LoadLibrary();
     }

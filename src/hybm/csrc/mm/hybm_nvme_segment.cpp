@@ -38,10 +38,33 @@ HybmNvmeExtentRegistry &HybmNvmeExtentRegistry::GetInstance()
     return instance;
 }
 
-void HybmNvmeExtentRegistry::Register(const HybmNvmeExtent &extent)
+void HybmNvmeExtentRegistry::SetWarmupCallback(std::function<Result(const HybmNvmeExtent &)> cb)
 {
     std::lock_guard<std::mutex> guard(mutex_);
-    extents_[extent.gvaBase] = extent;
+    warmupCb_ = std::move(cb);
+}
+
+Result HybmNvmeExtentRegistry::Register(const HybmNvmeExtent &extent)
+{
+    std::function<Result(const HybmNvmeExtent &)> cb;
+    {
+        std::lock_guard<std::mutex> guard(mutex_);
+        extents_[extent.gvaBase] = extent;
+        cb = warmupCb_;
+    }
+    if (cb == nullptr) {
+        return BM_OK;
+    }
+    /* warmup runs OUTSIDE the registry lock: the operator connects the ctrlr and pre-creates
+     * io qpairs (dlopen + fabric connect, hundreds of ms); a failure rolls the entry back so
+     * the import path stays self-contained on error */
+    auto ret = cb(extent);
+    if (ret != BM_OK) {
+        std::lock_guard<std::mutex> guard(mutex_);
+        extents_.erase(extent.gvaBase);
+        return ret;
+    }
+    return BM_OK;
 }
 
 void HybmNvmeExtentRegistry::UnregisterByGva(uint64_t gvaBase)
@@ -581,7 +604,18 @@ Result HybmNvmeSegment::AllocLocalMemory(uint64_t size, MemSlicePtr &slice) noex
     extent.lbaLen = info.lbaLen;
     (void)memcpy(extent.nqn, info.nqn, sizeof(extent.nqn));
     (void)memcpy(extent.traddr, info.traddr, sizeof(extent.traddr));
-    HybmNvmeExtentRegistry::GetInstance().Register(extent);
+    ret = HybmNvmeExtentRegistry::GetInstance().Register(extent); /* fires warmup (loopback connect) */
+    if (ret != BM_OK) {
+        BM_LOG_ERROR("nvme alloc: warmup (pre-connect) failed, nsid: " << nsid << ", traddr: " << extent.traddr
+                                                                       << ", ret: " << ret);
+        slices_.erase(realSlice->index_);
+        sliceExtents_.erase(realSlice->index_);
+        exportMap_.erase(realSlice->index_);
+        HybmVaManager::GetInstance().RemoveOneVaInfo(gva, HVM_GVA);
+        (void)admin_->RemoveNs(nsid);
+        FreeLbaRange(lbaOffset, lbaBytes);
+        return ret;
+    }
 
     allocatedSize_ += size;
     slice = std::move(realSlice);
@@ -650,22 +684,30 @@ Result HybmNvmeSegment::GetExportSliceSize(size_t &size) noexcept
 
 Result HybmNvmeSegment::Import(const std::vector<std::string> &allExInfo, void *addresses[]) noexcept
 {
+    /* self-contained on failure: every item added by THIS call (va info / registry entry /
+     * imports_) is rolled back before the error is returned, the warmup (pre-connect) inside
+     * Register() hard-fails the import so a broken target is reported at JOIN time, not on
+     * the first IO */
+    const size_t baseline = imports_.size();
+    Result ret = BM_OK;
     for (size_t i = 0; i < allExInfo.size(); i++) {
         if (allExInfo[i].size() != sizeof(NvmeExportInfo)) {
             BM_LOG_ERROR("nvme import: info size " << allExInfo[i].size() << " != " << sizeof(NvmeExportInfo));
-            return BM_INVALID_PARAM;
+            ret = BM_INVALID_PARAM;
+            break;
         }
         NvmeExportInfo info;
         (void)memcpy(&info, allExInfo[i].data(), sizeof(info));
         if (!IsNvmeSlice(info.magic)) {
             BM_LOG_ERROR("nvme import: magic mismatch: " << VaToStr(info.magic));
-            return BM_INVALID_PARAM;
+            ret = BM_INVALID_PARAM;
+            break;
         }
-        auto ret = HybmVaManager::GetInstance().AddVaInfoFromExternal(
+        ret = HybmVaManager::GetInstance().AddVaInfoFromExternal(
             {{info.gva, 0, 0}, info.vsize, HYBM_MEM_TYPE_NVME}, options_.rankId, info.ownerRank);
         if (ret != BM_OK) {
             BM_LOG_ERROR("nvme import: add external va failed, gva: " << VaToStr(info.gva) << " ret: " << ret);
-            return ret;
+            break;
         }
 
         HybmNvmeExtent extent{};
@@ -679,7 +721,16 @@ Result HybmNvmeSegment::Import(const std::vector<std::string> &allExInfo, void *
         extent.lbaLen = info.lbaLen;
         (void)memcpy(extent.nqn, info.nqn, sizeof(extent.nqn));
         (void)memcpy(extent.traddr, info.traddr, sizeof(extent.traddr));
-        HybmNvmeExtentRegistry::GetInstance().Register(extent);
+        ret = HybmNvmeExtentRegistry::GetInstance().Register(extent); /* fires warmup (hard fail) */
+        if (ret != BM_OK) {
+            BM_LOG_ERROR("nvme import: warmup (pre-connect) failed, owner: " << info.ownerRank
+                                                                            << ", nsid: " << info.nsid
+                                                                            << ", traddr: " << info.traddr
+                                                                            << ", nqn: " << info.nqn
+                                                                            << ", ret: " << ret);
+            HybmVaManager::GetInstance().RemoveOneVaInfo(info.gva, HVM_GVA);
+            break;
+        }
 
         imports_.push_back(info);
         if (addresses != nullptr) {
@@ -687,6 +738,15 @@ Result HybmNvmeSegment::Import(const std::vector<std::string> &allExInfo, void *
         }
         BM_LOG_INFO("nvme extent imported, owner: " << info.ownerRank << " gva: " << VaToStr(info.gva)
                                                     << " nsid: " << info.nsid);
+    }
+
+    if (ret != BM_OK) {
+        for (size_t j = baseline; j < imports_.size(); ++j) {
+            HybmNvmeExtentRegistry::GetInstance().UnregisterByGva(imports_[j].gva);
+            HybmVaManager::GetInstance().RemoveOneVaInfo(imports_[j].gva, HVM_GVA);
+        }
+        imports_.resize(baseline);
+        return ret;
     }
     return BM_OK;
 }

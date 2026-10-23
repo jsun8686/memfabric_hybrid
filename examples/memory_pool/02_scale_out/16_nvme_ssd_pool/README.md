@@ -125,7 +125,13 @@ python3 memfabric_client.py --store tcp://10.90.22.33:8588 --nvme-transport rdma
 | `MF_NVME_NQN`/`TRADDR`/`TRSVCID` | FAR | 本 target 对外身份，随块导出给 initiator |
 | `MF_NVME_RPC_SOCK` | FAR | SPDK JSON-RPC socket（默认 `/var/tmp/spdk.sock`） |
 | `MF_NVME_BASE_BDEV` | FAR | 池底座 bdev（真盘 `Nvme0n1` / 模拟 `Malloc0`） |
-| `MF_NVME_BUF_MB`/`BUF_SLOTS`/`QPAIRS` | NEAR | staging 块大小（默认 4M）/池深（4）/每控制器 qpair 数（2） |
+| `MF_NVME_BUF_MB` | NEAR | staging 单段上限（默认 4M）；实际段 = min(MDTS, BUF_MB, 尺寸) |
+| `MF_NVME_QDEPTH` | NEAR | 窗口深度：单窗在飞命令数（默认 16，clamp 1..128） |
+| `MF_NVME_QPAIRS` | NEAR | 每控制器 qpair 槽位数 = 并发窗口上限（默认 4，无全局 IO 锁） |
+| `MF_NVME_BUF_SLOTS` | NEAR | staging 池深（默认 = QDEPTH） |
+
+> 数据面生命周期（性能优化后）：SPDK 库+EAL 在**池 create 时**预载（失败即报错）；
+> ctrlr 连接与 qpair 在 **extent 导入时**预热（失败即 JOIN 报错并回滚）；首 IO 零建立开销。
 
 ## 设计约束（摘要）
 

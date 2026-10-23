@@ -1128,6 +1128,16 @@ int MemEntityDefault::LoadExtendLibrary() noexcept
             return ret;
         }
     }
+    /* pool creation declares the NVMe op bit -> the SPDK initiator stack is mandatory:
+     * preload it right here and FAIL EARLY (a missing/broken SPDK env is a deployment
+     * error, reporting it at create time beats a failure on the first IO) */
+    if (options_.bmDataOpType & (HYBM_DOP_TYPE_NVME_TCP | HYBM_DOP_TYPE_NVME_RDMA)) {
+        auto ret = DlApi::LoadExtendLibrary(DlApiExtendLibraryType::DL_EXT_LIB_NVME);
+        if (ret != 0) {
+            BM_LOG_ERROR("LoadExtendLibrary for NVME (spdk) failed: " << ret);
+            return ret;
+        }
+    }
 
     return BM_OK;
 }

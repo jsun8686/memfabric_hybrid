@@ -191,6 +191,17 @@ enum MF_HYBM_MOD {
     INDIRECT_RECV_READ_WAIT_DONE,
     INDIRECT_RECV_READ_H2D,
     INDIRECT_RECV_READ_SEND_ACK,
+
+    /* nvme data operator: whole request, and the stages its windowed engine cycles
+     * through (see hybm_data_op_nvme); durations accumulate across re-entries */
+    TP_HYBM_NVME_COPY_TOTAL,   /* one DataCopy / BatchDataCopy call, door to door */
+    TP_HYBM_NVME_LOOKUP,       /* gva -> extent registry lookup */
+    TP_HYBM_NVME_STAGE_COPY,   /* user <-> staging copies (fill before submit, drain after reap) */
+    TP_HYBM_NVME_SUBMIT,       /* single nvme command submission */
+    TP_HYBM_NVME_POLL_WAIT,    /* one process-completions wait cycle of the window engine */
+    TP_HYBM_NVME_RMW_STAGE_B,  /* second round: RMW head/tail writes after the merge */
+    TP_HYBM_NVME_QPAIR_WAIT,   /* acquiring a qpair slot (contention indicator, multithreaded) */
+    TP_HYBM_NVME_PRELOAD,      /* one-time spdk load + dpdk eal init at pool create */
 };
 
 #endif // MF_HYBRID_HYBM_PTRACER_H

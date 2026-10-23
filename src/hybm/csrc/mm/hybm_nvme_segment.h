@@ -12,6 +12,7 @@
 #ifndef MF_HYBRID_HYBM_NVME_SEGMENT_H
 #define MF_HYBRID_HYBM_NVME_SEGMENT_H
 
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -64,7 +65,11 @@ struct HybmNvmeExtent {
     char traddr[46]{};
 };
 
-/* process-wide gva -> extent registry: the single source of truth for the NVMe data plane */
+/* process-wide gva -> extent registry: the single source of truth for the NVMe data plane.
+ * Register() additionally fires the warmup callback (nvme data operator pre-connects its
+ * ctrlr + io qpairs right at extent import time); a warmup failure FAILS Register so the
+ * import/JOIN path reports it instead of the first IO -- the callback is optional, without
+ * one Register degrades to a plain table insert (unit tests / FAR-only processes). */
 class HybmNvmeExtentRegistry {
 public:
     static HybmNvmeExtentRegistry &GetInstance();
@@ -72,7 +77,11 @@ public:
     HybmNvmeExtentRegistry(const HybmNvmeExtentRegistry &) = delete;
     HybmNvmeExtentRegistry &operator=(const HybmNvmeExtentRegistry &) = delete;
 
-    void Register(const HybmNvmeExtent &extent);
+    /* inject/clear the warmup hook (nullptr clears); single slot: the last registered
+     * NVMe data operator wins -- a process mixing pools of DIFFERENT NVMe-oF transports
+     * is not supported yet (same transport is fine, endpoints are deduped by key) */
+    void SetWarmupCallback(std::function<Result(const HybmNvmeExtent &)> cb);
+    Result Register(const HybmNvmeExtent &extent);
     void UnregisterByGva(uint64_t gvaBase);
     void UnregisterByRank(uint32_t rank);
     /* resolve the extent containing [gva, gva + size), false when gva is not NVMe media */
@@ -84,6 +93,7 @@ private:
 
     mutable std::mutex mutex_;
     std::map<uint64_t, HybmNvmeExtent> extents_; /* keyed by gvaBase */
+    std::function<Result(const HybmNvmeExtent &)> warmupCb_; /* guarded by mutex_ */
 };
 
 /* admin-plane client of the local nvmf target (pure interface: UT injects a mock, production

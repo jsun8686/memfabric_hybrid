@@ -312,3 +312,62 @@ SPDK 默认 `keep_alive_timeout_ms=10000`，库自动发 KAT 的前提是宿主*
 | `spdk_nvme_connect` 自 24.09 起为 **三参** `(trid, opts, opts_size)` | 旧单参调用把 x1/x2 寄存器残留垃圾当 opts/opts_size，垃圾 opts 尾部的 `tls_psk`/`dhchap_key` 指针进 keyring 解引用 → SIGSEGV（栈顶 `spdk_key_get_name(key=0xffffffff)` ← `nvme_tcp_generate_tls_credentials`） | typedef 三参，调用传 `(trid, nullptr, 0)`（官方"opts 为 NULL 则 opts_size 须 0"路径，零 TLS） |
 | `struct spdk_nvme_transport_id` 布局 = `trstring / trtype(4B) / adrfam(4B) / traddr / trsvcid / subnqn / priority`，sizeof=596（char 数组后无对齐垫） | 自声明结构若缺 trtype 或 adrfam 位置在 traddr 之后，我们填的 traddr 字节会被 SPDK 当作 trtype/adrfam 读取 | `MfSpdkNvmeTransportId` 按上游字段序重排 + `static_assert(sizeof==596)`；`GetEndpoint` 显式填 `trtype`（NVMe spec：tcp→3/rdma→1，FC=2 勿混淆——transport 路由按 trstring，trtype 用于日志与内部检查） |
 | `spdk_env_dpdk_post_init(bool legacy_mem)` 单 bool 参数 | 多余第二参在 ABI 上无害但属未定义行为边缘 | typedef 对齐单参 |
+
+## 16. 数据面性能优化（NVME_RDMA 窗口引擎，2026-10-23 实施）
+
+### 优化前基线与瓶颈（33↔35 RDMA，BW 矩阵 write/read GB/s）
+
+| 尺寸 | 4K | 64K | 1M | 16M |
+|---|---|---|---|---|
+| 基线 | 0.37 / 0.37 | 2.32 / 2.74 | 2.69 / 3.37 | 1.81 / 2.62 |
+
+瓶颈（代码实证）：`SubmitAndWait` 深度=1 串行（chunk/MDTS/RMW 全串行）、staging 双拷贝占比 ~50%、`ioMutex_` 全局 IO 锁（多线程假并发）、`BUF_SLOTS=4` 过小、RMW 单扇区 scratch 共享。TCP loopback sim 0.02-0.03 GB/s（正确性口径）。
+
+### 窗口引擎（SubmitWindowed，两轮流水）
+
+- **命令展开**（`BuildCmds`，纯函数）：一次请求（或整个 batch）展开为命令序列——mid 段整扇区直传（cap=min(MDTS, chunk)）、头/尾亚扇区 RMW（round1 读半段共享窗口 → merge → round2 写）；
+- **窗口**：填窗（staging 懒获取 + stage-in + 提交）至 `MF_NVME_QDEPTH`（默认 16）→ poll 收割（stage-out/merge/还池）→ 补发，流水重叠取代逐命令等待；错误路径 = 停止补发 + 收割在飞 + 报首错（qpair 死亡则弃单，防死等）；
+- **batch 聚合**（对齐 host_rdma 批量模式）：全批次命令共享窗口（4K 小 IO 并发主通道），多 endpoint 按组各占窗口，组失败不阻塞其余组；
+- **cpl 状态检查**：`IoDone` 按 v25.05 nvme_spec.h 自声明前缀（16bit status word，`raw & 0x0FFE` 判 SC/SCT）置错。
+
+### 并发模型（qpair 租赁，无全局 IO 锁）
+
+删除 `ioMutex_`。SPDK qpair 非线程安全 → **qpair 即并发边界**：窗口全程独占一个 slot（`try_lock` 轮转，全忙阻塞 = 天然背压），并发上限 = `MF_NVME_QPAIRS`（默认 4）；单线程退化为纯轮转零开销。窗口状态（cmds/scratch/IoCtx）全部栈/局部，slot 锁封闭并发正确性。IoCtx 非原子（SPDK 回调在 poll 线程内联执行，无跨线程竞争）。
+
+### 生命周期前置（懒加载 → 池创建/导入时，fail-fast）
+
+| 阶段 | 动作 | 失败语义 |
+|---|---|---|
+| 池 create | `LoadExtendLibrary(DL_EXT_LIB_NVME)` dlopen 全家 + op `Initialize` → EAL init | **硬失败**（create 即报"SPDK 环境不可用"） |
+| extent 导入/分配 | `HybmNvmeExtentRegistry::Register` 触发 warmup 回调 → `HostDataOpNvme::Warmup`（connect + 预建 qpair slots） | **硬失败**：Import/AllocLocalMemory 报错并自包含回滚（va info/registry/imports_ 全撤） |
+| 首 IO | endpoint 必须已存在（`GetEndpoint` 未命中报 `BM_NOT_CONNECTED`，不惰性连接兜底） | 破损装配显式暴露 |
+
+收益：首 IO 尾延迟 ~1.3s（库 1.2s + connect 0.1s）→ 接近 0；部署错误（缺库/断网/协议不符）在 create/JOIN 即暴露。FAR 侧 AllocLocalMemory 的 warmup 为 loopback 连接，语义对称。
+
+### 地址模型注记（TransformVa 空实现的正确性）
+
+用户内存为**原生 HVA/DVA**（不进 GVA 体系）；NVMe GVA 恒为远端盘介质（本地 VA manager 恒无映射）→ 尽力转换恒为空操作，空实现正确（对比 host_rdma：其 GLOBAL_HOST 侧可能映射到本 rank 池块，需要转换）。已在头文件注释固化，防止误判复发。
+
+### 观测（TP 打点 8 个）
+
+`TP_HYBM_NVME_COPY_TOTAL / LOOKUP / STAGE_COPY / SUBMIT / POLL_WAIT / RMW_STAGE_B / QPAIR_WAIT / PRELOAD`（ptracer 机制，与 `TP_HYBM_RDMA_*` 同接入方式）；`QPAIR_WAIT` 观测多线程背压，`POLL_WAIT/STAGE_COPY` 定位拷贝与等待占比。基线协议：client.py 已含 warmup 排除首样本。
+
+### 环境变量（终版）
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `MF_NVME_QDEPTH` | 16（clamp 1..128） | 窗口深度（单窗在飞命令数） |
+| `MF_NVME_QPAIRS` | 4 | slot 数 = 并发窗口上限 |
+| `MF_NVME_BUF_MB` | 4 | staging 单段上限（段=min(MDTS, BUF_MB, 尺寸)） |
+| `MF_NVME_BUF_SLOTS` | =QDEPTH | 池深（段/扇区两类池各计） |
+
+应急回退位：`MF_NVME_QDEPTH=1 + MF_NVME_QPAIRS=1` 近似旧行为。staging 两级懒池（chunk 块 / 512B 扇区块），活块数 ≤ qdepth。
+
+### 验收标准与验证三线（待集群执行，结果回填本节）
+
+| 线 | 内容 | 通过标准 |
+|---|---|---|
+| UT | 16 用例（新增 warmup 失败/窗口深度/提交错误收割/poll 错误/batch 聚合/双读并发/slot 隔离/env 钳位） | 16/16 绿 + 覆盖率门禁（行≥70%/分支≥40%） |
+| TCP sim 回归 | 单机 round-trip/RMW/BW 矩阵 | 与既有结果一致（正确性口径） |
+| RDMA 复测（33↔35） | BW 矩阵 + QDEPTH/QPAIRS 参数矩阵 + `TP` 打点归档 | 1M/16M ≥2× 基线（≥5.4/3.6 GB/s write）；batch 小 IO 并发收益量化 |
+| device 方向 | D2H/H2D 原生 DVA 路径（LOCAL_DEVICE↔GLOBAL_NVME） | 4 方向全覆盖（真机 SDMA） |
