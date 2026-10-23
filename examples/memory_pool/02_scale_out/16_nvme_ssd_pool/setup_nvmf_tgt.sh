@@ -92,13 +92,16 @@ fi
 #      multi-socket ARM. RDMA resolves the NIC from the listener IP and takes the
 #      node's first 2 cpus (stock 2-reactor footprint, just on the right socket);
 #      TCP loopback sim keeps the historical cpus 0-1.
-CORE_MASK="3"
+#      NOTE: -c/-m coremasks carry LCORE ids, which must stay < RTE_MAX_LCORE (128 in
+#      this build) -- a NIC on node 6 has physical cpus 144+, so the pinning rides
+#      --lcores "0@<phys>,1@<phys>" (lcore id mapped to the physical cpu) instead.
+EAL_CORES="-m 0x3"
 if [ "${TRANSPORT}" = "RDMA" ]; then
     NIC_IF=$(ip -o -4 addr show | awk -v ip="${TRADDR}" '{split($4,a,"/"); if (a[1]==ip) {print $2; exit}}')
     if [ -n "${NIC_IF}" ] && [ -r "/sys/class/net/${NIC_IF}/device/numa_node" ]; then
         NIC_NUMA=$(cat "/sys/class/net/${NIC_IF}/device/numa_node" 2>/dev/null || echo -1)
         if [ "${NIC_NUMA}" -ge 0 ] 2>/dev/null; then
-            CORE_MASK=$(python3 - "${NIC_NUMA}" <<'PY'
+            PINNED=$(python3 - "${NIC_NUMA}" <<'PY'
 import sys
 node = sys.argv[1]
 raw = open("/sys/devices/system/node/node%s/cpulist" % node).read().strip()
@@ -109,16 +112,17 @@ for p in raw.split(","):
         cpus.extend(range(a, b + 1))
     else:
         cpus.append(int(p))
-m = 0
-for c in cpus[:2]:
-    m |= 1 << c
-print(format(m, "x"))
+if len(cpus) >= 2:
+    print("--lcores 0@%d,1@%d" % (cpus[0], cpus[1]))
 PY
 )
-            echo "nvmf_tgt reactors pinned to NIC ${NIC_IF} (NUMA node ${NIC_NUMA}, mask 0x${CORE_MASK})"
+            if [ -n "${PINNED}" ]; then
+                EAL_CORES="${PINNED}"
+                echo "nvmf_tgt reactors pinned to NIC ${NIC_IF} (NUMA node ${NIC_NUMA}, ${EAL_CORES})"
+            fi
         fi
     fi
-    if [ "${CORE_MASK}" = "3" ]; then
+    if [ "${EAL_CORES}" = "-m 0x3" ]; then
         echo "NOTE: NIC NUMA node unresolved (no iface for ${TRADDR}?), reactors stay on cpus 0-1"
     fi
 fi
@@ -136,7 +140,9 @@ start_tgt_direct() {
         [ -d "${spdk_lib}" ] && ld_path="${spdk_lib}:${ld_path}"
         [ -d "${dpdk_lib}" ] && ld_path="${dpdk_lib}:${ld_path}"
     fi
-    LD_LIBRARY_PATH="${ld_path}" nohup "${NVMF_TGT}" -m "0x${CORE_MASK}" -s 2048 -r "${RPC_SOCK}" >/tmp/nvmf_tgt.log 2>&1 &
+    # ${EAL_CORES} stays intentionally unquoted: it is a multi-token argument string
+    # ("-m 0x3" fallback or "--lcores 0@144,1@145") and must word-split
+    LD_LIBRARY_PATH="${ld_path}" nohup "${NVMF_TGT}" ${EAL_CORES} -s 2048 -r "${RPC_SOCK}" >/tmp/nvmf_tgt.log 2>&1 &
     echo "nvmf_tgt started directly (no systemd in this environment)"
     echo "  log: /tmp/nvmf_tgt.log   stop: pkill nvmf_tgt"
 }
@@ -152,7 +158,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=${NVMF_TGT} -m 0x${CORE_MASK} -s 2048
+ExecStart=${NVMF_TGT} ${EAL_CORES} -s 2048
 Restart=always
 
 [Install]
