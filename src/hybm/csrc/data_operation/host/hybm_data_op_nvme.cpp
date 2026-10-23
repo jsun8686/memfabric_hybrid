@@ -169,12 +169,27 @@ Result HostDataOpNvme::EnsureReady() noexcept
     }
 
     /* the host process owns the EAL lifecycle: bring DPDK up ourselves (in-memory,
-     * no hugepages) before switching spdk to dynamic memory registration mode */
-    if (DlNvmeApi::InitDpdkEnv() != BM_OK) {
-        BM_LOG_DEBUG("dpdk eal init skipped: absent symbols or pre-inited by the host");
+     * no hugepages, no pci probing) before switching spdk to dynamic memory
+     * registration mode. BM_NOT_SUPPORTED = no DPDK symbols mapped (UT stubs /
+     * a host that pre-inits EAL without exposing the symbols) and is tolerated;
+     * a real init failure is FATAL -- a half-dead EAL silently skips the spdk
+     * mem_map subsystem and every later fabric connect dies with the cryptic
+     * "Unable to create memory map" (verified: nvmf tgt + daemon co-located on
+     * one node, EAL pci probing clashes with the target's RDMA nics) */
+    auto ealRet = DlNvmeApi::InitDpdkEnv();
+    if (ealRet != BM_OK && ealRet != BM_NOT_SUPPORTED) {
+        BM_LOG_ERROR("dpdk eal init failed, ret:" << ealRet);
+        return ealRet;
     }
-    if (DlNvmeApi::EnvDpdkPostInit(false) != 0) {
-        BM_LOG_WARN("spdk_env_dpdk_post_init failed or absent, nvme io may fail on unregistered buffers");
+    if (DlNvmeApi::gSpdkEnvDpdkPostInit != nullptr) {
+        /* the symbol exists: its failure builds no mem_map subsystem and every
+         * RDMA connect after it fails -- report it right here instead of WARN-ing
+         * and deferring the surprise to the first warmup */
+        const int postRet = DlNvmeApi::EnvDpdkPostInit(false);
+        if (postRet != 0) {
+            BM_LOG_ERROR("spdk_env_dpdk_post_init failed, ret:" << postRet);
+            return BM_ERROR;
+        }
     }
     ready_ = true;
     return BM_OK;

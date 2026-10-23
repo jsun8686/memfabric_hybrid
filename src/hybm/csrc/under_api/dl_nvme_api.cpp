@@ -205,7 +205,11 @@ Result DlNvmeApi::InitDpdkEnv()
 {
     /* spdk_dma_malloc and the qpair socket buffers need a live DPDK EAL; the
      * post-init path assumes the host brought it up itself, so do it here:
-     * --in-memory avoids hugepage and shared-config-file dependencies entirely */
+     * --in-memory avoids hugepage and shared-config-file dependencies entirely,
+     * --no-pci skips ALL pci probing (we only use the memory subsystem -- the
+     * NVMe-oF fabric rides rdma-core verbs, not a DPDK PMD): without it EAL
+     * tries to bind every device and FAILS on a node whose RDMA nics are taken
+     * by another DPDK process (verified: nvmf tgt + daemon co-located) */
     static bool attempted = false;
     if (attempted) {
         return BM_OK;
@@ -221,9 +225,26 @@ Result DlNvmeApi::InitDpdkEnv()
     /* static storage: EAL keeps pointers into argv for the process lifetime */
     static char arg0[] = "memfabric-nvme";
     static char arg1[] = "--in-memory";
-    char *argv[] = {arg0, arg1, nullptr};
-    int rc = rteEalInit(2, argv); /* negative return is tolerated: EAL may already be up */
-    BM_LOG_DEBUG("rte_eal_init --in-memory rc:" << rc);
+    static char arg2[] = "--no-pci";
+    char *argv[] = {arg0, arg1, arg2, nullptr};
+    int rc = rteEalInit(3, argv);
+    if (rc < 0) {
+        /* a negative return is only benign when the EAL is already up (another
+         * component initialized it) -- anything else is a real failure that must
+         * not be papered over: a half-dead EAL silently breaks spdk env
+         * post-init (mem_map subsystem), which later surfaces as the cryptic
+         * "Unable to create memory map" on the first fabric connect */
+        auto *rteErrno = reinterpret_cast<int *>(dlsym(RTLD_DEFAULT, "rte_errno"));
+        const int err = rteErrno != nullptr ? *rteErrno : 0;
+        if (err == EALREADY) {
+            BM_LOG_DEBUG("dpdk eal already initialized by another component, rc:" << rc);
+            return BM_OK;
+        }
+        BM_LOG_ERROR("rte_eal_init failed, rc:" << rc << " rte_errno:" << err
+                                                << " -- spdk dma memory will not work");
+        return BM_ERROR;
+    }
+    BM_LOG_DEBUG("rte_eal_init --in-memory --no-pci rc:" << rc);
     return BM_OK;
 }
 

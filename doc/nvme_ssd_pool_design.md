@@ -371,3 +371,11 @@ SPDK 默认 `keep_alive_timeout_ms=10000`，库自动发 KAT 的前提是宿主*
 | TCP sim 回归 | 单机 round-trip/RMW/BW 矩阵 | 与既有结果一致（正确性口径） |
 | RDMA 复测（33↔35） | BW 矩阵 + QDEPTH/QPAIRS 参数矩阵 + `TP` 打点归档 | 1M/16M ≥2× 基线（≥5.4/3.6 GB/s write）；batch 小 IO 并发收益量化 |
 | device 方向 | D2H/H2D 原生 DVA 路径（LOCAL_DEVICE↔GLOBAL_NVME） | 4 方向全覆盖（真机 SDMA） |
+
+### 坑：tgt + daemon 同机共存时 EAL PCI 探测冲突（2026-10-23 实证，FAR 不重启二次 create 暴露）
+
+**现象**：FAR daemon（新库）首次 NVMe 路径 warmup 即 `spdk_rdma_utils_create_mem_map: Unable to create memory map` → connect 失败；NEAR 侧（无 tgt 的节点）一切正常。
+
+**根因链**：33 节点 nvmf tgt 常驻占用 RDMA 网卡（tgt 日志 4×`PCI_BUS: cannot be used`）→ daemon 的 `rte_eal_init("--in-memory")` **无 `--no-pci`** → EAL 尝试绑定全部 PCI 设备与 tgt 撞车 → eal_init 真失败被旧代码当"EALREADY"容忍 → `spdk_env_dpdk_post_init` 在半死 EAL 上失败又被 WARN 吞掉 → `g_mem_reg_map == NULL` → 首次 fabric connect 在 `spdk_mem_map_alloc`→`mem_map_notify_walk` 的 `if (!g_mem_reg_map) return -EINVAL`（**SPDK 全路径唯一无日志的失败点**，故现场只见 "Unable to create memory map" 无 ibv_reg_mr 日志）。
+
+**修复（三处）**：① `InitDpdkEnv` argv 加 **`--no-pci`**（我们只用 DPDK 内存子系统，NVMe-oF 走 rdma-core verbs 非 PMD，根本不需要 PCI——tgt/daemon 从此同机无冲突）；② eal_init 负返回**区分 `rte_errno==EALREADY`（良性容忍）与真失败（报错）**；③ `EnsureReady` 将 post_init 失败从 WARN 升级为**硬失败**（A8a 语义补全：环境坏在池 create 即报，而非拖到 connect 报谜语）。旧库时代 FAR 侧懒加载从未触发故未暴露；A8a 把库+EAL 提前到 create 首次点亮此坑。
