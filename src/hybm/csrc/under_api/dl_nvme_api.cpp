@@ -10,11 +10,13 @@
  * See the Mulan PSL v2 for more details.
  */
 #include "dl_nvme_api.h"
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
 #include <dirent.h>
 #include <dlfcn.h>
+#include <sched.h>
 #include "hybm_define.h"
 
 namespace ock {
@@ -227,8 +229,36 @@ Result DlNvmeApi::InitDpdkEnv()
     static char arg0[] = "memfabric-nvme";
     static char arg1[] = "--in-memory";
     static char arg2[] = "--no-pci";
-    char *argv[] = {arg0, arg1, arg2, nullptr};
-    int rc = rteEalInit(3, argv);
+    static char lcoreArg[32] = {0};
+
+    /* RTE_MAX_LCORE is 128 in this DPDK build: EAL derives its main lcore from the
+     * process affinity, and a process pinned to HIGH physical cpus (e.g. NUMA node 6
+     * = cpus 144+, the NIC-local pinning) breaks that auto-selection with a misleading
+     * "Invalid 'command line' arguments" -- map lcore 0 onto the first allowed cpu
+     * explicitly. Only the high-cpu case needs the argument; the already verified
+     * unpinned / low-core paths keep their exact argv */
+    cpu_set_t affinity;
+    CPU_ZERO(&affinity);
+    if (sched_getaffinity(0, sizeof(affinity), &affinity) == 0) {
+        int firstCpu = -1;
+        for (int c = 0; c < CPU_SETSIZE; ++c) {
+            if (CPU_ISSET(c, &affinity) != 0) {
+                firstCpu = c;
+                break;
+            }
+        }
+        if (firstCpu >= 128) {
+            (void)snprintf(lcoreArg, sizeof(lcoreArg), "--lcores=0@%d", firstCpu);
+        }
+    }
+
+    char *argv[5] = {arg0, arg1, arg2, nullptr, nullptr};
+    int argc = 3;
+    if (lcoreArg[0] != '\0') {
+        argv[3] = lcoreArg;
+        argc = 4;
+    }
+    int rc = rteEalInit(argc, argv);
     if (rc < 0) {
         /* a negative return is only benign when the EAL is already up (another
          * component initialized it) -- anything else is a real failure that must
