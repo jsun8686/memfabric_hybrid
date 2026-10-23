@@ -15,6 +15,11 @@ declared by the pool op bit (--nvme-transport tcp|rdma) and verified against
 the target listener on the FAR side. The NEAR process dlopens the SPDK
 initiator libraries on the first NVMe IO:
     export LD_LIBRARY_PATH=/path/to/spdk/build/lib:$LD_LIBRARY_PATH
+
+--device switches the LOCAL endpoint of every copy from host DRAM (mmap) to
+NPU HBM (torch_npu tensor DVA): copy_data's direction is inferred from the
+address, so the same calls then exercise the LOCAL_DEVICE <-> GLOBAL_NVME
+directions (aclrtMemcpy last hop). torch_npu is required only for this mode.
 """
 
 import argparse
@@ -73,11 +78,51 @@ def _wait_tcp(url, timeout_sec):
     raise RuntimeError(f"endpoint not reachable within {timeout_sec}s: {url} — is the daemon up?")
 
 
-def _map_buffer(size):
-    """anonymous page-aligned host buffer: the LOCAL_HOST endpoint of the copies"""
-    mm = mmap.mmap(-1, size)
-    addr = ctypes.addressof(ctypes.c_char.from_buffer(mm))
-    return mm, addr
+def _init_torch_npu():
+    """lazy import so the default host mode needs no torch; --device only"""
+    try:
+        import torch
+        import torch_npu  # noqa: F401 -- registers the npu backend on import
+        return torch
+    except ImportError as e:
+        raise RuntimeError("--device requires torch_npu (run on an NPU node)") from e
+
+
+class _LocalBuf:
+    """LOCAL endpoint of every copy. Host mode: anonymous mmap (LOCAL_HOST).
+    --device: NPU HBM tensor (LOCAL_DEVICE, the DVA feeds copy_data unchanged,
+    direction is inferred from the address -- no registration is needed: the
+    NVMe op only stages through memcpy/aclrtMemcpy). fill()/read() hide the
+    difference so the verification flow stays single-sourced."""
+
+    def __init__(self, size, torch_mod=None):
+        self.torch = torch_mod
+        self.size = size
+        if torch_mod is not None:
+            self._t = torch_mod.empty(size, dtype=torch_mod.uint8, device="npu")
+            self._mm = None
+            self.addr = self._t.data_ptr()
+        else:
+            self._mm = mmap.mmap(-1, size)
+            self._t = None
+            self.addr = ctypes.addressof(ctypes.c_char.from_buffer(self._mm))
+
+    def fill(self, data):
+        assert len(data) == self.size
+        if self._t is not None:
+            self._t.copy_(self.torch.frombuffer(bytearray(data), dtype=self.torch.uint8).to("npu"))
+        else:
+            self._mm[:] = data
+
+    def read(self):
+        if self._t is not None:
+            return bytes(self._t.cpu().numpy().tobytes())
+        return bytes(self._mm[:])
+
+    def close(self):
+        if self._mm is not None:
+            self._mm.close()
+        # the tensor is freed when the last reference (self._t) drops
 
 
 def _make_pattern(size, seed):
@@ -112,6 +157,10 @@ def main():
     parser.add_argument("--nvme-transport", choices=["tcp", "rdma"], default="tcp",
                         help="NVMe-oF transport declared by the pool op bit and verified against the "
                              "target listener on the FAR side, default tcp (loopback simulation)")
+    parser.add_argument("--device", action="store_true",
+                        help="route the LOCAL endpoint of every copy through NPU HBM (torch_npu "
+                             "tensor DVA): exercises the LOCAL_DEVICE <-> GLOBAL_NVME directions, "
+                             "default off (host mmap, LOCAL_HOST)")
     parser.add_argument("--world", type=int, default=DEFAULT_WORLD,
                         help=f"declared world capacity (default {DEFAULT_WORLD})")
     parser.add_argument("--rpc-port-base", type=int, default=RPC_PORT_BASE,
@@ -172,49 +221,58 @@ def main():
         _log(f"[client rank {rank}] NVMe block from FAR rank {far_rank}: gva=0x{nvme_gva:x}, {size} bytes")
 
         # ---- 2) byte-granular write/read verification (aligned bulk) ----
+        # local endpoint: host mmap (LOCAL_HOST) or NPU HBM DVA (LOCAL_DEVICE, --device);
+        # copy_data infers the direction from the address either way
+        tmod = _init_torch_npu() if args.device else None
         seed = 0x16 + rank
         pattern = _make_pattern(size, seed)
-        w_mm, w_addr = _map_buffer(size)
-        r_mm, r_addr = _map_buffer(size)
-        bufs = [w_mm, r_mm]
-        w_mm[:] = pattern
-        _copy(pool, w_addr, nvme_gva, size, "write pattern -> NVMe")
-        r_mm[:] = bytes(size)
-        _copy(pool, nvme_gva, r_addr, size, "read NVMe -> buffer")
-        assert bytes(r_mm[:]) == pattern, "aligned bulk round-trip mismatch"
+        w = _LocalBuf(size, tmod)
+        r = _LocalBuf(size, tmod)
+        bufs = [w, r]
+        if args.device:
+            _log(f"[client] device endpoints: w=0x{w.addr:x} r=0x{r.addr:x} "
+                 f"(must sit inside the NPU virtual address window)")
+        w.fill(pattern)
+        _copy(pool, w.addr, nvme_gva, size, "write pattern -> NVMe")
+        r.fill(bytes(size))
+        _copy(pool, nvme_gva, r.addr, size, "read NVMe -> buffer")
+        assert r.read() == pattern, "aligned bulk round-trip mismatch"
         _log(f"[client] aligned {size}-byte round-trip OK (head/tail blocks distinct)")
 
         # ---- 3) sub-sector RMW: 10 bytes at offset +100 must merge, neighbours survive ----
         magic = b"MEMFABRIC!"
-        m_mm, m_addr = _map_buffer(64)
-        v_mm, v_addr = _map_buffer(64)
-        bufs += [m_mm, v_mm]
-        m_mm[:10] = magic
-        _copy(pool, m_addr, nvme_gva + 100, 10, "sub-sector write @+100")
-        _copy(pool, nvme_gva + 64, v_addr, 64, "read window @+64")
-        window = bytes(v_mm[:])
+        m = _LocalBuf(64, tmod)
+        v = _LocalBuf(64, tmod)
+        bufs += [m, v]
+        m.fill(magic.ljust(64, b"\x00"))
+        _copy(pool, m.addr, nvme_gva + 100, 10, "sub-sector write @+100")
+        v.fill(bytes(64))
+        _copy(pool, nvme_gva + 64, v.addr, 64, "read window @+64")
+        window = v.read()
         want = pattern[64:100] + magic + pattern[110:128]
         assert window[:36 + 10 + 18] == want, \
             f"RMW merge mismatch: got={window[:64].hex()} want={want.hex()}"
         _log("[client] sub-sector RMW OK (10B magic @+100 merged, neighbours preserved)")
 
         # ---- 4) bandwidth matrix (write and read, plain unified API) ----
-        _log(f"[client] bandwidth matrix ({'/'.join(str(s) for s in bw_sizes)} bytes):")
+        mode = "device" if args.device else "host"
+        _log(f"[client] bandwidth matrix ({'/'.join(str(s) for s in bw_sizes)} bytes, "
+             f"local endpoint {mode}):")
         _log("    size      write GB/s   read GB/s")
         for s in bw_sizes:
             if s > size:
                 _log(f"    {s:>9}  skipped (block is {size} bytes)")
                 continue
             n = max(3, min(64, (64 << 20) // s))
-            _copy(pool, w_addr, nvme_gva, s, "bw warmup")  # also warms the endpoint/qpair cache
+            _copy(pool, w.addr, nvme_gva, s, "bw warmup")  # also warms the endpoint/qpair cache
             t0 = time.perf_counter()
             for _ in range(n):
-                _copy(pool, w_addr, nvme_gva, s, "bw write")
+                _copy(pool, w.addr, nvme_gva, s, "bw write")
             t_wr = time.perf_counter() - t0
-            _copy(pool, nvme_gva, r_addr, s, "bw warmup")
+            _copy(pool, nvme_gva, r.addr, s, "bw warmup")
             t0 = time.perf_counter()
             for _ in range(n):
-                _copy(pool, nvme_gva, r_addr, s, "bw read")
+                _copy(pool, nvme_gva, r.addr, s, "bw read")
             t_rd = time.perf_counter() - t0
             _log(f"    {s:>9}  {n * s / t_wr / GIB:10.2f}   {n * s / t_rd / GIB:9.2f}")
 

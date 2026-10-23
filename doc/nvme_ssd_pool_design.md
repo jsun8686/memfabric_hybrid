@@ -319,9 +319,13 @@ SPDK 默认 `keep_alive_timeout_ms=10000`，库自动发 KAT 的前提是宿主*
 
 | 尺寸 | 4K | 64K | 1M | 16M |
 |---|---|---|---|---|
-| 基线 | 0.37 / 0.37 | 2.32 / 2.74 | 2.69 / 3.37 | 1.81 / 2.62 |
+| 基线（深度=1 串行） | 0.37 / 0.37 | 2.32 / 2.74 | 2.69 / 3.37 | 1.81 / 2.62 |
+| **窗口引擎后（2026-10-23 实测）** | 0.31 / 0.30 | 2.16 / 2.51 | **5.97 / 4.57** | **6.71 / 5.54** |
+| 提升 | ~持平 | ~持平 | **2.2× / 1.36×** | **3.7× / 2.1×** |
 
-瓶颈（代码实证）：`SubmitAndWait` 深度=1 串行（chunk/MDTS/RMW 全串行）、staging 双拷贝占比 ~50%、`ioMutex_` 全局 IO 锁（多线程假并发）、`BUF_SLOTS=4` 过小、RMW 单扇区 scratch 共享。TCP loopback sim 0.02-0.03 GB/s（正确性口径）。
+4K/64K 持平符合设计预期（单请求命令数=1，无窗口收益；批量小 IO 并发是 batch 窗口的事）。TP 打点（404 次 copy）：`STAGE_COPY` 3606 次 TOTAL 51.7ms = `COPY_TOTAL`(103ms) 的 **50%**（staging 双拷贝成为首要瓶颈——B3 零拷贝的靶子，预判兑现）；`POLL_WAIT` 75944 次仅 10.4ms（10%，等待不是瓶颈）；`QPAIR_WAIT` AVG 0.112us（无锁竞争）；`RMW_STAGE_B` 仅 1 次；`PRELOAD` 311ms 一次性（A8a，池创建时）。
+
+read 1M 1.36× 未达 2× 的机理：读路径 stage-out（staging→user）在收割线程串行，流水化程度低于写路径的填窗 stage-in——50% 拷贝占比对读路径伤害更直接，B3 读路径优先。
 
 ### 窗口引擎（SubmitWindowed，两轮流水）
 
@@ -363,14 +367,15 @@ SPDK 默认 `keep_alive_timeout_ms=10000`，库自动发 KAT 的前提是宿主*
 
 应急回退位：`MF_NVME_QDEPTH=1 + MF_NVME_QPAIRS=1` 近似旧行为。staging 两级懒池（chunk 块 / 512B 扇区块），活块数 ≤ qdepth。
 
-### 验收标准与验证三线（待集群执行，结果回填本节）
+### 验收结果（2026-10-23 回填）
 
-| 线 | 内容 | 通过标准 |
+| 线 | 内容 | 结果 |
 |---|---|---|
-| UT | 16 用例（新增 warmup 失败/窗口深度/提交错误收割/poll 错误/batch 聚合/双读并发/slot 隔离/env 钳位） | 16/16 绿 + 覆盖率门禁（行≥70%/分支≥40%） |
-| TCP sim 回归 | 单机 round-trip/RMW/BW 矩阵 | 与既有结果一致（正确性口径） |
-| RDMA 复测（33↔35） | BW 矩阵 + QDEPTH/QPAIRS 参数矩阵 + `TP` 打点归档 | 1M/16M ≥2× 基线（≥5.4/3.6 GB/s write）；batch 小 IO 并发收益量化 |
-| device 方向 | D2H/H2D 原生 DVA 路径（LOCAL_DEVICE↔GLOBAL_NVME） | 4 方向全覆盖（真机 SDMA） |
+| UT | 18 用例（warmup 失败回滚/窗口深度/提交错误收割/poll 错误/batch 聚合/双读并发/slot 隔离/env 钳位） | **18/18 绿** + 覆盖率门禁通过；两轮联调各捕获一个真实 bug（BuildCmds 头尾越界、post_init 重入） |
+| RDMA 复测（33↔35） | BW 矩阵 + TP 归档 | write 1M 2.2×、16M 3.7×，read 16M 2.1× **达标**；read 1M 1.36× 未达（STAGE_COPY 50% 所致，B3 项）；参数矩阵与 `MF_NVME_QDEPTH/QPAIRS` 调优待 B3 前后对比 |
+| 稳定性 | FAR daemon 不重启，NEAR 多轮 create/destroy/BW | **通过**（坑一/坑二修复后；warmup 幂等、endpoint 重复建链、`EnsureSpdkEnv` 闩锁全验证） |
+| TCP sim 回归 | 单机 round-trip/RMW/BW | 通过（正确性口径不变） |
+| device 方向 | D2H/H2D 原生 DVA 路径 | **待测**（见验证指引，B2 收尾项） |
 
 ### 坑：tgt + daemon 同机共存时 EAL PCI 探测冲突（2026-10-23 实证，FAR 不重启二次 create 暴露）
 

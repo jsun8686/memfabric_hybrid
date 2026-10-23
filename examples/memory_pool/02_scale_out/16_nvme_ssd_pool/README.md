@@ -97,6 +97,24 @@ python3 memfabric_client.py --store tcp://10.90.22.33:8588 --nvme-transport rdma
 
 控制面走管理口（store 8588 / rpc 端口段），数据面走 RDMA 口 4420——两网段均须互通。
 
+## device 方向联调（LOCAL_DEVICE ↔ GLOBAL_NVME）
+
+client 的 `copy_data` 方向按地址自动判定：默认模式的本地端点是 host mmap（LOCAL_HOST）；
+`--device` 把本地端点换成 NPU HBM（torch_npu tensor 的 `data_ptr()` 即 DVA，落 NPU 虚拟
+地址区间 → 自动判为 LOCAL_DEVICE），同一套验证/BW 流程即覆盖 device 两方向（本地 HBM 与
+staging 间的最后一跳走 aclrtMemcpy/D2H/H2D）。**无需注册**——NVMe 算子只经
+memcpy/aclrtMemcpy 中转，端点裸地址直接可用。
+
+```bash
+# 前置：NPU 节点（33/35 均可）+ python 环境有 torch_npu；--dev 已随 ralloc 初始化 device 上下文
+python3 memfabric_client.py --store tcp://10.90.22.33:8588 --nvme-transport rdma --device
+```
+
+预期输出与 host 模式一致（round-trip / RMW / BW 矩阵），另有一行端点防呆日志
+`device endpoints: w=0x... r=0x...`——确认地址落在 NPU 虚拟地址窗口内。BW 数值含
+H2D/D2H 中转开销，与 host 模式分开解读。host 方向（LOCAL_HOST ↔ GLOBAL_NVME）已由
+默认模式覆盖，两模式各跑一遍即 4 方向全覆盖。
+
 ## 双节点真盘变体
 
 1. FAR 节点：`sudo bash ./setup_nvmf_tgt.sh <存储面IP>`（默认 RDMA transport；脚本内
