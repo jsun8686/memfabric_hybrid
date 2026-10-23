@@ -111,6 +111,11 @@ class _LocalBuf:
         assert len(data) == self.size
         if self._t is not None:
             self._t.copy_(self.torch.frombuffer(bytearray(data), dtype=self.torch.uint8).to("npu"))
+            # torch's H2D rides its own stream and returns before the copy completes;
+            # the NVMe op's aclrtMemcpy runs on a different stream with NO implicit
+            # ordering between them -- sync the device or the staging D2H reads the
+            # tensor's previous (uninitialized) contents
+            self.torch.npu.synchronize()
         else:
             self._mm[:] = data
 
@@ -236,7 +241,12 @@ def main():
         _copy(pool, w.addr, nvme_gva, size, "write pattern -> NVMe")
         r.fill(bytes(size))
         _copy(pool, nvme_gva, r.addr, size, "read NVMe -> buffer")
-        assert r.read() == pattern, "aligned bulk round-trip mismatch"
+        got = r.read()
+        if got != pattern:
+            import numpy as np
+            off = int(np.argmax(np.frombuffer(got, dtype=np.uint8) != np.frombuffer(pattern, dtype=np.uint8)))
+            raise AssertionError(f"aligned bulk round-trip mismatch at offset {off}: "
+                                 f"got={got[off:off + 16].hex()} want={pattern[off:off + 16].hex()}")
         _log(f"[client] aligned {size}-byte round-trip OK (head/tail blocks distinct)")
 
         # ---- 3) sub-sector RMW: 10 bytes at offset +100 must merge, neighbours survive ----
