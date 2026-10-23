@@ -133,6 +133,20 @@ H2D/D2H 中转开销，与 host 模式分开解读。host 方向（LOCAL_HOST �
 - 本示例为纯 NVMe 单介质池（`max_dram=0`）；若需 NVMe+DRAM 双介质池，DRAM 窗口另配一个
   host 面 op 位（同节点 `HOST_SHM`、跨节点 `HOST_RDMA`），冷层预取工作流见下节。
 
+## NUMA 亲和（可选，多 socket 机器）
+
+数据 NIC 的 DMA 与业务线程/staging 内存跨 NUMA 时有实际损耗（本集群 NIC 在 node 6）：
+
+- **NEAR 侧**：`--numa-node 6` 把 client 绑到 NIC 同 socket——NVMe 算子的 staging 池在
+  copy 线程懒分配（first-touch）、qpair 也在该线程同步 poll，**一次绑核同时完成
+  线程/内存/轮询三对齐**（须在进程启动早期生效，脚本内已置于 initialize 之前）；
+- **device 方向全亲和**：再选 NIC 同 socket 的 NPU（本集群 c1/c2 侧卡 = `--dev 6` 或 7，
+  可用 `npu-smi info` 的 PCI 列确认映射）；
+- **FAR 侧**：setup 脚本在 RDMA 模式下自动按 listener IP 反查网卡 NUMA，把 tgt 的
+  reactor 绑到该 node 的前 2 个 CPU（TCP loopback sim 保持 cpus 0-1）；
+- 量化方法：`--numa-node 6`（绑对）vs `--numa-node 0`（绑错）两轮 BW 矩阵对比，差值即
+  亲和收益。
+
 ## 环境变量
 
 完整列表见 `doc/environment_variables.md`（NVMe 第三介质环境变量一节）。关键项：

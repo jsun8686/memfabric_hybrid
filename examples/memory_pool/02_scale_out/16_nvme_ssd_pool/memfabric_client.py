@@ -67,6 +67,27 @@ def _parse_size(tok):
     return n * mult
 
 
+def _bind_numa_node(node):
+    """pin the whole process to one NUMA node's CPUs. The NVMe op allocates its staging
+    pools lazily on the copy thread (first-touch) and polls the qpair in it, so a single
+    binding aligns thread + staging memory + poll with the data NIC's socket. Must run
+    BEFORE mf.initialize: every thread spawned later inherits the affinity."""
+    try:
+        with open(f"/sys/devices/system/node/node{node}/cpulist") as f:
+            raw = f.read().strip()
+    except OSError as e:
+        raise RuntimeError(f"--numa-node {node}: cannot read its cpulist: {e}") from e
+    cpus = []
+    for part in raw.split(","):
+        if "-" in part:
+            lo, hi = (int(x) for x in part.split("-"))
+            cpus.extend(range(lo, hi + 1))
+        else:
+            cpus.append(int(part))
+    os.sched_setaffinity(0, cpus)
+    _log(f"[client] pinned to NUMA node {node} (cpus {raw}) -- staging/poll inherit the locality")
+
+
 def _wait_tcp(url, timeout_sec):
     host, port = url.split("://", 1)[1].rsplit(":", 1)
     deadline = time.time() + timeout_sec
@@ -166,6 +187,10 @@ def main():
                         help="route the LOCAL endpoint of every copy through NPU HBM (torch_npu "
                              "tensor DVA): exercises the LOCAL_DEVICE <-> GLOBAL_NVME directions, "
                              "default off (host mmap, LOCAL_HOST)")
+    parser.add_argument("--numa-node", type=int, default=None, metavar="N",
+                        help="pin the client to NUMA node N (aligns thread + staging + poll with "
+                             "the data NIC's socket; this cluster's data NICs sit on node 6), "
+                             "default off (scheduler picks randomly)")
     parser.add_argument("--world", type=int, default=DEFAULT_WORLD,
                         help=f"declared world capacity (default {DEFAULT_WORLD})")
     parser.add_argument("--rpc-port-base", type=int, default=RPC_PORT_BASE,
@@ -190,6 +215,9 @@ def main():
              "will fail dlopen(libspdk_env_dpdk.so). Export both <spdk>/build/lib and "
              "<spdk>/dpdk/build/lib before launching.")
     _wait_tcp(args.store, 30)
+
+    if args.numa_node is not None:
+        _bind_numa_node(args.numa_node)
 
     mf.set_log_level(1)
     assert mf.initialize() == 0, "mf.initialize failed"

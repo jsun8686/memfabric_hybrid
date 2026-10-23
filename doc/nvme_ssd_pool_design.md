@@ -297,7 +297,7 @@ SPDK 共享库（`--with-shared` 构建）的部分运行时依赖**不进 DT_NE
 
 ### external-EAL 初始化（SPDK dynamic 注册模式）
 
-`spdk_dma_malloc`/qpair 缓冲依赖活的 DPDK EAL；`spdk_env_dpdk_post_init` 的前提是宿主已自行 `rte_eal_init`。`DlNvmeApi::InitDpdkEnv` 已内置：`dlsym(RTLD_DEFAULT,"rte_eal_init")`（DPDK 全家已预载故符号必在）→ `rte_eal_init("memfabric-nvme","--in-memory")`——**免 hugepage、免共享配置文件**，容器 sim 零依赖；幂等（二次调用 ALREADY 被忽略）；无 DPDK 符号（UT stub 场景）返回 NOT_SUPPORTED 由 `EnsureReady` 容忍。
+`spdk_dma_malloc`/qpair 缓冲依赖活的 DPDK EAL；`spdk_env_dpdk_post_init` 的前提是宿主已自行 `rte_eal_init`。`DlNvmeApi::InitDpdkEnv` 已内置：`dlsym(RTLD_DEFAULT,"rte_eal_init")`（DPDK 全家已预载故符号必在）→ `rte_eal_init("memfabric-nvme","--in-memory","--no-pci")`——**免共享配置文件、免 hugepage 显式配置**（注意：`--in-memory` 并不免大页本身——大页仍从系统池按需动态取用、进程退出即还；client 侧无需自行配置的前提是系统池有余量，tgt 部署脚本已把系统 2M 大页池抬至 4GB，跨机两侧均覆盖）；幂等（二次调用 ALREADY 被忽略）；无 DPDK 符号（UT stub 场景）返回 NOT_SUPPORTED 由 `EnsureReady` 容忍。
 
 ### Keep-Alive 必须禁用（target 侧 keep alive timeout 断链，实证）
 
@@ -375,7 +375,7 @@ read 1M 1.36× 未达 2× 的机理：读路径 stage-out（staging→user）在
 | RDMA 复测（33↔35） | BW 矩阵 + TP 归档 | write 1M 2.2×、16M 3.7×，read 16M 2.1× **达标**；read 1M 1.36× 未达（STAGE_COPY 50% 所致，B3 项）；参数矩阵与 `MF_NVME_QDEPTH/QPAIRS` 调优待 B3 前后对比 |
 | 稳定性 | FAR daemon 不重启，NEAR 多轮 create/destroy/BW | **通过**（坑一/坑二修复后；warmup 幂等、endpoint 重复建链、`EnsureSpdkEnv` 闩锁全验证） |
 | TCP sim 回归 | 单机 round-trip/RMW/BW | 通过（正确性口径不变） |
-| device 方向 | D2H/H2D 原生 DVA 路径 | **待测**（见验证指引，B2 收尾项） |
+| device 方向 | D2H/H2D 原生 DVA 路径 | **通过**（2026-10-23，`--device` 模式；torch_npu DVA 端点 + AUTO 方向推断；期间修复 torch H2D 异步流与 aclrtMemcpy 跨流无同步问题——`fill` 后 `npu.synchronize()`） |
 
 ### 坑：tgt + daemon 同机共存时 EAL PCI 探测冲突（2026-10-23 实证，FAR 不重启二次 create 暴露）
 

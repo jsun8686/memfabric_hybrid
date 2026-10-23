@@ -87,6 +87,42 @@ if [ "${SIM}" = 1 ] || [ "${TRANSPORT}" = "RDMA" ]; then
     fi
 fi
 
+# 0.5) NUMA-local reactors: the tgt's own DMA (NIC <-> bdev memory) should stay on
+#      the data NIC's socket -- cross-node traffic costs real bandwidth/latency on
+#      multi-socket ARM. RDMA resolves the NIC from the listener IP and takes the
+#      node's first 2 cpus (stock 2-reactor footprint, just on the right socket);
+#      TCP loopback sim keeps the historical cpus 0-1.
+CORE_MASK="3"
+if [ "${TRANSPORT}" = "RDMA" ]; then
+    NIC_IF=$(ip -o -4 addr show | awk -v ip="${TRADDR}" '{split($4,a,"/"); if (a[1]==ip) {print $2; exit}}')
+    if [ -n "${NIC_IF}" ] && [ -r "/sys/class/net/${NIC_IF}/device/numa_node" ]; then
+        NIC_NUMA=$(cat "/sys/class/net/${NIC_IF}/device/numa_node" 2>/dev/null || echo -1)
+        if [ "${NIC_NUMA}" -ge 0 ] 2>/dev/null; then
+            CORE_MASK=$(python3 - "${NIC_NUMA}" <<'PY'
+import sys
+node = sys.argv[1]
+raw = open("/sys/devices/system/node/node%s/cpulist" % node).read().strip()
+cpus = []
+for p in raw.split(","):
+    if "-" in p:
+        a, b = (int(x) for x in p.split("-"))
+        cpus.extend(range(a, b + 1))
+    else:
+        cpus.append(int(p))
+m = 0
+for c in cpus[:2]:
+    m |= 1 << c
+print(format(m, "x"))
+PY
+)
+            echo "nvmf_tgt reactors pinned to NIC ${NIC_IF} (NUMA node ${NIC_NUMA}, mask 0x${CORE_MASK})"
+        fi
+    fi
+    if [ "${CORE_MASK}" = "3" ]; then
+        echo "NOTE: NIC NUMA node unresolved (no iface for ${TRADDR}?), reactors stay on cpus 0-1"
+    fi
+fi
+
 # 1) target daemon: systemd service when available, direct nohup launch otherwise
 #    (containers usually have no systemd as PID 1)
 start_tgt_direct() {
@@ -100,7 +136,7 @@ start_tgt_direct() {
         [ -d "${spdk_lib}" ] && ld_path="${spdk_lib}:${ld_path}"
         [ -d "${dpdk_lib}" ] && ld_path="${dpdk_lib}:${ld_path}"
     fi
-    LD_LIBRARY_PATH="${ld_path}" nohup "${NVMF_TGT}" -m 0x3 -s 2048 -r "${RPC_SOCK}" >/tmp/nvmf_tgt.log 2>&1 &
+    LD_LIBRARY_PATH="${ld_path}" nohup "${NVMF_TGT}" -m "0x${CORE_MASK}" -s 2048 -r "${RPC_SOCK}" >/tmp/nvmf_tgt.log 2>&1 &
     echo "nvmf_tgt started directly (no systemd in this environment)"
     echo "  log: /tmp/nvmf_tgt.log   stop: pkill nvmf_tgt"
 }
@@ -116,7 +152,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=${NVMF_TGT} -m 0x3 -s 2048
+ExecStart=${NVMF_TGT} -m 0x${CORE_MASK} -s 2048
 Restart=always
 
 [Install]
