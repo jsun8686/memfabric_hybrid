@@ -379,3 +379,11 @@ SPDK 默认 `keep_alive_timeout_ms=10000`，库自动发 KAT 的前提是宿主*
 **根因链**：33 节点 nvmf tgt 常驻占用 RDMA 网卡（tgt 日志 4×`PCI_BUS: cannot be used`）→ daemon 的 `rte_eal_init("--in-memory")` **无 `--no-pci`** → EAL 尝试绑定全部 PCI 设备与 tgt 撞车 → eal_init 真失败被旧代码当"EALREADY"容忍 → `spdk_env_dpdk_post_init` 在半死 EAL 上失败又被 WARN 吞掉 → `g_mem_reg_map == NULL` → 首次 fabric connect 在 `spdk_mem_map_alloc`→`mem_map_notify_walk` 的 `if (!g_mem_reg_map) return -EINVAL`（**SPDK 全路径唯一无日志的失败点**，故现场只见 "Unable to create memory map" 无 ibv_reg_mr 日志）。
 
 **修复（三处）**：① `InitDpdkEnv` argv 加 **`--no-pci`**（我们只用 DPDK 内存子系统，NVMe-oF 走 rdma-core verbs 非 PMD，根本不需要 PCI——tgt/daemon 从此同机无冲突）；② eal_init 负返回**区分 `rte_errno==EALREADY`（良性容忍）与真失败（报错）**；③ `EnsureReady` 将 post_init 失败从 WARN 升级为**硬失败**（A8a 语义补全：环境坏在池 create 即报，而非拖到 connect 报谜语）。旧库时代 FAR 侧懒加载从未触发故未暴露；A8a 把库+EAL 提前到 create 首次点亮此坑。
+
+### 坑二：`spdk_env_dpdk_post_init` 不可重入（daemon 不重启二次 create 暴露）
+
+**现象**：`--no-pci` 修复后第一次 create/warmup/destroy 全通；同 daemon 第二次 create 报 `EAL: The callback is already exist` + `spdk_env_dpdk_post_init: Failed to allocate mem_map`。
+
+**根因**：v25.05 `mem_map_init` 每次都 `rte_mem_event_callback_register("spdk",...)`——DPDK 对同名回调二次注册返回 **EEXIST** → mem_map_init 失败。第一次 pool destroy → op `UnInitialize` 置 `ready_=false` → 二次 create 的 `Initialize` 重跑 post_init。SPDK env 是**进程级**资源（dlopen RTLD_NODELETE 常驻、mem_map_fini 无人调），与 op 实例级 `ready_` 生命周期错位。
+
+**修复**：`DlNvmeApi::EnsureSpdkEnv()`——进程级 **once-per-success** 闩锁（dlopen + EAL + post_init 三合一；独立 envMutex 嵌套于 gMutex 之外，序固定无死锁）。失败不闩（部署修复后可不重启进程重试）。否决的替代：destroy 时调 `spdk_env_fini()` 撤回调——多池共享 SPDK 底座时会拆共享状态。

@@ -110,6 +110,14 @@ public:
      * call repeatedly, absent symbols fall through to BM_NOT_SUPPORTED */
     static Result InitDpdkEnv();
 
+    /* process-wide one-shot of the full SPDK environment: dlopen + EAL init +
+     * spdk_env_dpdk_post_init. MUST succeed only once per process: post_init is NOT
+     * re-entrant -- DPDK rejects a second same-name mem event callback with EEXIST
+     * which makes mem_map_init fail ("Failed to allocate mem_map", verified: a daemon
+     * surviving pool destroy re-ran it on the next create). A failure does NOT latch:
+     * the deployment can be fixed and the next call retries. */
+    static Result EnsureSpdkEnv();
+
     /* the SPDK env may also be initialized externally (e.g. embedded in the caller);
      * the post-init call is optional, a missing symbol is not an error */
     static inline int EnvDpdkPostInit(bool legacyMem)
@@ -245,6 +253,7 @@ public:
 
 private:
     static bool gLoaded;
+    static bool gSpdkEnvReady; /* EnsureSpdkEnv once-per-success latch */
     static std::mutex gMutex;
     static void *gEnvHandle;
     static void *gNvmeHandle;

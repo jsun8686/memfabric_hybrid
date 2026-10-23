@@ -21,6 +21,7 @@ namespace ock {
 namespace mf {
 
 bool DlNvmeApi::gLoaded = false;
+bool DlNvmeApi::gSpdkEnvReady = false;
 std::mutex DlNvmeApi::gMutex;
 void *DlNvmeApi::gEnvHandle = nullptr;
 void *DlNvmeApi::gNvmeHandle = nullptr;
@@ -245,6 +246,42 @@ Result DlNvmeApi::InitDpdkEnv()
         return BM_ERROR;
     }
     BM_LOG_DEBUG("rte_eal_init --in-memory --no-pci rc:" << rc);
+    return BM_OK;
+}
+
+Result DlNvmeApi::EnsureSpdkEnv()
+{
+    /* process-wide once-per-success: dlopen + EAL + post_init. post_init is NOT
+     * re-entrant (DPDK rejects the second same-name mem event callback with EEXIST,
+     * which fails mem_map_init), so it must never run again after the first success,
+     * even when an nvme data operator is destroyed and re-created with the process
+     * still alive. A failure leaves the latch open: fix the env and the next call
+     * retries. gEnvMutex nests strictly outside gMutex (LoadLibrary takes gMutex),
+     * the order is fixed so there is no deadlock. */
+    static std::mutex envMutex;
+    std::lock_guard<std::mutex> guard(envMutex);
+    if (gSpdkEnvReady) {
+        return BM_OK;
+    }
+
+    auto ret = LoadLibrary();
+    if (ret != BM_OK) {
+        return ret;
+    }
+    ret = InitDpdkEnv();
+    if (ret != BM_OK && ret != BM_NOT_SUPPORTED) {
+        return ret; /* real EAL failure (e.g. pci clash): hard error, retry stays possible */
+    }
+    if (gSpdkEnvDpdkPostInit != nullptr) {
+        /* the symbol exists: its failure leaves no mem_map subsystem and every RDMA
+         * connect after it fails -- report it right here, do not defer the surprise */
+        const int postRet = gSpdkEnvDpdkPostInit(false);
+        if (postRet != 0) {
+            BM_LOG_ERROR("spdk_env_dpdk_post_init failed, ret:" << postRet);
+            return BM_ERROR;
+        }
+    }
+    gSpdkEnvReady = true;
     return BM_OK;
 }
 
