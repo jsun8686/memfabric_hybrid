@@ -426,7 +426,7 @@ Result HostDataOpNvme::PrepareAndSubmit(const NvmeEndpointPtr &endpoint, QpairSl
 {
     /* staging is taken lazily here (NOT in BuildCmds): only qdepth commands are in
      * flight at any time, so the pools only need qdepth blocks */
-    cmd.staging = AcquireBuf(cmd.rmw);
+    cmd.staging = static_cast<char *>(AcquireBuf(cmd.rmw));
     if (cmd.staging == nullptr) {
         BM_LOG_ERROR("nvme staging buffer exhausted");
         return BM_MALLOC_FAILED;

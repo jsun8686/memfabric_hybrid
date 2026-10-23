@@ -896,7 +896,7 @@ TEST_F(HybmDataOpNvmeTest, ConcurrentCopies_UseDistinctQpairs)
     ASSERT_EQ(op.Initialize(), BM_OK);
     RegisterExtent();
 
-    NvmeEndpointPtr endpoint;
+    HostDataOpNvme::NvmeEndpointPtr endpoint;
     ASSERT_EQ(op.GetEndpoint(extent_, endpoint), BM_OK);
     ASSERT_EQ(endpoint->slots.size(), 4U); /* MF_NVME_QPAIRS default */
 
