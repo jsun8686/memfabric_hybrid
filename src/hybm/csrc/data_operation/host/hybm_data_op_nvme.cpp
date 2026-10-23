@@ -364,8 +364,11 @@ void HostDataOpNvme::BuildCmds(const NvmeEndpointPtr &endpoint, const HybmNvmeEx
     const uint64_t firstSector = absStart >> 9;
     const uint64_t lastSector = (absEnd - 1) >> 9;
     const uint32_t headSkip = static_cast<uint32_t>(absStart & (NVME_SECTOR_SIZE - 1));
-    const uint32_t headBytes = headSkip != 0 ? static_cast<uint32_t>(NVME_SECTOR_SIZE - headSkip) : 0U;
-    const uint32_t tailBytes = static_cast<uint32_t>(absEnd & (NVME_SECTOR_SIZE - 1));
+    /* head clamps to len (a sub-sector write inside ONE sector must not stretch past the
+     * user buffer) and tail only exists when the range actually leaves the first sector */
+    const uint32_t headBytes =
+        headSkip != 0 ? static_cast<uint32_t>(std::min<uint64_t>(NVME_SECTOR_SIZE - headSkip, len)) : 0U;
+    const uint32_t tailBytes = (lastSector != firstSector) ? static_cast<uint32_t>(absEnd & (NVME_SECTOR_SIZE - 1)) : 0U;
     const uint64_t midStart = absStart + headBytes;
     const uint64_t midLen = len - headBytes - tailBytes;
 
@@ -424,23 +427,27 @@ void HostDataOpNvme::BuildCmds(const NvmeEndpointPtr &endpoint, const HybmNvmeEx
 
 Result HostDataOpNvme::PrepareAndSubmit(const NvmeEndpointPtr &endpoint, QpairSlot *slot, NvmeCmd &cmd) noexcept
 {
-    /* staging is taken lazily here (NOT in BuildCmds): only qdepth commands are in
-     * flight at any time, so the pools only need qdepth blocks */
-    cmd.staging = static_cast<char *>(AcquireBuf(cmd.rmw));
     if (cmd.staging == nullptr) {
-        BM_LOG_ERROR("nvme staging buffer exhausted");
-        return BM_MALLOC_FAILED;
-    }
-    /* mid writes stage the user bytes in before submit; reads and RMW read-halves are
-     * filled by the device */
-    if (cmd.isWrite && !cmd.pendingWrite) {
-        const uint64_t t0 = TP_CURRENT_TIME_NS;
-        auto ret = CopyUserIn(cmd);
-        TP_TRACE_RECORD(TP_HYBM_NVME_STAGE_COPY, TP_CURRENT_TIME_NS - t0, ret);
-        if (ret != BM_OK) {
-            return ret;
+        /* staging is taken lazily here (NOT in BuildCmds): only qdepth commands are in
+         * flight at any time, so the pools only need qdepth blocks */
+        cmd.staging = static_cast<char *>(AcquireBuf(cmd.rmw));
+        if (cmd.staging == nullptr) {
+            BM_LOG_ERROR("nvme staging buffer exhausted");
+            return BM_MALLOC_FAILED;
+        }
+        /* mid writes stage the user bytes in before submit; reads and RMW read-halves
+         * are filled by the device */
+        if (cmd.isWrite && !cmd.pendingWrite) {
+            const uint64_t t0 = TP_CURRENT_TIME_NS;
+            auto ret = CopyUserIn(cmd);
+            TP_TRACE_RECORD(TP_HYBM_NVME_STAGE_COPY, TP_CURRENT_TIME_NS - t0, ret);
+            if (ret != BM_OK) {
+                return ret;
+            }
         }
     }
+    /* else: round-2 RMW command -- the staging (sector already read + merged by ReapCmd)
+     * rides along, no re-acquire (would leak the transferred block) and no re-merge */
     const int rc = cmd.isWrite
         ? DlNvmeApi::NsCmdWrite(endpoint->ns, slot->qpair, cmd.staging, cmd.lba, cmd.lbaCount, IoDone, &cmd.ctx)
         : DlNvmeApi::NsCmdRead(endpoint->ns, slot->qpair, cmd.staging, cmd.lba, cmd.lbaCount, IoDone, &cmd.ctx);
