@@ -220,6 +220,15 @@ private:
 
     static void FakeDmaFree(void *buf)
     {
+        /* released through the normal path (pool recycle / CloseDevice): drop it from
+         * the LSan ledger so the stub destructor only frees what was never returned */
+        auto &v = Instance().dmaAllocs_;
+        for (auto it = v.begin(); it != v.end(); ++it) {
+            if (*it == buf) {
+                v.erase(it);
+                break;
+            }
+        }
         free(buf);
     }
 
