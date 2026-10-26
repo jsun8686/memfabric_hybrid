@@ -161,12 +161,17 @@ RDMA busy-poll + SGL 翻译 + malloc 盘的 CPU memcpy 全部跑在 reactor 核�
   默认）。**它不抬 MDTS**——单独调大到 64K 实测全线慢 20~30%（buffer 粒度粗、池中
   buffer 数变少），不要单独使用；
 - `--max-io-size N`：transport max I/O（RPC `--max-io-size`，默认 131072）= **tgt 上报
-  的控制器 MDTS，initiator 按它切分命令**。与 `--io-unit`（须 ≤ max-io-size）一起调
-  大——如 `--io-unit 65536 --max-io-size 1048576`——host 端每命令负载 ×8，是压测
-  host 侧单线程命令处理成本的杠杆（host `maxXfer` 日志可确认生效）；代价是 transport
-  pool 内存变大；
+  的控制器 MDTS，initiator 按它切分命令**。**实测负优化**：与 `--io-unit 65536` 联调到
+  1M 后 16M read 7.4→4.35 GB/s——大命令让 tgt 侧 CPU memcpy 与 NIC 传输从"流水重叠"
+  退化为"逐命令串行"（单核 memcpy 实测 7.93 GB/s，见 `bench_memcpy.sh`），保持默认；
+- `--zcopy`：transport 零拷贝（RPC `-z`，malloc 盘支持）——RDMA 直接 DMA 盘内存，消除
+  tgt reactor 上的逐 IO CPU memcpy。**基线 16M read ~7.4 GB/s ≈ 单核 memcpy 带宽的
+  94%，该 memcpy 就是基线瓶颈**，此开关是对症药（预期突破到 9.6+ GB/s，受协议栈有效
+  带宽约束）；
 - 注意：transport 参数对**已运行**的 tgt 不重放（create_transport 一次性），改参数必须
-  `pkill nvmf_tgt` 后重跑脚本。
+  `pkill nvmf_tgt` 后重跑脚本；
+- 瓶颈定位工具：`bench_memcpy.sh`（单核/多核/跨 NUMA 的 memcpy 带宽矩阵，node6 单核
+  7.93 GB/s、8 线程聚合 22 GB/s、跨 node 代价 3~8%）。
 
 ## 零拷贝预注册（B3，host buffer 可选加速）
 

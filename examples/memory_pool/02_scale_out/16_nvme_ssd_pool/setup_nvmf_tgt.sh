@@ -42,9 +42,16 @@
 #                initiator adopts as its per-command transfer cap (default 131072
 #                = SPDK default). Raising this (with --io-unit <= max-io-size,
 #                e.g. --io-unit 65536 --max-io-size 1048576) makes the initiator
-#                submit fewer, larger commands -- the lever for testing host-side
-#                per-command overhead. Costs transport pool memory; consider a
-#                bigger tgt -s reservation if buffer allocation fails.
+#                submit fewer, larger commands -- measured NEGATIVE on this
+#                cluster (16M read 7.4 -> 4.35 GB/s: coarse commands serialize
+#                the tgt-side CPU memcpy against the NIC; single-core memcpy
+#                measured 7.93 GB/s, see bench_memcpy.sh). Keep the defaults.
+#   --zcopy      enable the transport zero-copy path (RPC -z): with a bdev that
+#                supports it (malloc does) the RDMA engine DMAs the bdev memory
+#                directly, eliminating the per-IO CPU memcpy on the tgt reactors
+#                -- the measured baseline ceiling (16M read ~7.4 GB/s ~= 94% of
+#                the single-core memcpy bandwidth) IS that memcpy, so this is
+#                the first lever to try when the tgt side caps throughput.
 # (bash is required; invoking via sh re-execs bash automatically)
 
 # re-exec under bash when mistakenly invoked via sh/dash (dash lacks pipefail)
@@ -58,6 +65,7 @@ TRANSPORT=""
 CORES=2
 IO_UNIT=8192
 MAX_IO_SIZE=131072
+ZCOPY=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --sim) SIM=1 ;;
@@ -69,11 +77,12 @@ while [ $# -gt 0 ]; do
         --io-unit=*) IO_UNIT="${1#*=}" ;;
         --max-io-size) [ $# -ge 2 ] || { echo "--max-io-size needs a value" >&2; exit 1; }; MAX_IO_SIZE="$2"; shift ;;
         --max-io-size=*) MAX_IO_SIZE="${1#*=}" ;;
+        --zcopy) ZCOPY=1 ;;
         *) if [ -z "${TRADDR}" ]; then TRADDR="$1"; else BASE_BDEV="$1"; fi ;;
     esac
     shift
 done
-: "${TRADDR:?usage: $0 <traddr> [bdev] [--sim] [--tcp|--rdma|--transport=TCP|RDMA] [--cores=N] [--io-unit=N] [--max-io-size=N]}"
+: "${TRADDR:?usage: $0 <traddr> [bdev] [--sim] [--tcp|--rdma|--transport=TCP|RDMA] [--cores=N] [--io-unit=N] [--max-io-size=N] [--zcopy]}"
 
 # sanitize the knobs: positive ints, clamped (CORES<=32 keeps the -m coremask sane)
 case "${CORES}" in ''|*[!0-9]*|0) echo "invalid --cores '${CORES}'" >&2; exit 1 ;; esac
@@ -241,7 +250,10 @@ fi
 #    NOTE: this SPDK generation takes the NQN as a positional argument, and
 #    allow_any_host defaults to enabled (--allow/--enable do not exist)
 if [ "${TRANSPORT}" = "RDMA" ]; then
-    $RPC nvmf_create_transport -t RDMA --io-unit-size "${IO_UNIT}" --max-io-size "${MAX_IO_SIZE}" -m 8 || true
+    ZCOPY_FLAG=""
+    [ "${ZCOPY}" = 1 ] && ZCOPY_FLAG="-z"
+    # shellcheck disable=SC2086 # ZCOPY_FLAG is intentionally empty or a single flag
+    $RPC nvmf_create_transport -t RDMA --io-unit-size "${IO_UNIT}" --max-io-size "${MAX_IO_SIZE}" -m 8 ${ZCOPY_FLAG} || true
 else
     $RPC nvmf_create_transport -t TCP || true
 fi
@@ -261,7 +273,7 @@ echo "  nqn        = ${NQN}"
 echo "  listener   = ${TRADDR}:${TRSVCID}"
 echo "  reactors   = ${CORES} cores (${EAL_CORES})"
 if [ "${TRANSPORT}" = "RDMA" ]; then
-    echo "  io-unit    = ${IO_UNIT} bytes, max-io-size = ${MAX_IO_SIZE} bytes (= controller MDTS the initiator adopts)"
+    echo "  io-unit    = ${IO_UNIT} bytes, max-io-size = ${MAX_IO_SIZE} bytes (= controller MDTS the initiator adopts), zcopy = ${ZCOPY}"
 fi
 echo "  base bdev  = ${BASE_BDEV} (extents are carved as uniform splits by the daemon)"
 if [ "${SIM}" = 1 ]; then
