@@ -91,14 +91,17 @@ public:
     /* drain every slot once (operator Wait: the window path is already synchronous) */
     Result Drain() noexcept;
 
-private:
-    NvmeTransportManager() = default;
     /* release everything on destruction: the singleton dies only at process exit or
-     * UT reset, but a live MR/staging pool must never outlive it silently */
+     * UT reset, but a live MR/staging pool must never outlive it silently. Public:
+     * shared_ptr's control block deletes the instance, the destructor must stay
+     * accessible (private ctor is what actually enforces the singleton). */
     ~NvmeTransportManager() override
     {
         (void)CloseDevice();
     }
+
+private:
+    NvmeTransportManager() = default;
 
     struct IoCtx {
         int32_t done{0};
