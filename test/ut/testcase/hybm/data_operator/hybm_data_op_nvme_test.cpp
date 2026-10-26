@@ -122,6 +122,12 @@ public:
         DlNvmeApi::gSpdkMemRegister = saved_.memRegister;
         DlNvmeApi::gSpdkMemUnregister = saved_.memUnregister;
         DlNvmeApi::gLoaded = savedLoaded_;
+        /* LSan insurance, AFTER the pointers are restored: release every staging block
+         * the transport pools never returned (singleton may outlive this stub) */
+        for (void *buf : dmaAllocs_) {
+            free(buf);
+        }
+        dmaAllocs_.clear();
     }
 
     void FillSector(uint64_t lba, char filler)
@@ -159,6 +165,8 @@ public:
     uint32_t memRegisterCalls = 0;
     uint32_t memUnregisterCalls = 0;
     std::vector<std::pair<uint64_t, uint64_t>> registeredRanges; /* aligned windows, in order */
+    /* every FakeDmaMalloc block, freed at stub teardown (LSan insurance) */
+    std::vector<void *> dmaAllocs_;
     MfSpdkNvmeTransportId lastTrid{};
     size_t lastOptsSize = 0;
     uint32_t lastKeepAliveMs = 0xFFFFFFFF;
@@ -203,6 +211,10 @@ private:
         if (posix_memalign(&buf, align < sizeof(void *) ? sizeof(void *) : align, size) != 0) {
             return nullptr;
         }
+        /* LSan insurance: the transport singleton may be destroyed after this stub
+         * restored the function pointers (fixture teardown order), so its pools could
+         * never be freed through the normal path -- release everything here */
+        Instance().dmaAllocs_.push_back(buf);
         return buf;
     }
 
@@ -692,7 +704,12 @@ TEST_F(HybmDataOpNvmeTest, AsyncBatchAndWait_CompleteAndDetach)
 
     ASSERT_EQ(op.Wait(0), BM_OK);
 
+    /* connection lifetime belongs to the transport singleton now (shared across
+     * pools): the operator teardown does NOT drop endpoints -- an explicit transport
+     * CloseDevice releases them */
     op.UnInitialize();
+    EXPECT_EQ(stub.detachCalls, 0U);
+    ASSERT_EQ(NvmeTransportForTest::GetInstance()->CloseDevice(), BM_OK);
     EXPECT_GE(stub.detachCalls, 1U);
 }
 
@@ -767,11 +784,14 @@ TEST_F(HybmDataOpNvmeTest, BatchWindow_FillsDepthAndReaps)
     NvmeApiStub stub;
     stub.maxXfer = 512U; /* one sector per command -> 16 commands */
     (void)setenv("MF_NVME_QDEPTH", "4", 1);
-    NvmeTransportForTest::ResetInstanceForTest(); /* env is parsed at singleton creation */
-    HostDataOpNvme op(0, "rdma");
+    NvmeTransportForTest::ResetInstanceForTest();
+    /* construct the singleton NOW while the env is still set -- env is parsed once,
+     * at singleton creation; anything touching it later reads the default */
+    auto tm = NvmeTransportForTest::GetInstance().get();
     (void)unsetenv("MF_NVME_QDEPTH");
+    HostDataOpNvme op(0, "rdma");
     ASSERT_EQ(op.Initialize(), BM_OK);
-    ASSERT_EQ(NvmeTransportForTest::GetInstance()->qdepth_, 4U);
+    ASSERT_EQ(tm->qdepth_, 4U);
     RegisterExtent();
 
     const uint64_t len = 16U * 512U;

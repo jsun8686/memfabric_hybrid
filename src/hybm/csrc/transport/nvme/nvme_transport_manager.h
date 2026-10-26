@@ -93,6 +93,12 @@ public:
 
 private:
     NvmeTransportManager() = default;
+    /* release everything on destruction: the singleton dies only at process exit or
+     * UT reset, but a live MR/staging pool must never outlive it silently */
+    ~NvmeTransportManager() override
+    {
+        (void)CloseDevice();
+    }
 
     struct IoCtx {
         int32_t done{0};

@@ -91,6 +91,19 @@ Result NvmeTransportManager::OpenDevice(const TransportOptions &options)
 
 Result NvmeTransportManager::CloseDevice()
 {
+    /* UT teardown safety: the singleton is destroyed AFTER the API stub restored the
+     * dlsym'd pointers to null -- touching them then would crash. With the spdk
+     * surface absent there is nothing we can release, just drop the tables. */
+    if (DlNvmeApi::gSpdkDmaFree == nullptr || DlNvmeApi::gSpdkNvmeDetach == nullptr) {
+        std::lock_guard<std::mutex> zcGuard(zcMutex_);
+        zcRegions_.clear();
+        std::lock_guard<std::mutex> bufGuard(bufMutex_);
+        freeSegBufs_.clear();
+        freeSectorBufs_.clear();
+        std::lock_guard<std::mutex> epGuard(endpointsMutex_);
+        endpoints_.clear();
+        return BM_OK;
+    }
     /* release leftover zero-copy registrations: the SPDK env outlives the pools
      * (process-wide once-per-success), a live MR would leak ibv contexts */
     {
@@ -839,9 +852,13 @@ Result NvmeTransportManager::RunItems(std::vector<NvmeCopyItem> &items, bool isW
         cmds.reserve(group.itemIdx.size() * 2U + group.itemIdx.size());
         for (size_t idx : group.itemIdx) {
             const auto &item = items[idx];
-            /* zero-copy only when pre-registered AND host memory: device endpoints keep
-             * aclrtMemcpy staging semantics, RMW head/tail stay staging inside BuildCmds */
-            const bool zc = !localIsDevice && IsZeroCopyRegistered(item.local, item.size);
+            /* zero-copy arming only excludes device endpoints; the PER-COMMAND decision
+             * happens inside BuildCmds (each mid segment must FULLY ride a registered
+             * window). Arming on a whole-item hit would misclassify a 4K-aligned (not
+             * 2MB) buffer: the item as a whole never fits the window, yet most of its
+             * mid segments do -- they must still DMA directly. An empty MR table makes
+             * every per-command lookup return early, so arming is zero-cost then. */
+            const bool zc = !localIsDevice;
             BuildCmds(group.endpoint, group.extent, item.gva - group.extent.gvaBase, item.local, item.size,
                       isWrite, localIsDevice, zc, cmds);
         }
