@@ -18,6 +18,7 @@ include_directories(
         ${PROJECT_HYBM_SRC_BASE}/csrc/transport/device
         ${PROJECT_HYBM_SRC_BASE}/csrc/transport/device/indirect
         ${PROJECT_HYBM_SRC_BASE}/csrc/transport/host
+        ${PROJECT_HYBM_SRC_BASE}/csrc/transport/nvme
         ${PROJECT_HYBM_SRC_BASE}/csrc/transport/utils
         ${PROJECT_HYBM_SRC_BASE}/csrc/ts_engine
         ${PROJECT_HYBM_SRC_BASE}/csrc/under_api
