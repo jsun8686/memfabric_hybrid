@@ -184,6 +184,7 @@ DMA 用户内存——stage-in/stage-out 两次 memcpy 消失（read 1M 实测�
 | `MF_NVME_QPAIRS` | NEAR | 每控制器 qpair 槽位数 = 并发窗口上限（默认 4，无全局 IO 锁） |
 | `MF_NVME_BUF_SLOTS` | NEAR | staging 池深（默认 = QDEPTH） |
 | `MF_NVME_ZEROCOPY` | NEAR | 零拷贝总开关（默认 1；0 = 全量回退 staging） |
+| `MF_NVME_IOVA_MODE` | NEAR | EAL IOVA 模式（默认 va——用户内存零拷贝必需；auto = DPDK 自选，逃生口） |
 
 > 数据面生命周期（性能优化后）：SPDK 库+EAL 在**池 create 时**预载（失败即报错）；
 > ctrlr 连接与 qpair 在 **extent 导入时**预热（失败即 JOIN 报错并回滚）；首 IO 零建立开销。

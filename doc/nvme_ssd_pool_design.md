@@ -242,7 +242,7 @@ SPDK 共享库（`--with-shared`）部分运行时依赖**不进 DT_NEEDED**，d
 
 ### 7.3 EAL 初始化（external-EAL 动态注册模式）
 
-`InitDpdkEnv`：`rte_eal_init("memfabric-nvme","--in-memory","--no-pci")` ——免共享配置文件；`--in-memory` 不免大页本身（按需动态取用，进程退出即还，系统 2M 池须有余量——tgt 部署脚本已抬至 4GB）；**`--no-pci` 必需**（与同机 tgt 的 PCI 探测冲突，附录 B 坑一）；高 NUMA node（物理核 ≥ RTE_MAX_LCORE=128）自动注入 `--lcores=0@<first>`（坑三）；eal_init 负返回区分 `EALREADY`（良性）与真失败。进程级 `EnsureSpdkEnv` once-per-success 闩锁（dlopen+EAL+post_init 三合一；post_init 不可重入——坑二）。
+`InitDpdkEnv`：`rte_eal_init("memfabric-nvme","--in-memory","--no-pci","--iova-mode=va")` ——免共享配置文件；`--in-memory` 不免大页本身（按需动态取用，进程退出即还，系统 2M 池须有余量——tgt 部署脚本已抬至 4GB）；**`--no-pci` 必需**（与同机 tgt 的 PCI 探测冲突，附录 B 坑一）；**`--iova-mode=va` 必需**（用户内存零拷贝：PA 模式下 vtophys 链路对 4K 页 buffer 必败，附录 B 坑四；`MF_NVME_IOVA_MODE=auto` 可省略逃生）；高 NUMA node（物理核 ≥ RTE_MAX_LCORE=128）自动注入 `--lcores=0@<first>`（坑三）；eal_init 负返回区分 `EALREADY`（良性）与真失败。进程级 `EnsureSpdkEnv` once-per-success 闩锁（dlopen+EAL+post_init 三合一；post_init 不可重入——坑二）。
 
 ### 7.4 Keep-Alive 必须禁用 + opts 契约
 
@@ -289,6 +289,7 @@ tgt 侧系统池 2048×2M=4GB（脚本抬）+ tgt 进程 `-s 2048`；NEAR 侧 `-
 | `MF_NVME_BUF_MB` | NEAR | 4 | staging 单段上限（段=min(MDTS, BUF_MB, 尺寸)） |
 | `MF_NVME_BUF_SLOTS` | NEAR | =QDEPTH | staging 池深（两类池各计） |
 | `MF_NVME_ZEROCOPY` | NEAR | 1 | 零拷贝总开关（0=全量回退 staging） |
+| `MF_NVME_IOVA_MODE` | NEAR | va | EAL IOVA 模式（va=用户内存零拷贝必需：PA 模式下 vtophys 要求物理 2MB 对齐+pagemap 可读，普通 4K 页 buffer 无法注册；auto=省略由 DPDK 自选，逃生口） |
 | `MF_NVME_DPDK_LIB_DIR` | NEAR | — | DPDK 库目录显式指定（默认遍历 LD_LIBRARY_PATH） |
 | `MF_NVME_EXTENT_GRAN` | FAR | 1G | extent LBA 粒度（须 ≤ 盘容量） |
 | `MF_NVME_NQN`/`TRADDR`/`TRSVCID` | FAR | — | target 对外身份 |
@@ -408,3 +409,11 @@ SPDK 注册失败不回滚页标记 → 同区间重试 -EBUSY。加固：失败
 ### B.8 torch 异步流与 aclrtMemcpy 跨流
 
 `.to("npu")` 异步 H2D 与 aclrtMemcpy 无跨流隐式序——`fill` 后必须 `torch.npu.synchronize()`。
+
+### B.9 IOVA=PA 模式下用户内存动态注册必败（zc 静默回退，源码实证）
+
+**现象**：例 16 两 buffer `pool.register` 全失败，库日志仅 `nvme zc register ... failed, ret:-1`（无任何 SPDK 输出），`ulimit -l unlimited` 无效——memlock 无关。
+
+**根因链（spdk v25.05.x + spdk/dpdk@cf36799c）**：容器无 IOMMU 组 → EAL 自动选 **IOVA=PA** → `spdk_mem_register` 通知 vtophys map（post_init 无条件创建、链上先于 rdma map）→ `rte_mem_virt2iova` PA 分支走 `rte_mem_virt2phy`（/proc/self/pagemap，PFN 需 CAP_SYS_ADMIN）→ 拿到物理地址后 `vtophys_notify` 要求**逐 2MB chunk 物理地址 2MB 对齐**（`paddr & MASK_2MB → -EINVAL`；PFN 零/读失败 → -EFAULT）——普通 4K 页 backing 的用户 buffer 几乎必然失败；且 vtophys 失败走 `DEBUG_PRINT`（仅 DEBUG 构建输出）→ **生产日志零输出**，`ibv_reg_mr` 从未执行到。THP=always 也救不了（大页分配不保证 100%）。
+
+**修复**：EAL argv 强制 `--iova-mode=va`（默认）——`virt2iova` 直接返回 VA，2MB 对齐内窗过检；vtophys 表存 VA 无害（NVMe-oF SGL 用 MR lkey，不消费 vtophys）；`--no-pci` 零设备下 EAL 接受 VA 无 DMA-mask 检查。`MF_NVME_IOVA_MODE=auto` 逃生口。诊断配套：MemRegister 透传 SPDK 原始负值（-EFAULT/-EINVAL/-EBUSY 可辨，不再归一）。

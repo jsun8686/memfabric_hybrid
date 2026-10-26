@@ -144,7 +144,9 @@ public:
         if (gSpdkMemRegister == nullptr) {
             return BM_NOT_SUPPORTED;
         }
-        return gSpdkMemRegister(vaddr, len) == 0 ? BM_OK : BM_ERROR;
+        /* keep the spdk return verbatim (-EINVAL unaligned, -EBUSY overlap,
+         * -EFAULT vtophys/pagemap) -- the caller logs it for diagnosis */
+        return gSpdkMemRegister(vaddr, len);
     }
 
     static inline Result MemUnregister(void *vaddr, size_t len)
@@ -152,7 +154,7 @@ public:
         if (gSpdkMemUnregister == nullptr) {
             return BM_NOT_SUPPORTED;
         }
-        return gSpdkMemUnregister(vaddr, len) == 0 ? BM_OK : BM_ERROR;
+        return gSpdkMemUnregister(vaddr, len);
     }
 
     /* the SPDK env may also be initialized externally (e.g. embedded in the caller);

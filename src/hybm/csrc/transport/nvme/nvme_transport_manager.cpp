@@ -178,7 +178,8 @@ Result NvmeTransportManager::RegisterMemoryRegion(const TransportMemoryRegion &m
     if (ret != BM_OK) {
         BM_LOG_ERROR("nvme zc register [0x" << std::hex << alignedStart << ", 0x" << alignedEnd
                      << std::dec << ") failed, ret:" << ret
-                     << " (check RLIMIT_MEMLOCK for ibv_reg_mr)");
+                     << " (-EFAULT vtophys/pagemap or memlock, -EINVAL not 2MB-aligned,"
+                        " -EBUSY overlapping; IOVA=VA is required for user memory, see InitDpdkEnv)");
         /* spdk_mem_register marks the 2MB pages BEFORE running the notify callbacks and
          * does NOT roll back on failure (v25.05 memory.c) -- a retry on the same range
          * would fail with -EBUSY. Clear the leftover marks now: unregister of a page

@@ -236,6 +236,29 @@ Result DlNvmeApi::InitDpdkEnv()
     static char arg1[] = "--in-memory";
     static char arg2[] = "--no-pci";
     static char lcoreArg[32] = {0};
+    static char iovaArg[32] = {0};
+
+    /* IOVA mode: default VA. In PA mode spdk_mem_register breaks on the vtophys
+     * mem map -- rte_mem_virt2iova falls back to /proc/self/pagemap and the
+     * translation must be PHYSICALLY 2MB-aligned per chunk (vtophys_notify:
+     * "paddr & MASK_2MB -> -EINVAL"; PFN unavailable -> -EFAULT), so ordinary
+     * 4K-page user buffers can never register (verified on the 33/35 cluster:
+     * zc register failed with zero spdk log output -- vtophys failures are
+     * DEBUG_PRINT-only in release builds). With IOVA=VA virt2iova returns the
+     * VA itself: the 2MB-aligned inner window passes, and the vtophys entries
+     * holding VAs are harmless -- NVMe-oF SGLs address memory via the MR lkey
+     * and never consume vtophys (that is the local PCIe PRP path). No PCI
+     * devices are bound (--no-pci), so EAL accepts VA without DMA-mask checks.
+     * MF_NVME_IOVA_MODE=auto omits the flag (DPDK auto-selects) as an escape
+     * hatch for exotic environments that refuse VA. */
+    {
+        const char *mode = getenv("MF_NVME_IOVA_MODE");
+        if (mode == nullptr || mode[0] == '\0') {
+            (void)snprintf(iovaArg, sizeof(iovaArg), "%s", "--iova-mode=va");
+        } else if (strcmp(mode, "auto") != 0) {
+            (void)snprintf(iovaArg, sizeof(iovaArg), "--iova-mode=%s", mode); /* va / pa */
+        } /* "auto": leave empty = omit, DPDK picks */
+    }
 
     /* RTE_MAX_LCORE is 128 in this DPDK build: EAL derives its main lcore from the
      * process affinity, and a process pinned to HIGH physical cpus (e.g. NUMA node 6
@@ -258,11 +281,13 @@ Result DlNvmeApi::InitDpdkEnv()
         }
     }
 
-    char *argv[5] = {arg0, arg1, arg2, nullptr, nullptr};
+    char *argv[7] = {arg0, arg1, arg2, nullptr, nullptr, nullptr, nullptr};
     int argc = 3;
     if (lcoreArg[0] != '\0') {
-        argv[3] = lcoreArg;
-        argc = 4;
+        argv[argc++] = lcoreArg;
+    }
+    if (iovaArg[0] != '\0') {
+        argv[argc++] = iovaArg;
     }
     int rc = rteEalInit(argc, argv);
     if (rc < 0) {
