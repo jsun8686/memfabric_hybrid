@@ -143,9 +143,25 @@ H2D/D2H 中转开销，与 host 模式分开解读。host 方向（LOCAL_HOST �
 - **device 方向全亲和**：再选 NIC 同 socket 的 NPU（本集群 c1/c2 侧卡 = `--dev 6` 或 7，
   可用 `npu-smi info` 的 PCI 列确认映射）；
 - **FAR 侧**：setup 脚本在 RDMA 模式下自动按 listener IP 反查网卡 NUMA，把 tgt 的
-  reactor 绑到该 node 的前 2 个 CPU（TCP loopback sim 保持 cpus 0-1）；
+  reactor 绑到该 node 的前 N 个 CPU（`--cores N`，默认 2；TCP loopback sim 保持低核号
+  coremask）；
 - 量化方法：`--numa-node 6`（绑对）vs `--numa-node 0`（绑错）两轮 BW 矩阵对比，差值即
   亲和收益。
+
+## FAR 侧 tgt 调优（--cores / --io-unit）
+
+零拷贝后 host 侧已非瓶颈，大块档位的上限由 FAR 侧 tgt 决定（源码实证 SPDK v25.05：
+RDMA busy-poll + SGL 翻译 + malloc 盘的 CPU memcpy 全部跑在 reactor 核上，默认 2 核
+时单 IO reactor 实测封顶 ~7.5GB/s）：
+
+- `--cores N`：reactor 数（默认 2）。扩核是判定实验也是主要杠杆——吞吐随核数升 =
+  tgt CPU 瓶颈实锤（busy-poll 下 reactor 常年 100% 属设计常态，不能单独作证据）；
+- `--io-unit N`：RDMA transport 的 IO 单元（默认 8192 = SPDK 默认，128K max_io ÷ 16
+  SGL）。调大（如 65536）每命令 buffer 数/SGE 翻译/WR 链长 ÷8，且 max_io_size =
+  io-unit×16 相应变大 → initiator 侧 MDTS 分段同步受益（host 端无需改动）；代价是
+  transport buffer pool 内存变大（不足时加大 tgt 的 `-s` 预留）；
+- 两者正交可叠加，改完重启 tgt 重跑 BW 矩阵即可 A/B：
+  `sudo SPDK_ROOT=... bash ./setup_nvmf_tgt.sh 192.168.200.10 --sim --rdma --cores 8 --io-unit 65536`
 
 ## 零拷贝预注册（B3，host buffer 可选加速）
 

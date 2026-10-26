@@ -23,9 +23,24 @@
 #   prints the LD_LIBRARY_PATH the NEAR side needs for dlopen. Without SPDK_ROOT
 #   a package install layout is assumed (systemd unit + rpc.py on PATH).
 #
-# Usage: sudo [SPDK_ROOT=...] bash ./setup_nvmf_tgt.sh <traddr> [bdev] [--sim] [--tcp|--rdma|--transport=TCP|RDMA]
+# Usage: sudo [SPDK_ROOT=...] bash ./setup_nvmf_tgt.sh <traddr> [bdev] [--sim] [--tcp|--rdma|--transport=TCP|RDMA] [--cores=N] [--io-unit=N]
 #   transport defaults to TCP with --sim (loopback) and RDMA otherwise;
 #   "--sim --rdma" = simulated malloc disk behind a real RDMA listener (cross-node)
+#
+# Tuning knobs (both default to the historical values; A/B against the defaults):
+#   --cores N    nvmf_tgt reactor count (default 2). RDMA pins the first N cpus of
+#                the NIC's NUMA node via --lcores; TCP/sim expands the -m coremask.
+#                The whole nvmf data plane (RDMA busy-poll + SGL translation +
+#                bdev memcpy for the malloc disk) shares these reactors: with 2
+#                cores one IO reactor caps throughput around ~7.5GB/s observed.
+#   --io-unit N  RDMA transport io-unit in bytes (default 8192 = SPDK default,
+#                max_io_size 128K / 16 SGL entries). Larger units (e.g. 65536)
+#                cut the per-command buffer count / SGE translations / WR chain
+#                by 8x AND raise max_io_size (= unit x 16) so the initiator's
+#                MDTS splitting grows the same way; costs pool memory.
+#                NOTE: a much larger io-unit enlarges the RDMA buffer pool -- if the
+#                tgt fails to allocate transport buffers raise the -s reservation
+#                in start_tgt_direct below.
 # (bash is required; invoking via sh re-execs bash automatically)
 
 # re-exec under bash when mistakenly invoked via sh/dash (dash lacks pipefail)
@@ -36,15 +51,27 @@ TRADDR=""
 BASE_BDEV=""
 SIM=0
 TRANSPORT=""
-for arg in "$@"; do
-    case "${arg}" in
+CORES=2
+IO_UNIT=8192
+while [ $# -gt 0 ]; do
+    case "$1" in
         --sim) SIM=1 ;;
         --tcp|--transport=TCP|--transport=tcp) TRANSPORT="TCP" ;;
         --rdma|--transport=RDMA|--transport=rdma) TRANSPORT="RDMA" ;;
-        *) if [ -z "${TRADDR}" ]; then TRADDR="${arg}"; else BASE_BDEV="${arg}"; fi ;;
+        --cores) [ $# -ge 2 ] || { echo "--cores needs a value" >&2; exit 1; }; CORES="$2"; shift ;;
+        --cores=*) CORES="${1#*=}" ;;
+        --io-unit) [ $# -ge 2 ] || { echo "--io-unit needs a value" >&2; exit 1; }; IO_UNIT="$2"; shift ;;
+        --io-unit=*) IO_UNIT="${1#*=}" ;;
+        *) if [ -z "${TRADDR}" ]; then TRADDR="$1"; else BASE_BDEV="$1"; fi ;;
     esac
+    shift
 done
-: "${TRADDR:?usage: $0 <traddr> [bdev] [--sim] [--tcp|--rdma|--transport=TCP|RDMA]}"
+: "${TRADDR:?usage: $0 <traddr> [bdev] [--sim] [--tcp|--rdma|--transport=TCP|RDMA] [--cores=N] [--io-unit=N]}"
+
+# sanitize the knobs: positive ints, clamped (CORES<=32 keeps the -m coremask sane)
+case "${CORES}" in ''|*[!0-9]*|0) echo "invalid --cores '${CORES}'" >&2; exit 1 ;; esac
+[ "${CORES}" -le 32 ] || { echo "--cores ${CORES} > 32 not supported (coremask fallback)" >&2; exit 1; }
+case "${IO_UNIT}" in ''|*[!0-9]*|0) echo "invalid --io-unit '${IO_UNIT}'" >&2; exit 1 ;; esac
 
 if [ -z "${BASE_BDEV}" ]; then
     # sim default is the malloc bdev created below, real default is the first NVMe drive
@@ -90,20 +117,21 @@ fi
 # 0.5) NUMA-local reactors: the tgt's own DMA (NIC <-> bdev memory) should stay on
 #      the data NIC's socket -- cross-node traffic costs real bandwidth/latency on
 #      multi-socket ARM. RDMA resolves the NIC from the listener IP and takes the
-#      node's first 2 cpus (stock 2-reactor footprint, just on the right socket);
-#      TCP loopback sim keeps the historical cpus 0-1.
+#      node's first ${CORES} cpus (--cores, default 2 = the historical footprint);
+#      TCP loopback sim keeps the historical low cpus via the -m coremask.
 #      NOTE: -c/-m coremasks carry LCORE ids, which must stay < RTE_MAX_LCORE (128 in
 #      this build) -- a NIC on node 6 has physical cpus 144+, so the pinning rides
-#      --lcores "0@<phys>,1@<phys>" (lcore id mapped to the physical cpu) instead.
-EAL_CORES="-m 0x3"
+#      --lcores "0@<phys>,1@<phys>,..." (lcore id mapped to the physical cpu) instead.
+CORE_MASK=$(printf '0x%X' "$(( (1 << CORES) - 1 ))")
+EAL_CORES="-m ${CORE_MASK}"
 if [ "${TRANSPORT}" = "RDMA" ]; then
     NIC_IF=$(ip -o -4 addr show | awk -v ip="${TRADDR}" '{split($4,a,"/"); if (a[1]==ip) {print $2; exit}}')
     if [ -n "${NIC_IF}" ] && [ -r "/sys/class/net/${NIC_IF}/device/numa_node" ]; then
         NIC_NUMA=$(cat "/sys/class/net/${NIC_IF}/device/numa_node" 2>/dev/null || echo -1)
         if [ "${NIC_NUMA}" -ge 0 ] 2>/dev/null; then
-            PINNED=$(python3 - "${NIC_NUMA}" <<'PY'
+            PINNED=$(python3 - "${NIC_NUMA}" "${CORES}" <<'PY'
 import sys
-node = sys.argv[1]
+node, n = sys.argv[1], int(sys.argv[2])
 raw = open("/sys/devices/system/node/node%s/cpulist" % node).read().strip()
 cpus = []
 for p in raw.split(","):
@@ -112,18 +140,20 @@ for p in raw.split(","):
         cpus.extend(range(a, b + 1))
     else:
         cpus.append(int(p))
-if len(cpus) >= 2:
-    print("--lcores 0@%d,1@%d" % (cpus[0], cpus[1]))
+if len(cpus) >= n:
+    print("--lcores " + ",".join("%d@%d" % (i, c) for i, c in enumerate(cpus[:n])))
 PY
 )
             if [ -n "${PINNED}" ]; then
                 EAL_CORES="${PINNED}"
-                echo "nvmf_tgt reactors pinned to NIC ${NIC_IF} (NUMA node ${NIC_NUMA}, ${EAL_CORES})"
+                echo "nvmf_tgt reactors (${CORES} cores) pinned to NIC ${NIC_IF} (NUMA node ${NIC_NUMA}, ${EAL_CORES})"
+            else
+                echo "NOTE: NIC ${NIC_IF} node ${NIC_NUMA} exposes fewer than ${CORES} cpus, falling back to ${EAL_CORES}"
             fi
         fi
     fi
-    if [ "${EAL_CORES}" = "-m 0x3" ]; then
-        echo "NOTE: NIC NUMA node unresolved (no iface for ${TRADDR}?), reactors stay on cpus 0-1"
+    if [ "${EAL_CORES}" = "-m ${CORE_MASK}" ]; then
+        echo "NOTE: NIC NUMA node unresolved (no iface for ${TRADDR}?), reactors stay on ${EAL_CORES} (cpus 0-$((CORES - 1)))"
     fi
 fi
 
@@ -199,7 +229,7 @@ fi
 #    NOTE: this SPDK generation takes the NQN as a positional argument, and
 #    allow_any_host defaults to enabled (--allow/--enable do not exist)
 if [ "${TRANSPORT}" = "RDMA" ]; then
-    $RPC nvmf_create_transport -t RDMA -u 8192 -m 8 || true
+    $RPC nvmf_create_transport -t RDMA -u "${IO_UNIT}" -m 8 || true
 else
     $RPC nvmf_create_transport -t TCP || true
 fi
@@ -217,6 +247,10 @@ echo "${SUBSYS_JSON}" | grep -q "\"${TRADDR}\"" \
 echo "nvmf target up (transport=${TRANSPORT}, sim=${SIM}):"
 echo "  nqn        = ${NQN}"
 echo "  listener   = ${TRADDR}:${TRSVCID}"
+echo "  reactors   = ${CORES} cores (${EAL_CORES})"
+if [ "${TRANSPORT}" = "RDMA" ]; then
+    echo "  io-unit    = ${IO_UNIT} bytes (max_io_size = $((IO_UNIT * 16)) = io-unit x 16 SGL entries)"
+fi
 echo "  base bdev  = ${BASE_BDEV} (extents are carved as uniform splits by the daemon)"
 if [ "${SIM}" = 1 ]; then
     echo "daemon env  : MF_NVME_NQN=${NQN} MF_NVME_TRADDR=${TRADDR} MF_NVME_BASE_BDEV=${BASE_BDEV}"
