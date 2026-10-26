@@ -360,6 +360,31 @@ int32_t MemEntityDefault::FreeLocalMemory(hybm_mem_slice_t slice, uint32_t flags
         BM_LOG_ERROR("the object is not initialized, please check whether Initialize is called.");
         return BM_INVALID_PARAM;
     }
+    /* zero-copy sentinel FIRST: no segment owns it by design, and running the
+     * three-segment lookup on it only produces misleading "slice not found"
+     * error noise (its index can even collide with a live segment slice index,
+     * the sentinel magic is what separates them) */
+    if (MemSlice::IsZcSentinelId(slice)) {
+        const uint32_t index = MemSlice::GetZcIndexFrom(slice);
+        std::lock_guard<std::mutex> guard(zcRegsMutex_);
+        auto it = zcRegs_.find(index);
+        if (it == zcRegs_.end()) {
+            BM_LOG_ERROR("FreeLocalMemory: unknown zc sentinel index=" << index);
+            return BM_INVALID_PARAM;
+        }
+        const uint64_t addr = it->second.first;
+        zcRegs_.erase(it);
+        if (transportManager_ != nullptr) {
+            auto ret = transportManager_->UnregisterMemoryRegion(addr);
+            if (ret != BM_OK) {
+                BM_LOG_ERROR("FreeLocalMemory: nvme zc unregister addr=0x" << std::hex << addr
+                             << std::dec << " failed, ret:" << ret);
+                return ret;
+            }
+        }
+        BM_LOG_INFO("FreeLocalMemory: nvme zc released, index=" << index << " addr=0x" << std::hex << addr);
+        return BM_OK;
+    }
     HybmVaManager::GetInstance().DumpReservedGvaInfo();
     HybmVaManager::GetInstance().DumpAllocatedGvaInfo();
     MemSlicePtr memSlice;
@@ -375,29 +400,6 @@ int32_t MemEntityDefault::FreeLocalMemory(hybm_mem_slice_t slice, uint32_t flags
     }
 
     if (memSlice == nullptr) {
-        /* zero-copy sentinel: no segment owns it by design, route the release to the
-         * transport MR domain through the registration ledger */
-        if (MemSlice::IsZcSentinelId(slice)) {
-            const uint32_t index = MemSlice::GetZcIndexFrom(slice);
-            std::lock_guard<std::mutex> guard(zcRegsMutex_);
-            auto it = zcRegs_.find(index);
-            if (it == zcRegs_.end()) {
-                BM_LOG_ERROR("FreeLocalMemory: unknown zc sentinel index=" << index);
-                return BM_INVALID_PARAM;
-            }
-            const uint64_t addr = it->second.first;
-            zcRegs_.erase(it);
-            if (transportManager_ != nullptr) {
-                auto ret = transportManager_->UnregisterMemoryRegion(addr);
-                if (ret != BM_OK) {
-                    BM_LOG_ERROR("FreeLocalMemory: nvme zc unregister addr=0x" << std::hex << addr
-                                 << std::dec << " failed, ret:" << ret);
-                    return ret;
-                }
-            }
-            BM_LOG_INFO("FreeLocalMemory: nvme zc released, index=" << index << " addr=0x" << std::hex << addr);
-            return BM_OK;
-        }
         BM_LOG_ERROR("FreeLocalMemory: cannot resolve slice id=" << slice
                       << ", no segment owns it; VaManager entry may leak");
         return BM_OK;
