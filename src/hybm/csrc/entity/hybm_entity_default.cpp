@@ -294,7 +294,36 @@ int32_t MemEntityDefault::RegisterLocalMemory(const void *ptr, uint64_t size, ui
     } else {
         segment = dramSegment_;
     }
-    BM_VALIDATE_RETURN(segment != nullptr, "address for segment is null.", BM_INVALID_PARAM);
+    if (segment == nullptr) {
+        /* pure NVMe pool: no local memory segment exists to pin a slice on. Registration
+         * degrades to zero-copy pre-registration in the transport MR domain (the unified
+         * RegisterMemoryRegion chain; a hybrid pool reaches the same MR as an add-on on
+         * its normal path). The handle is a sentinel id routed back on free -- see
+         * MemSlice::MakeZcSentinelId for why it is safe in every slice consumer. */
+        constexpr uint32_t nvmeBits = HYBM_DOP_TYPE_NVME_TCP | HYBM_DOP_TYPE_NVME_RDMA;
+        if ((options_.bmDataOpType & nvmeBits) != 0 && transportManager_ != nullptr) {
+            transport::TransportMemoryRegion mr;
+            mr.addr = addr;
+            mr.size = size;
+            auto ret = transportManager_->RegisterMemoryRegion(mr);
+            if (ret != BM_OK) {
+                /* NOT_SUPPORTED here is a NORMAL fallback (zero-copy unavailable, copies
+                 * stay correct on staging): warn, do not spam the error path */
+                BM_LOG_WARN("nvme zero-copy register of [0x" << std::hex << addr << std::dec << ", "
+                            << size << ") unavailable, ret:" << ret
+                            << " (copies keep the staging path)");
+                return ret;
+            }
+            std::lock_guard<std::mutex> guard(zcRegsMutex_);
+            const uint32_t index = zcRegsNextIndex_++;
+            zcRegs_[index] = {addr, size};
+            slice = MemSlice::MakeZcSentinelId(index);
+            BM_LOG_INFO("nvme zero-copy registered: addr=0x" << std::hex << addr << std::dec
+                        << " size=" << size << " sentinel index=" << index);
+            return BM_OK;
+        }
+        BM_VALIDATE_RETURN(false, "address for segment is null.", BM_INVALID_PARAM);
+    }
 
     MemSlicePtr realSlice;
     auto ret = segment->RegisterMemory(ptr, size, realSlice);
@@ -346,6 +375,29 @@ int32_t MemEntityDefault::FreeLocalMemory(hybm_mem_slice_t slice, uint32_t flags
     }
 
     if (memSlice == nullptr) {
+        /* zero-copy sentinel: no segment owns it by design, route the release to the
+         * transport MR domain through the registration ledger */
+        if (MemSlice::IsZcSentinelId(slice)) {
+            const uint32_t index = MemSlice::GetZcIndexFrom(slice);
+            std::lock_guard<std::mutex> guard(zcRegsMutex_);
+            auto it = zcRegs_.find(index);
+            if (it == zcRegs_.end()) {
+                BM_LOG_ERROR("FreeLocalMemory: unknown zc sentinel index=" << index);
+                return BM_INVALID_PARAM;
+            }
+            const uint64_t addr = it->second.first;
+            zcRegs_.erase(it);
+            if (transportManager_ != nullptr) {
+                auto ret = transportManager_->UnregisterMemoryRegion(addr);
+                if (ret != BM_OK) {
+                    BM_LOG_ERROR("FreeLocalMemory: nvme zc unregister addr=0x" << std::hex << addr
+                                 << std::dec << " failed, ret:" << ret);
+                    return ret;
+                }
+            }
+            BM_LOG_INFO("FreeLocalMemory: nvme zc released, index=" << index << " addr=0x" << std::hex << addr);
+            return BM_OK;
+        }
         BM_LOG_ERROR("FreeLocalMemory: cannot resolve slice id=" << slice
                       << ", no segment owns it; VaManager entry may leak");
         return BM_OK;
@@ -1401,7 +1453,10 @@ Result MemEntityDefault::InitTransManager()
     }
 
     auto hostTransFlags = HYBM_DOP_TYPE_HOST_RDMA | HYBM_DOP_TYPE_HOST_URMA | HYBM_DOP_TYPE_HOST_TCP;
-    auto composeTransFlags = HYBM_DOP_TYPE_DEVICE_RDMA | hostTransFlags;
+    /* NVMe pools ride the transport layer too: the third sub-transport (singleton,
+     * shared ctrlr connections + SPDK env) opens with the pool create (A8a hard-fail) */
+    auto composeTransFlags = HYBM_DOP_TYPE_DEVICE_RDMA | hostTransFlags | HYBM_DOP_TYPE_NVME_TCP |
+                             HYBM_DOP_TYPE_NVME_RDMA;
     if ((options_.bmDataOpType & composeTransFlags) == 0) {
         BM_LOG_DEBUG("NO RDMA Data Operator transport skip init.");
         return BM_OK;

@@ -147,6 +147,28 @@ H2D/D2H 中转开销，与 host 模式分开解读。host 方向（LOCAL_HOST �
 - 量化方法：`--numa-node 6`（绑对）vs `--numa-node 0`（绑错）两轮 BW 矩阵对比，差值即
   亲和收益。
 
+## 零拷贝预注册（B3，host buffer 可选加速）
+
+`pool.register(addr, size)` 对 NVMe 池的语义 = **零拷贝预注册**：把 buffer 的 2MB 对齐
+内窗 `spdk_mem_register`（底层逐 mem map `ibv_reg_mr`），此后命中区间的 copy 由 NIC 直接
+DMA 用户内存——stage-in/stage-out 两次 memcpy 消失（read 1M 实测瓶颈即在此）。
+
+- **头尾碎片自然降级**：不足 2MB 对齐的头/尾（亚扇区 RMW 亦然）继续走 staging，混合执行，
+  无需用户对齐 buffer；device（DVA）端点恒 staging；
+- **显式生命周期**：buffer 须存活至 `pool.unregister(addr)`（与 host_rdma MR 注册同等
+  契约）——释放后 VA 复用而注册仍活会 DMA 到错内存；
+- **纯优化非依赖**：未注册/注册失败/`MF_NVME_ZEROCOPY=0`/符号缺失时自动回退 staging，
+  正确性不受影响；A/B 对比用 `--no-zc`（staging 基线）；
+- **RLIMIT_MEMLOCK**：注册 = 内核 pin 页（`ibv_reg_mr`），计入进程 memlock 配额——
+  例 16 两个 60MB 内窗 ≈ 120MB，ssh/systemd 默认 64MB 会在第二个 register 报错。
+  验证前 `ulimit -l unlimited`（或 systemd 单元 `LimitMEMLOCK=infinity`）；
+  SPDK 对注册区间的要求：vaddr/len 均 2MB 对齐（向内收缩已处理）、不可重叠、
+  须已映射；普通 4K 页匿名 mmap 即可，**不要求大页**（RDMA 数据面走 ibv_reg_mr，
+  不经 vtophys/PRP——那是本地 PCIe NVMe 的路径）；
+- 统一注册链：`pool.register` → ralloc → `hybm_register_local_memory`（与其他介质同一接口）
+  → 纯 NVMe 池在 entity 层直落 NVMe transport 的 MR 域（`spdk_mem_register`），返回哨兵
+  slice 句柄；IO 路径只做 ns 级查表，零注册开销（注册一次 = 整段一次 `ibv_reg_mr`，非逐 2MB）。
+
 ## 环境变量
 
 完整列表见 `doc/environment_variables.md`（NVMe 第三介质环境变量一节）。关键项：
@@ -161,6 +183,7 @@ H2D/D2H 中转开销，与 host 模式分开解读。host 方向（LOCAL_HOST �
 | `MF_NVME_QDEPTH` | NEAR | 窗口深度：单窗在飞命令数（默认 16，clamp 1..128） |
 | `MF_NVME_QPAIRS` | NEAR | 每控制器 qpair 槽位数 = 并发窗口上限（默认 4，无全局 IO 锁） |
 | `MF_NVME_BUF_SLOTS` | NEAR | staging 池深（默认 = QDEPTH） |
+| `MF_NVME_ZEROCOPY` | NEAR | 零拷贝总开关（默认 1；0 = 全量回退 staging） |
 
 > 数据面生命周期（性能优化后）：SPDK 库+EAL 在**池 create 时**预载（失败即报错）；
 > ctrlr 连接与 qpair 在 **extent 导入时**预热（失败即 JOIN 报错并回滚）；首 IO 零建立开销。

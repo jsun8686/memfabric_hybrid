@@ -79,6 +79,14 @@ static_assert(MF_NVME_CTRLR_OPTS_SIZE % alignof(uint64_t) == 0, "keeps uint64 fi
 /* callback of an NVMe IO command; cpl points to struct spdk_nvme_cpl (opaque here) */
 using MfSpdkNvmeCmdCb = void (*)(void *ctx, const void *cpl);
 
+/* dynamic memory registration for zero-copy (B3): spdk_mem_register takes a
+ * 2MB-aligned, mapped host range and pushes it through every rdma mem map
+ * (ibv_reg_mr) -- NVMe commands may then DMA directly into user memory.
+ * Optional symbols: absent -> zero-copy is globally disabled and every copy
+ * rides the staging path (correctity never depends on it). */
+using SpdkMemRegisterFunc = int (*)(void *vaddr, size_t len);
+using SpdkMemUnregisterFunc = int (*)(void *vaddr, size_t len);
+
 using SpdkEnvDpdkPostInitFunc = int (*)(bool legacyMem);
 using SpdkDmaMallocFunc = void *(*)(size_t size, size_t align, uint64_t *physAddr);
 using SpdkDmaFreeFunc = void (*)(void *buf);
@@ -117,6 +125,35 @@ public:
      * surviving pool destroy re-ran it on the next create). A failure does NOT latch:
      * the deployment can be fixed and the next call retries. */
     static Result EnsureSpdkEnv();
+
+    /* zero-copy memory registration (B3). MF_NVME_ZEROCOPY=0 disables the whole
+     * feature at the operator level. Absent symbols or a failed registration are
+     * reported to the caller -- the operator then falls back to its staging path,
+     * zero-copy is an optimization, never a correctness dependency. */
+    static inline bool ZeroCopyEnabled()
+    {
+        if (gSpdkMemRegister == nullptr || gSpdkMemUnregister == nullptr) {
+            return false;
+        }
+        const char *env = getenv("MF_NVME_ZEROCOPY");
+        return env == nullptr || env[0] == '\0' || env[0] != '0';
+    }
+
+    static inline Result MemRegister(void *vaddr, size_t len)
+    {
+        if (gSpdkMemRegister == nullptr) {
+            return BM_NOT_SUPPORTED;
+        }
+        return gSpdkMemRegister(vaddr, len) == 0 ? BM_OK : BM_ERROR;
+    }
+
+    static inline Result MemUnregister(void *vaddr, size_t len)
+    {
+        if (gSpdkMemUnregister == nullptr) {
+            return BM_NOT_SUPPORTED;
+        }
+        return gSpdkMemUnregister(vaddr, len) == 0 ? BM_OK : BM_ERROR;
+    }
 
     /* the SPDK env may also be initialized externally (e.g. embedded in the caller);
      * the post-init call is optional, a missing symbol is not an error */
@@ -240,6 +277,8 @@ public:
     static SpdkEnvDpdkPostInitFunc gSpdkEnvDpdkPostInit;
     static SpdkDmaMallocFunc gSpdkDmaMalloc;
     static SpdkDmaFreeFunc gSpdkDmaFree;
+    static SpdkMemRegisterFunc gSpdkMemRegister;
+    static SpdkMemUnregisterFunc gSpdkMemUnregister;
     static SpdkNvmeConnectFunc gSpdkNvmeConnect;
     static SpdkNvmeGetDefaultCtrlrOptsFunc gSpdkNvmeGetDefaultCtrlrOpts;
     static SpdkNvmeDetachFunc gSpdkNvmeDetach;

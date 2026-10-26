@@ -35,6 +35,19 @@ struct MemSlice {
     bool ValidateId(hybm_mem_slice_t slice) const;
     static uint64_t GetIndexFrom(hybm_mem_slice_t slice) noexcept;
 
+    /* ---- NVMe zero-copy registration sentinel ------------------------------------
+     * A pure NVMe pool has no local memory segment to pin a slice on: registering user
+     * memory there means zero-copy pre-registration (transport MR). The returned handle
+     * is a PACKED sentinel id (same layout as ConvertToId) with a sentinel magic and
+     * memType = HYBM_MEM_TYPE_NVME -- it resolves in NO segment table (GetMemSlice
+     * misses everywhere: index lookup fails or ValidateId fails on the magic), so the
+     * classic slice consumers (Export/GetSliceVa/GetSliceGva) reject it by design.
+     * The registrar (MemEntityDefault) keeps the index -> (addr, size) ledger and
+     * FreeLocalMemory routes sentinel ids to the transport MR unregister. */
+    static hybm_mem_slice_t MakeZcSentinelId(uint32_t index) noexcept;
+    static bool IsZcSentinelId(hybm_mem_slice_t slice) noexcept;
+    static uint32_t GetZcIndexFrom(hybm_mem_slice_t slice) noexcept;
+
     const uint64_t magic_ : 24;         /* to verify hybm_mem_slice_t ptr */
     const uint64_t index_ : 32;         /* id of mem slice  */
     const uint64_t memType_ : 4;        /* device or host memory */

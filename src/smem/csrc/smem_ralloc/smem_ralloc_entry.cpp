@@ -912,15 +912,21 @@ Result SmemRallocEntry::Wait()
 Result SmemRallocEntry::RegisterMem(uint64_t addr, uint64_t size)
 {
     SM_ASSERT_RETURN(inited_, SM_NOT_INITIALIZED);
+    /* the unified register path: a pure NVMe pool resolves to zero-copy pre-registration
+     * inside hybm_register_local_memory (transport MR + sentinel slice), a hybrid pool
+     * gets the nvme MR as an add-on of its normal host path -- no ralloc-side branching */
+    constexpr uint32_t nvmeBits = HYBM_DOP_TYPE_NVME_TCP | HYBM_DOP_TYPE_NVME_RDMA;
+    const bool nvmePool = (coreOptions_.bmDataOpType & nvmeBits) != 0;
     /* endpoint classification: NPU HBM keeps regAddress == addr (identity SGE), while
-     * host-DRAM goes through HalHostRegister and carries a distinct iova in regAddress --
+     * host-DRAM goes through HalHostRegister and carries a distinct iova in regAddress--
      * the kernel user-MR table (v2) translates both, so host-DRAM is accepted too, but
-     * it must be 4K aligned (page granularity of the iova mapping). */
+     * it must be 4K aligned (page granularity of the iova mapping). The NVMe zero-copy
+     * MR has no iova constraint (2MB inner window shrinks inwards), skip the check. */
     uint64_t hbmStart = 0;
     uint64_t hbmEnd = 0;
     const bool hbmKnown = (hybm_get_hbm_address_range(&hbmStart, &hbmEnd) == 0);
     const bool isHbm = hbmKnown && addr >= hbmStart && addr < hbmEnd;
-    if (!isHbm) {
+    if (!isHbm && !nvmePool) {
         constexpr uint64_t dramAlign = 4096;
         if (addr % dramAlign != 0 || size % dramAlign != 0) {
             SM_LOG_ERROR("RegisterMem reject_unaligned_dram: addr=0x" << std::hex << addr << std::dec
@@ -985,6 +991,8 @@ Result SmemRallocEntry::UnRegisterMem(uint64_t addr)
         return SM_OK;
     }
     auto sz = iter->second.first;
+    /* unified free: a zero-copy sentinel slice is routed to the transport MR release
+     * inside FreeLocalMemory, classic slices go through their segment as before */
     auto ret = hybm_free_local_memory(entity_, iter->second.second, 1, 0);
     if (ret != 0) {
         SM_LOG_ERROR("UnRegisterMem free_fail: addr=0x" << std::hex << addr << std::dec

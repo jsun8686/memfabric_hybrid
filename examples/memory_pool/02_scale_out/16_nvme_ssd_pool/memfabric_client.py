@@ -191,6 +191,9 @@ def main():
                         help="pin the client to NUMA node N (aligns thread + staging + poll with "
                              "the data NIC's socket; this cluster's data NICs sit on node 6), "
                              "default off (scheduler picks randomly)")
+    parser.add_argument("--no-zc", action="store_true",
+                        help="skip pool.register zero-copy pre-registration "
+                             "(staging baseline for A/B comparison)")
     parser.add_argument("--world", type=int, default=DEFAULT_WORLD,
                         help=f"declared world capacity (default {DEFAULT_WORLD})")
     parser.add_argument("--rpc-port-base", type=int, default=RPC_PORT_BASE,
@@ -292,7 +295,20 @@ def main():
             f"RMW merge mismatch: got={window[:64].hex()} want={want.hex()}"
         _log("[client] sub-sector RMW OK (10B magic @+100 merged, neighbours preserved)")
 
-        # ---- 4) bandwidth matrix (write and read, plain unified API) ----
+        # ---- 4) zero-copy pre-registration (B3, host buffers only) ----
+        # pool.register pins the 2MB-aligned inner window of each buffer with
+        # spdk_mem_register -> later copies DMA the user buffer directly, the
+        # staging memcpy disappears. Falls back to staging automatically when
+        # unsupported; --no-zc keeps the staging baseline for A/B comparison.
+        zc_mode = "off (--no-zc, staging baseline)" if args.no_zc else "on"
+        if not args.no_zc and not args.device:
+            for b in (w, r):
+                pool.register(b.addr, size)
+            _log(f"[client] zero-copy: w/r buffers registered ({zc_mode})")
+        else:
+            _log(f"[client] zero-copy: {zc_mode}")
+
+        # ---- 5) bandwidth matrix (write and read, plain unified API) ----
         mode = "device" if args.device else "host"
         _log(f"[client] bandwidth matrix ({'/'.join(str(s) for s in bw_sizes)} bytes, "
              f"local endpoint {mode}):")
@@ -314,6 +330,10 @@ def main():
             t_rd = time.perf_counter() - t0
             _log(f"    {s:>9}  {n * s / t_wr / GIB:10.2f}   {n * s / t_rd / GIB:9.2f}")
 
+        # release the registrations before the buffers close (DMA-safety contract)
+        if not args.no_zc and not args.device:
+            for b in (w, r):
+                pool.unregister(b.addr)
         pool.destroy()
         pool = None
         mf.get_and_clear_last_err_msg()

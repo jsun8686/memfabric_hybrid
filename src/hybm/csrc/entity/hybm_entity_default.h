@@ -134,6 +134,13 @@ private:
     uint32_t extraCtxSize_{0}; /* last extra-context size, to re-publish device meta after QP setup */
     std::mutex importMutex_;
     transport::TransManagerPtr transportManager_;
+    /* zero-copy registration ledger: sentinel slice index -> (user addr, size). Pure
+     * NVMe pools have no segment to pin a slice on, RegisterLocalMemory hands out a
+     * packed sentinel id (MemSlice::MakeZcSentinelId) and records it here so
+     * FreeLocalMemory can route the unregister to the transport MR domain */
+    std::mutex zcRegsMutex_;
+    uint32_t zcRegsNextIndex_{0};
+    std::map<uint32_t, std::pair<uint64_t, uint64_t>> zcRegs_;
     std::unordered_map<uint32_t, EntityExportInfo> importedRanks_;
     std::unordered_map<uint32_t, std::set<transport::TransportMemoryKey>> importedMemories_;
     HybmEntityTagInfoPtr tagManager_;

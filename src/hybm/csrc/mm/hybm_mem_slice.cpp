@@ -51,5 +51,35 @@ uint64_t MemSlice::GetIndexFrom(hybm_mem_slice_t slice) noexcept
     idUnion.address = slice;
     return idUnion.detail.index_;
 }
+
+/* sentinel magic deliberately outside the Func::MakeObjectMagic space of live slices:
+ * even on an index collision ValidateId() must reject the sentinel (different magic) */
+constexpr uint64_t ZC_SENTINEL_MAGIC = 0x5A2C7DULL;
+
+hybm_mem_slice_t MemSlice::MakeZcSentinelId(uint32_t index) noexcept
+{
+    SliceIdUnion idUnion{};
+    idUnion.detail.magic_ = ZC_SENTINEL_MAGIC & 0xFFFFFF;
+    idUnion.detail.index_ = index;
+    idUnion.detail.memType_ = HYBM_MEM_TYPE_NVME;
+    idUnion.detail.memPageTblType_ = 0;
+    idUnion.detail.reserved = 0;
+    return idUnion.address;
+}
+
+bool MemSlice::IsZcSentinelId(hybm_mem_slice_t slice) noexcept
+{
+    SliceIdUnion idUnion{};
+    idUnion.address = slice;
+    return idUnion.detail.magic_ == (ZC_SENTINEL_MAGIC & 0xFFFFFF) &&
+           idUnion.detail.memType_ == HYBM_MEM_TYPE_NVME;
+}
+
+uint32_t MemSlice::GetZcIndexFrom(hybm_mem_slice_t slice) noexcept
+{
+    SliceIdUnion idUnion{};
+    idUnion.address = slice;
+    return static_cast<uint32_t>(idUnion.detail.index_);
+}
 } // namespace mf
 } // namespace ock

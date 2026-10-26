@@ -19,12 +19,13 @@ include_directories(
         ${PROJECT_HYBM_SRC_BASE}/csrc/driver/version
         ${PROJECT_HYBM_SRC_BASE}/csrc/entity
         ${PROJECT_HYBM_SRC_BASE}/csrc/mm
-        ${PROJECT_HYBM_SRC_BASE}/csrc/transport
-        ${PROJECT_HYBM_SRC_BASE}/csrc/transport/compose
-        ${PROJECT_HYBM_SRC_BASE}/csrc/transport/device
-        ${PROJECT_HYBM_SRC_BASE}/csrc/transport/device/indirect
-        ${PROJECT_HYBM_SRC_BASE}/csrc/transport/host
-        ${PROJECT_HYBM_SRC_BASE}/csrc/transport/utils
+${PROJECT_HYBM_SRC_BASE}/csrc/transport
+${PROJECT_HYBM_SRC_BASE}/csrc/transport/compose
+${PROJECT_HYBM_SRC_BASE}/csrc/transport/device
+${PROJECT_HYBM_SRC_BASE}/csrc/transport/device/indirect
+${PROJECT_HYBM_SRC_BASE}/csrc/transport/host
+${PROJECT_HYBM_SRC_BASE}/csrc/transport/nvme
+${PROJECT_HYBM_SRC_BASE}/csrc/transport/utils
         ${PROJECT_HYBM_SRC_BASE}/csrc/ts_engine
         ${PROJECT_HYBM_SRC_BASE}/csrc/under_api
         ${PROJECT_UTIL_SRC_BASE}/ptracer/include

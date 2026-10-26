@@ -22,10 +22,22 @@
 #define protected public
 #include "dl_nvme_api.h"
 #include "hybm_data_op_nvme.h"
+#include "nvme_transport_manager.h"
+#include "hybm_mem_slice.h"
 #undef private
 #undef protected
 
 using namespace ock::mf;
+using NvmeTransportForTest = ock::mf::transport::NvmeTransportManager;
+
+/* MR-shaped helper: the unified register chain resolves to the transport MR domain */
+static Result ZcRegister(void *addr, uint64_t size)
+{
+    ock::mf::transport::TransportMemoryRegion mr{};
+    mr.addr = reinterpret_cast<uint64_t>(addr);
+    mr.size = size;
+    return NvmeTransportForTest::GetInstance()->RegisterMemoryRegion(mr);
+}
 
 namespace {
 static void *const FAKE_CTRLR = reinterpret_cast<void *>(0x1000);
@@ -45,6 +57,7 @@ public:
         uint64_t lba;
         uint32_t count;
         void *qpair = nullptr;
+        void *buf = nullptr; /* DMA buffer the command carried (staging or direct user) */
         std::vector<char> data;
     };
 
@@ -63,6 +76,8 @@ public:
         saved_.read = DlNvmeApi::gSpdkNvmeNsCmdRead;
         saved_.write = DlNvmeApi::gSpdkNvmeNsCmdWrite;
         saved_.process = DlNvmeApi::gSpdkNvmeQpairProcessCompletions;
+        saved_.memRegister = DlNvmeApi::gSpdkMemRegister;
+        saved_.memUnregister = DlNvmeApi::gSpdkMemUnregister;
         savedLoaded_ = DlNvmeApi::gLoaded;
         /* pretend the spdk libraries are already dlopen-ed: LoadLibrary turns into a
          * no-op and only the stubbed function pointers are exercised */
@@ -81,6 +96,10 @@ public:
         DlNvmeApi::gSpdkNvmeNsCmdRead = FakeRead;
         DlNvmeApi::gSpdkNvmeNsCmdWrite = FakeWrite;
         DlNvmeApi::gSpdkNvmeQpairProcessCompletions = FakeProcessCompletions;
+        /* B3 zero-copy: symbols are present by default; a test can null them out to
+         * emulate an spdk build without dynamic registration support */
+        DlNvmeApi::gSpdkMemRegister = FakeMemRegister;
+        DlNvmeApi::gSpdkMemUnregister = FakeMemUnregister;
         current_ = this;
     }
 
@@ -100,6 +119,8 @@ public:
         DlNvmeApi::gSpdkNvmeNsCmdRead = saved_.read;
         DlNvmeApi::gSpdkNvmeNsCmdWrite = saved_.write;
         DlNvmeApi::gSpdkNvmeQpairProcessCompletions = saved_.process;
+        DlNvmeApi::gSpdkMemRegister = saved_.memRegister;
+        DlNvmeApi::gSpdkMemUnregister = saved_.memUnregister;
         DlNvmeApi::gLoaded = savedLoaded_;
     }
 
@@ -133,6 +154,11 @@ public:
     uint32_t qpairSeq = 0;
     size_t peakPending = 0;   /* max simultaneously in-flight commands */
     size_t submitAttempts = 0;
+    /* zero-copy registration tracking (spdk_mem_register stub) */
+    bool memRegisterFail = false;
+    uint32_t memRegisterCalls = 0;
+    uint32_t memUnregisterCalls = 0;
+    std::vector<std::pair<uint64_t, uint64_t>> registeredRanges; /* aligned windows, in order */
     MfSpdkNvmeTransportId lastTrid{};
     size_t lastOptsSize = 0;
     uint32_t lastKeepAliveMs = 0xFFFFFFFF;
@@ -152,6 +178,8 @@ private:
         SpdkNvmeNsCmdReadFunc read;
         SpdkNvmeNsCmdWriteFunc write;
         SpdkNvmeQpairProcessCompletionsFunc process;
+        SpdkMemRegisterFunc memRegister;
+        SpdkMemUnregisterFunc memUnregister;
     };
 
     static int FakePostInit(bool legacyMem)
@@ -181,6 +209,25 @@ private:
     static void FakeDmaFree(void *buf)
     {
         free(buf);
+    }
+
+    static int FakeMemRegister(void *vaddr, size_t len)
+    {
+        auto &s = Instance();
+        s.memRegisterCalls += 1;
+        if (s.memRegisterFail) {
+            return -1;
+        }
+        s.registeredRanges.emplace_back(reinterpret_cast<uint64_t>(vaddr), static_cast<uint64_t>(len));
+        return 0;
+    }
+
+    static int FakeMemUnregister(void *vaddr, size_t len)
+    {
+        (void)vaddr;
+        (void)len;
+        Instance().memUnregisterCalls += 1;
+        return 0;
     }
 
     static void *FakeConnect(const MfSpdkNvmeTransportId *trid, const void *opts, size_t optsSize)
@@ -270,7 +317,7 @@ private:
                 (void)memset(static_cast<char *>(buf) + i * SECTOR, 0x5A, SECTOR);
             }
         }
-        s.cmds.push_back(Cmd{false, lba, lbaCount, qpair, {}});
+        s.cmds.push_back(Cmd{false, lba, lbaCount, qpair, buf, {}});
         s.pending_.emplace_back(cb, ctx);
         TrackPending();
         return 0;
@@ -285,7 +332,7 @@ private:
         if (ShouldFailSubmit()) {
             return -1;
         }
-        Cmd cmd{true, lba, lbaCount, qpair, {}};
+        Cmd cmd{true, lba, lbaCount, qpair, buf, {}};
         cmd.data.resize(static_cast<size_t>(lbaCount) * SECTOR);
         (void)memcpy(cmd.data.data(), buf, cmd.data.size());
         s.cmds.push_back(std::move(cmd));
@@ -347,6 +394,9 @@ class HybmDataOpNvmeTest : public testing::Test {
 protected:
     void SetUp() override
     {
+        /* the transport is a process-wide singleton: give every case a fresh instance
+         * (endpoints / MR table / staging pools start empty) */
+        NvmeTransportForTest::ResetInstanceForTest();
         HybmNvmeExtentRegistry::GetInstance().Clear();
         extent_ = TestExtent();
     }
@@ -355,6 +405,7 @@ protected:
     {
         HybmNvmeExtentRegistry::GetInstance().SetWarmupCallback(nullptr);
         HybmNvmeExtentRegistry::GetInstance().Clear();
+        NvmeTransportForTest::ResetInstanceForTest();
     }
 
     /* real-world order: Initialize() installs the warmup hook, THEN the extent import
@@ -369,8 +420,7 @@ protected:
 
 /**
  * RejectsBadInput_NoLoaderTouched
- *  - 非法方向 / 未知 gva / 空指针在触达 SPDK 加载器之前被拒绝。
- */
+ *  - 非法方向 / 未知 gva / 空指针在触达 SPDK 加载器之前被拒绝�? */
 TEST_F(HybmDataOpNvmeTest, RejectsBadInput_NoLoaderTouched)
 {
     NvmeApiStub stub; /* spdk "loaded": Initialize preloads (A8a) before any IO */
@@ -395,9 +445,8 @@ TEST_F(HybmDataOpNvmeTest, RejectsBadInput_NoLoaderTouched)
 
 /**
  * AlignedWrite_IssuesSingleLbaCommand
- *  - 对齐写：一条 write 命令，LBA = extent.lbaBase + 偏移扇区数，数据逐字节一致，
- *    trid 按 rdma/nqn/traddr/trsvcid 填充；connect 发生在 extent 注册（warmup）时。
- */
+ *  - 对齐写：一�?write 命令，LBA = extent.lbaBase + 偏移扇区数，数据逐字节一致，
+ *    trid �?rdma/nqn/traddr/trsvcid 填充；connect 发生�?extent 注册（warmup）时�? */
 TEST_F(HybmDataOpNvmeTest, AlignedWrite_IssuesSingleLbaCommand)
 {
     NvmeApiStub stub;
@@ -436,8 +485,7 @@ TEST_F(HybmDataOpNvmeTest, AlignedWrite_IssuesSingleLbaCommand)
 
 /**
  * LargeAlignedWrite_SplitsByMaxXfer
- *  - 超过 MDTS(128K) 的对齐写被拆成多条 <=maxXfer 的整扇区命令，LBA 连续、数据无缝拼接。
- */
+ *  - 超过 MDTS(128K) 的对齐写被拆成多�?<=maxXfer 的整扇区命令，LBA 连续、数据无缝拼接�? */
 TEST_F(HybmDataOpNvmeTest, LargeAlignedWrite_SplitsByMaxXfer)
 {
     NvmeApiStub stub;
@@ -470,8 +518,7 @@ TEST_F(HybmDataOpNvmeTest, LargeAlignedWrite_SplitsByMaxXfer)
 
 /**
  * TcpTransport_BuildsTcpTrid
- *  - 池 op 位声明的协议经构造参数生效：trid.trstring == "tcp"。
- */
+ *  - �?op 位声明的协议经构造参数生效：trid.trstring == "tcp"�? */
 TEST_F(HybmDataOpNvmeTest, TcpTransport_BuildsTcpTrid)
 {
     NvmeApiStub stub;
@@ -496,12 +543,11 @@ TEST_F(HybmDataOpNvmeTest, TcpTransport_BuildsTcpTrid)
 
 /**
  * AlignedRead_PollsCompletionsAndReturnsDiskBytes
- *  - 对齐读：数据仅在 ProcessCompletions 触发回调后对调用方可见，读回内容与盘一致。
- */
+ *  - 对齐读：数据仅在 ProcessCompletions 触发回调后对调用方可见，读回内容与盘一致�? */
 TEST_F(HybmDataOpNvmeTest, AlignedRead_PollsCompletionsAndReturnsDiskBytes)
 {
     NvmeApiStub stub;
-    /* extent 内偏移 524288B -> LBA 2048 起 8 个扇区 */
+    /* extent 内偏�?524288B -> LBA 2048 �?8 个扇�?*/
     for (uint64_t lba = 2048; lba < 2048 + 8; ++lba) {
         stub.FillSector(lba, static_cast<char>('a' + lba % 26));
     }
@@ -527,12 +573,11 @@ TEST_F(HybmDataOpNvmeTest, AlignedRead_PollsCompletionsAndReturnsDiskBytes)
 
 /**
  * SubSectorWrite_DoesReadModifyWrite
- *  - 扇区内写：round1 读整扇区 -> merge -> round2 写回，盘上其余字节保持原样。
- */
+ *  - 扇区内写：round1 读整扇区 -> merge -> round2 写回，盘上其余字节保持原样�? */
 TEST_F(HybmDataOpNvmeTest, SubSectorWrite_DoesReadModifyWrite)
 {
     NvmeApiStub stub;
-    stub.FillSector(1024, 'X'); /* extent 第 0 扇区 */
+    stub.FillSector(1024, 'X'); /* extent �?0 扇区 */
     HostDataOpNvme op(0, "rdma");
     ASSERT_EQ(op.Initialize(), BM_OK);
     RegisterExtent();
@@ -560,9 +605,8 @@ TEST_F(HybmDataOpNvmeTest, SubSectorWrite_DoesReadModifyWrite)
 
 /**
  * SpanningWrite_SplitsHeadMidTail
- *  - 跨扇区非对齐区间（窗口引擎时序）：round1 = head 读 + mid 写 + tail 读 共享同一窗口
- *    并发提交；round2 = head 写 + tail 写。盘上合并结果正确。
- */
+ *  - 跨扇区非对齐区间（窗口引擎时序）：round1 = head �?+ mid �?+ tail �?共享同一窗口
+ *    并发提交；round2 = head �?+ tail 写。盘上合并结果正确�? */
 TEST_F(HybmDataOpNvmeTest, SpanningWrite_SplitsHeadMidTail)
 {
     NvmeApiStub stub;
@@ -608,8 +652,7 @@ TEST_F(HybmDataOpNvmeTest, SpanningWrite_SplitsHeadMidTail)
 /**
  * AsyncBatchAndWait_CompleteAndDetach
  *  - DataCopyAsync 语义等同同步；BatchDataCopy 逐项落到盘；Wait 无害；UnInitialize
- *    释放 qpair 并 detach 控制器。
- */
+ *    释放 qpair �?detach 控制器�? */
 TEST_F(HybmDataOpNvmeTest, AsyncBatchAndWait_CompleteAndDetach)
 {
     NvmeApiStub stub;
@@ -657,9 +700,8 @@ TEST_F(HybmDataOpNvmeTest, AsyncBatchAndWait_CompleteAndDetach)
 
 /**
  * WarmupFailure_FailsImport
- *  - 连接失败时 Register 硬失败并自包含回滚（条目撤销、extent 完全不可见），后续 IO
- *    在 gva 查表处即被拒绝 —— 部署错误在 import/JOIN 时暴露，而不是首 IO。
- *    （NOT_CONNECTED 路径由 GetEndpointMissing_Errors 单独覆盖。）
+ *  - 连接失败�?Register 硬失败并自包含回滚（条目撤销、extent 完全不可见），后�?IO
+ *    �?gva 查表处即被拒�?—�?部署错误�?import/JOIN 时暴露，而不是首 IO�? *    （NOT_CONNECTED 路径�?GetEndpointMissing_Errors 单独覆盖。）
  */
 TEST_F(HybmDataOpNvmeTest, WarmupFailure_FailsImport)
 {
@@ -685,8 +727,7 @@ TEST_F(HybmDataOpNvmeTest, WarmupFailure_FailsImport)
 /**
  * GetEndpointMissing_Errors
  *  - extent 注册早于 op Initialize（warmup 钩子缺席）时：IO 不做惰性连接兜底，
- *    直接 BM_NOT_CONNECTED —— 破损的装配应当显式暴露。
- */
+ *    直接 BM_NOT_CONNECTED —�?破损的装配应当显式暴露�? */
 TEST_F(HybmDataOpNvmeTest, GetEndpointMissing_Errors)
 {
     NvmeApiStub stub;
@@ -705,8 +746,7 @@ TEST_F(HybmDataOpNvmeTest, GetEndpointMissing_Errors)
 
 /**
  * WarmupIdempotent_SecondRegisterNoReconnect
- *  - Warmup 幂等：重复 Register（例如重试的 import）不再连接。
- */
+ *  - Warmup 幂等：重�?Register（例如重试的 import）不再连接�? */
 TEST_F(HybmDataOpNvmeTest, WarmupIdempotent_SecondRegisterNoReconnect)
 {
     NvmeApiStub stub;
@@ -721,17 +761,17 @@ TEST_F(HybmDataOpNvmeTest, WarmupIdempotent_SecondRegisterNoReconnect)
 
 /**
  * BatchWindow_FillsDepthAndReaps
- *  - 窗口按 qdepth 填充：16 条命令在 qdepth=4 时峰值在飞恰为 4；全部数据落盘正确。
- */
+ *  - 窗口�?qdepth 填充�?6 条命令在 qdepth=4 时峰值在飞恰�?4；全部数据落盘正确�? */
 TEST_F(HybmDataOpNvmeTest, BatchWindow_FillsDepthAndReaps)
 {
     NvmeApiStub stub;
     stub.maxXfer = 512U; /* one sector per command -> 16 commands */
     (void)setenv("MF_NVME_QDEPTH", "4", 1);
+    NvmeTransportForTest::ResetInstanceForTest(); /* env is parsed at singleton creation */
     HostDataOpNvme op(0, "rdma");
     (void)unsetenv("MF_NVME_QDEPTH");
     ASSERT_EQ(op.Initialize(), BM_OK);
-    ASSERT_EQ(op.qdepth_, 4U);
+    ASSERT_EQ(NvmeTransportForTest::GetInstance()->qdepth_, 4U);
     RegisterExtent();
 
     const uint64_t len = 16U * 512U;
@@ -755,8 +795,7 @@ TEST_F(HybmDataOpNvmeTest, BatchWindow_FillsDepthAndReaps)
 
 /**
  * BatchWindow_SubmitErrorDrainsInflight
- *  - 第 6 次提交失败：报错返回，但停止补发前已在飞的命令被收割完成（数据在盘）。
- */
+ *  - �?6 次提交失败：报错返回，但停止补发前已在飞的命令被收割完成（数据在盘）�? */
 TEST_F(HybmDataOpNvmeTest, BatchWindow_SubmitErrorDrainsInflight)
 {
     NvmeApiStub stub;
@@ -785,8 +824,7 @@ TEST_F(HybmDataOpNvmeTest, BatchWindow_SubmitErrorDrainsInflight)
 
 /**
  * BatchWindow_PollErrorReturns
- *  - qpair 轮询失败（链路死亡）：窗口立即报错返回，不悬挂等待永不到来的完成。
- */
+ *  - qpair 轮询失败（链路死亡）：窗口立即报错返回，不悬挂等待永不到来的完成�? */
 TEST_F(HybmDataOpNvmeTest, BatchWindow_PollErrorReturns)
 {
     NvmeApiStub stub;
@@ -806,9 +844,7 @@ TEST_F(HybmDataOpNvmeTest, BatchWindow_PollErrorReturns)
 
 /**
  * BatchScatter_TwoItemsAggregatedInOneWindow
- *  - 批量小 IO 聚合：两个扇区内写的 round1 两条读并发同窗、round2 两条写并发同窗
- *    （串行实现会是 R,W,R,W 交错）。
- */
+ *  - 批量�?IO 聚合：两个扇区内写的 round1 两条读并发同窗、round2 两条写并发同�? *    （串行实现会�?R,W,R,W 交错）�? */
 TEST_F(HybmDataOpNvmeTest, BatchScatter_TwoItemsAggregatedInOneWindow)
 {
     NvmeApiStub stub;
@@ -851,8 +887,7 @@ TEST_F(HybmDataOpNvmeTest, BatchScatter_TwoItemsAggregatedInOneWindow)
 
 /**
  * BatchRead_ScattersBackPerItem
- *  - 批量读：三项各一扇区，全部并发读回且各自数据正确。
- */
+ *  - 批量读：三项各一扇区，全部并发读回且各自数据正确�? */
 TEST_F(HybmDataOpNvmeTest, BatchRead_ScattersBackPerItem)
 {
     NvmeApiStub stub;
@@ -890,8 +925,7 @@ TEST_F(HybmDataOpNvmeTest, BatchRead_ScattersBackPerItem)
 
 /**
  * ConcurrentCopies_UseDistinctQpairs
- *  - qpair 租赁：连续 AcquireSlot 拿到不同 slot（每窗独占一个 qpair，无全局 IO 锁）。
- */
+ *  - qpair 租赁：连�?AcquireSlot 拿到不同 slot（每窗独占一�?qpair，无全局 IO 锁）�? */
 TEST_F(HybmDataOpNvmeTest, ConcurrentCopies_UseDistinctQpairs)
 {
     NvmeApiStub stub;
@@ -899,34 +933,326 @@ TEST_F(HybmDataOpNvmeTest, ConcurrentCopies_UseDistinctQpairs)
     ASSERT_EQ(op.Initialize(), BM_OK);
     RegisterExtent();
 
-    HostDataOpNvme::NvmeEndpointPtr endpoint;
-    ASSERT_EQ(op.GetEndpoint(extent_, endpoint), BM_OK);
+    auto *tm = NvmeTransportForTest::GetInstance().get();
+    NvmeTransportForTest::NvmeEndpointPtr endpoint;
+    ASSERT_EQ(tm->GetEndpoint(extent_, endpoint), BM_OK);
     ASSERT_EQ(endpoint->slots.size(), 4U); /* MF_NVME_QPAIRS default */
 
-    auto leaseA = op.AcquireSlot(endpoint);
-    auto leaseB = op.AcquireSlot(endpoint);
+    auto leaseA = tm->AcquireSlot(endpoint);
+    auto leaseB = tm->AcquireSlot(endpoint);
     EXPECT_NE(leaseA.slot, leaseB.slot); /* distinct qpairs while both windows run */
     EXPECT_NE(leaseA.slot->qpair, leaseB.slot->qpair);
 
     leaseB.guard.unlock(); /* released: the next taker rotates to it (or another free one) */
-    auto leaseC = op.AcquireSlot(endpoint);
+    auto leaseC = tm->AcquireSlot(endpoint);
     EXPECT_NE(leaseC.slot, leaseA.slot);
 }
 
 /**
  * QDepthEnv_Clamp
- *  - MF_NVME_QDEPTH 越界钳位到 [1, 128]；MF_NVME_BUF_SLOTS 未设时默认等于 QDEPTH。
- */
+ *  - MF_NVME_QDEPTH 越界钳位�?[1, 128]；MF_NVME_BUF_SLOTS 未设时默认等�?QDEPTH�? */
 TEST_F(HybmDataOpNvmeTest, QDepthEnv_Clamp)
 {
+    /* env is parsed at singleton construction (transport owns the tuning knobs now) */
     (void)setenv("MF_NVME_QDEPTH", "999", 1);
-    HostDataOpNvme opHi(0, "rdma"); /* env is read at construction, no spdk needed */
+    NvmeTransportForTest::ResetInstanceForTest();
+    auto hi = NvmeTransportForTest::GetInstance();
     (void)unsetenv("MF_NVME_QDEPTH");
-    EXPECT_EQ(opHi.qdepth_, 128U);
-    EXPECT_EQ(opHi.bufSlots_, 128U); /* default follows qdepth */
+    EXPECT_EQ(hi->qdepth_, 128U);
+    EXPECT_EQ(hi->bufSlots_, 128U); /* default follows qdepth */
 
     (void)setenv("MF_NVME_QDEPTH", "0", 1);
-    HostDataOpNvme opLo(0, "rdma");
+    NvmeTransportForTest::ResetInstanceForTest();
+    auto lo = NvmeTransportForTest::GetInstance();
     (void)unsetenv("MF_NVME_QDEPTH");
-    EXPECT_EQ(opLo.qdepth_, 1U);
+    EXPECT_EQ(lo->qdepth_, 1U);
+}
+
+/* ==================== B3 zero-copy (pre-registered user buffers) ==================== */
+
+/* aligned scratch buffer helper: 2MB-aligned so the inner window == the whole buffer */
+struct AlignedBuf {
+    char *ptr = nullptr;
+    size_t size = 0;
+    explicit AlignedBuf(size_t sz) : size(sz)
+    {
+        constexpr size_t ALIGN = 2ULL * 1024 * 1024;
+        if (posix_memalign(reinterpret_cast<void **>(&ptr), ALIGN, sz) != 0) {
+            ptr = nullptr;
+        }
+    }
+    ~AlignedBuf()
+    {
+        free(ptr);
+    }
+};
+
+/**
+ * ZeroCopyWrite_MidCommandsDmaUserBuffer
+ *  - 预注册的对齐写：mid 命令直接携带用户地址（buf 落在用户区间内），staging 池零取用�? *    注册时只注册 2MB 对齐内窗（对�?buffer 即全窗）�? */
+TEST_F(HybmDataOpNvmeTest, ZeroCopyWrite_MidCommandsDmaUserBuffer)
+{
+    NvmeApiStub stub;
+    HostDataOpNvme op(0, "rdma");
+    ASSERT_EQ(op.Initialize(), BM_OK);
+    RegisterExtent();
+
+    AlignedBuf buf(4ULL * 1024 * 1024);
+    ASSERT_NE(buf.ptr, nullptr);
+    memset(buf.ptr, 0x33, buf.size);
+    ASSERT_EQ(ZcRegister(buf.ptr, buf.size), BM_OK);
+    EXPECT_EQ(stub.memRegisterCalls, 1U);
+    ASSERT_EQ(stub.registeredRanges.size(), 1U);
+    EXPECT_EQ(stub.registeredRanges[0].first, reinterpret_cast<uint64_t>(buf.ptr)); /* fully aligned */
+    EXPECT_EQ(stub.registeredRanges[0].second, buf.size);
+
+    const uint64_t len = 1024 * 1024; /* fully inside, sector aligned */
+    hybm_copy_params params{};
+    params.src = buf.ptr;
+    params.dest = reinterpret_cast<void *>(EXTENT_GVA + 8192);
+    params.dataSize = len;
+    ASSERT_EQ(op.DataCopy(params, HYBM_LOCAL_HOST_TO_GLOBAL_NVME, ExtOptions{}), BM_OK);
+
+    ASSERT_EQ(stub.cmds.size(), 8U); /* 1MB / 128K MDTS */
+    const uint64_t userStart = reinterpret_cast<uint64_t>(buf.ptr);
+    const uint64_t userEnd = userStart + len;
+    for (const auto &c : stub.cmds) {
+        const uint64_t b = reinterpret_cast<uint64_t>(c.buf);
+        EXPECT_GE(b, userStart);
+        EXPECT_LT(b, userEnd);
+        EXPECT_TRUE(c.write);
+    }
+    /* write data arrived straight from user memory */
+    EXPECT_EQ(stub.cmds[0].data.size(), stub.maxXfer);
+    EXPECT_EQ(0, memcmp(stub.cmds[0].data.data(), buf.ptr, stub.maxXfer));
+    /* staging pools never handed out a block (lazy pools stay empty) */
+    EXPECT_TRUE(NvmeTransportForTest::GetInstance()->freeSegBufs_.empty());
+    EXPECT_TRUE(NvmeTransportForTest::GetInstance()->freeSectorBufs_.empty());
+
+    ASSERT_EQ(NvmeTransportForTest::GetInstance()->UnregisterMemoryRegion(reinterpret_cast<uint64_t>(buf.ptr)), BM_OK);
+    EXPECT_EQ(stub.memUnregisterCalls, 1U);
+}
+
+/**
+ * ZeroCopyRead_LandsDirectlyInUserBuffer
+ *  - 预注册读：设备字节由桩直接写进用�?buffer（DMA 语义），返回后用户区间可见，
+ *    没有 stage-out 拷贝参与�? */
+TEST_F(HybmDataOpNvmeTest, ZeroCopyRead_LandsDirectlyInUserBuffer)
+{
+    NvmeApiStub stub;
+    HostDataOpNvme op(0, "rdma");
+    ASSERT_EQ(op.Initialize(), BM_OK);
+    RegisterExtent();
+
+    AlignedBuf buf(4ULL * 1024 * 1024);
+    ASSERT_NE(buf.ptr, nullptr);
+    stub.FillSector(1024U + 16U, 'Z'); /* the first sector the read hits */
+    ASSERT_EQ(ZcRegister(buf.ptr, buf.size), BM_OK);
+
+    const uint64_t len = 4096; /* aligned, single command */
+    hybm_copy_params params{};
+    params.src = reinterpret_cast<void *>(EXTENT_GVA + 8192);
+    params.dest = buf.ptr;
+    params.dataSize = len;
+    ASSERT_EQ(op.DataCopy(params, HYBM_GLOBAL_NVME_TO_LOCAL_HOST, ExtOptions{}), BM_OK);
+
+    ASSERT_EQ(stub.cmds.size(), 1U);
+    EXPECT_FALSE(stub.cmds[0].write);
+    EXPECT_EQ(stub.cmds[0].buf, buf.ptr); /* DMA target is the user buffer itself */
+    for (size_t i = 0; i < len; ++i) {
+        ASSERT_EQ(buf.ptr[i], 'Z') << "user buffer must carry the device bytes at " << i;
+    }
+    EXPECT_TRUE(NvmeTransportForTest::GetInstance()->freeSegBufs_.empty());
+    EXPECT_TRUE(NvmeTransportForTest::GetInstance()->freeSectorBufs_.empty());
+}
+
+/**
+ * UnregisteredCopy_KeepsStagingPath
+ *  - 未注册（或注销后）�?copy 全量�?staging：所有命�?buf 落在 staging 池，
+ *    数据语义不变（A/B 回退正确性）�? */
+TEST_F(HybmDataOpNvmeTest, UnregisteredCopy_KeepsStagingPath)
+{
+    NvmeApiStub stub;
+    HostDataOpNvme op(0, "rdma");
+    ASSERT_EQ(op.Initialize(), BM_OK);
+    RegisterExtent();
+
+    AlignedBuf buf(4ULL * 1024 * 1024);
+    ASSERT_NE(buf.ptr, nullptr);
+    memset(buf.ptr, 0x55, 4096);
+
+    hybm_copy_params params{};
+    params.src = buf.ptr;
+    params.dest = reinterpret_cast<void *>(EXTENT_GVA + 8192);
+    params.dataSize = 4096;
+    ASSERT_EQ(op.DataCopy(params, HYBM_LOCAL_HOST_TO_GLOBAL_NVME, ExtOptions{}), BM_OK);
+
+    ASSERT_EQ(stub.cmds.size(), 1U);
+    const uint64_t b = reinterpret_cast<uint64_t>(stub.cmds[0].buf);
+    EXPECT_NE(b, reinterpret_cast<uint64_t>(buf.ptr)); /* staging, not user memory */
+    EXPECT_FALSE(NvmeTransportForTest::GetInstance()->freeSegBufs_.empty()); /* the chunk pool was actually used */
+
+    /* register, then unregister: subsequent copies fall back again */
+    ASSERT_EQ(ZcRegister(buf.ptr, buf.size), BM_OK);
+    ASSERT_EQ(NvmeTransportForTest::GetInstance()->UnregisterMemoryRegion(reinterpret_cast<uint64_t>(buf.ptr)), BM_OK);
+    ASSERT_EQ(op.DataCopy(params, HYBM_LOCAL_HOST_TO_GLOBAL_NVME, ExtOptions{}), BM_OK);
+    EXPECT_NE(stub.cmds.back().buf, buf.ptr);
+    /* double unregister is rejected */
+    EXPECT_EQ(NvmeTransportForTest::GetInstance()->UnregisterMemoryRegion(reinterpret_cast<uint64_t>(buf.ptr)), BM_INVALID_PARAM);
+}
+
+/**
+ * ZeroCopySubSectorRmw_HeadTailStayStaging
+ *  - 预注册不影响 RMW：亚扇区写的 read-half �?round-2 write 全部�?staging�? *    合并语义保持（用�?magic 落盘、邻域字节保全）�? */
+TEST_F(HybmDataOpNvmeTest, ZeroCopySubSectorRmw_HeadTailStayStaging)
+{
+    NvmeApiStub stub;
+    HostDataOpNvme op(0, "rdma");
+    ASSERT_EQ(op.Initialize(), BM_OK);
+    RegisterExtent();
+
+    AlignedBuf buf(4ULL * 1024 * 1024);
+    ASSERT_NE(buf.ptr, nullptr);
+    stub.FillSector(1024U + 100U / 512U, 'Q'); /* neighbour context of the RMW sector */
+    ASSERT_EQ(ZcRegister(buf.ptr, buf.size), BM_OK);
+
+    memset(buf.ptr, 'M', 10); /* the 10 magic bytes at offset 100 */
+    hybm_copy_params params{};
+    params.src = buf.ptr;
+    params.dest = reinterpret_cast<void *>(EXTENT_GVA + 100);
+    params.dataSize = 10;
+    ASSERT_EQ(op.DataCopy(params, HYBM_LOCAL_HOST_TO_GLOBAL_NVME, ExtOptions{}), BM_OK);
+
+    /* RMW: one staging read (round 1) + one staging write (round 2) */
+    ASSERT_EQ(stub.cmds.size(), 2U);
+    EXPECT_FALSE(stub.cmds[0].write);
+    EXPECT_TRUE(stub.cmds[1].write);
+    for (const auto &c : stub.cmds) {
+        EXPECT_NE(c.buf, buf.ptr) << "RMW must keep the staging path";
+    }
+    EXPECT_EQ(0, memcmp(stub.cmds[1].data.data() + 100, buf.ptr, 10));
+    EXPECT_EQ(stub.cmds[1].data[99], 'Q'); /* neighbour preserved through the merge */
+}
+
+/**
+ * ZeroCopyUnalignedBuffer_InnerWindowOnly
+ *  - 非对齐注册：2MB 内窗向内收缩（注册区�?!= 用户区间），窗内命中零拷贝�? *    窗外（头/尾碎片）命令保持 staging——混合执行�? */
+TEST_F(HybmDataOpNvmeTest, ZeroCopyUnalignedBuffer_InnerWindowOnly)
+{
+    NvmeApiStub stub;
+    HostDataOpNvme op(0, "rdma");
+    ASSERT_EQ(op.Initialize(), BM_OK);
+    RegisterExtent();
+
+    /* deliberately misaligned: 4MB + 1 page at a page-aligned (not 2MB) address */
+    constexpr size_t ALIGN = 2ULL * 1024 * 1024;
+    char *raw = static_cast<char *>(malloc(8ULL * 1024 * 1024 + 4096));
+    ASSERT_NE(raw, nullptr);
+    char *misaligned = reinterpret_cast<char *>((reinterpret_cast<uint64_t>(raw) + ALIGN - 1) & ~(ALIGN - 1));
+    misaligned += 4096; /* 2MB-aligned + 4K: inner window shrinks by head 4K and tail 4K */
+    const size_t size = 4ULL * 1024 * 1024;
+    memset(misaligned, 0x66, size);
+
+    ASSERT_EQ(ZcRegister(misaligned, size), BM_OK);
+    ASSERT_EQ(stub.registeredRanges.size(), 1U);
+    EXPECT_EQ(stub.registeredRanges[0].first % ALIGN, 0U); /* aligned start > user addr */
+    EXPECT_GT(stub.registeredRanges[0].first, reinterpret_cast<uint64_t>(misaligned));
+    /* window = [align_up(A+4K), align_down(A+4K+4MB)) = [A+2MB, A+4MB): exactly 2MB */
+    EXPECT_EQ(stub.registeredRanges[0].second, 2ULL * 1024 * 1024);
+
+    /* copy of the FULL misaligned range: head 4K + tail 4K cannot ride the window */
+    hybm_copy_params params{};
+    params.src = misaligned;
+    params.dest = reinterpret_cast<void *>(EXTENT_GVA); /* offset 0: 4K head + aligned middle */
+    params.dataSize = size;
+    ASSERT_EQ(op.DataCopy(params, HYBM_LOCAL_HOST_TO_GLOBAL_NVME, ExtOptions{}), BM_OK);
+
+    /* commands strictly inside the aligned window carry user addresses */
+    const uint64_t winStart = stub.registeredRanges[0].first;
+    const uint64_t winEnd = winStart + stub.registeredRanges[0].second;
+    bool sawStaging = false;
+    bool sawZeroCopy = false;
+    for (const auto &c : stub.cmds) {
+        const uint64_t b = reinterpret_cast<uint64_t>(c.buf);
+        if (b >= winStart && b < winEnd) {
+            sawZeroCopy = true;
+        } else {
+            sawStaging = true;
+        }
+    }
+    EXPECT_TRUE(sawZeroCopy);
+    EXPECT_TRUE(sawStaging);
+
+    ASSERT_EQ(NvmeTransportForTest::GetInstance()->UnregisterMemoryRegion(reinterpret_cast<uint64_t>(misaligned)), BM_OK);
+    free(raw);
+}
+
+/**
+ * ZeroCopyDisabledByEnvOrSymbols_FallsBackSilently
+ *  - 符号缺失�?MF_NVME_ZEROCOPY=0：注册返�?NOT_SUPPORTED，copy �?staging 照常成功�? *    小于 2MB 内窗的注册同样拒绝（staging only）�? */
+TEST_F(HybmDataOpNvmeTest, ZeroCopyDisabledByEnvOrSymbols_FallsBackSilently)
+{
+    NvmeApiStub stub;
+    HostDataOpNvme op(0, "rdma");
+    ASSERT_EQ(op.Initialize(), BM_OK);
+    RegisterExtent();
+
+    AlignedBuf tiny(2ULL * 1024 * 1024); /* exactly 2MB: aligned window == whole buffer */
+    ASSERT_NE(tiny.ptr, nullptr);
+
+    /* symbols absent -> registration refused, copy still correct */
+    auto *savedRegister = DlNvmeApi::gSpdkMemRegister;
+    DlNvmeApi::gSpdkMemRegister = nullptr;
+    EXPECT_FALSE(DlNvmeApi::ZeroCopyEnabled());
+    EXPECT_EQ(ZcRegister(tiny.ptr, tiny.size), BM_NOT_SUPPORTED);
+    DlNvmeApi::gSpdkMemRegister = savedRegister;
+
+    /* no 2MB inner window (range smaller than alignment) */
+    char small[64] = {0};
+    EXPECT_EQ(ZcRegister(small, sizeof(small)), BM_NOT_SUPPORTED);
+
+    /* env kill-switch */
+    (void)setenv("MF_NVME_ZEROCOPY", "0", 1);
+    EXPECT_FALSE(DlNvmeApi::ZeroCopyEnabled());
+    EXPECT_EQ(ZcRegister(tiny.ptr, tiny.size), BM_NOT_SUPPORTED);
+    (void)unsetenv("MF_NVME_ZEROCOPY");
+    EXPECT_TRUE(DlNvmeApi::ZeroCopyEnabled());
+
+    /* failure of the underlying registration propagates as an error */
+    stub.memRegisterFail = true;
+    EXPECT_NE(ZcRegister(tiny.ptr, tiny.size), BM_OK);
+
+    /* and in every one of those states a plain copy succeeds via staging */
+    memset(tiny.ptr, 0x77, 4096);
+    hybm_copy_params params{};
+    params.src = tiny.ptr;
+    params.dest = reinterpret_cast<void *>(EXTENT_GVA + 8192);
+    params.dataSize = 4096;
+    ASSERT_EQ(op.DataCopy(params, HYBM_LOCAL_HOST_TO_GLOBAL_NVME, ExtOptions{}), BM_OK);
+    EXPECT_EQ(stub.cmds.back().data.size(), 4096U);
+    EXPECT_EQ(0, memcmp(stub.cmds.back().data.data(), tiny.ptr, 4096));
+}
+
+/**
+ * ZcSentinelId_EncodingAndRejection
+ *  - 哨兵 slice 编码：往返（index 恢复）、memType=NVME 标记、与真对象 slice 的区分
+ *    （GetIndexFrom 共享位布局但 ValidateId 必拒——哨兵 magic 在对象 magic 空间外）。
+ */
+TEST_F(HybmDataOpNvmeTest, ZcSentinelId_EncodingAndRejection)
+{
+    for (uint32_t index : {0U, 1U, 42U, 0xFFFFFFFFU}) {
+        auto id = MemSlice::MakeZcSentinelId(index);
+        EXPECT_TRUE(MemSlice::IsZcSentinelId(id));
+        EXPECT_EQ(MemSlice::GetZcIndexFrom(id), index);
+        /* same packed layout as live slices: the index is extractable by the classic
+         * decoder too, which is exactly why the sentinel magic must never collide with
+         * an object magic (ValidateId compares ALL fields, magic included) */
+        EXPECT_EQ(MemSlice::GetIndexFrom(id), static_cast<uint64_t>(index));
+    }
+    /* a live slice (memType HOST/DEVICE, object magic) is never mistaken for a sentinel */
+    MemSlice live{7, HYBM_MEM_TYPE_HOST, MEM_PT_TYPE_SVM, 0x1000, 0x2000, 4096};
+    EXPECT_FALSE(MemSlice::IsZcSentinelId(live.ConvertToId()));
+    /* garbage handles are not sentinels either */
+    EXPECT_FALSE(MemSlice::IsZcSentinelId(nullptr));
+    EXPECT_FALSE(MemSlice::IsZcSentinelId(reinterpret_cast<hybm_mem_slice_t>(0x123456789ABCDEF0ULL)));
 }

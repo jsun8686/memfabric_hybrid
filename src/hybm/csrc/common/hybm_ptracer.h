@@ -202,6 +202,7 @@ enum MF_HYBM_MOD {
     TP_HYBM_NVME_RMW_STAGE_B,  /* second round: RMW head/tail writes after the merge */
     TP_HYBM_NVME_QPAIR_WAIT,   /* acquiring a qpair slot (contention indicator, multithreaded) */
     TP_HYBM_NVME_PRELOAD,      /* one-time spdk load + dpdk eal init at pool create */
+    TP_HYBM_NVME_ZC_REG,       /* B3: spdk_mem_register of one user buffer (2MB inner window) */
 };
 
 #endif // MF_HYBRID_HYBM_PTRACER_H

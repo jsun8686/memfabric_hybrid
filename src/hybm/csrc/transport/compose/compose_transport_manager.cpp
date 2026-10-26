@@ -17,6 +17,7 @@
 #include "hybm_logger.h"
 #include "host_hcom_transport_manager.h"
 #include "device_rdma_transport_manager.h"
+#include "nvme_transport_manager.h"
 #include "hybm_gva_version.h"
 #include "mf_str_util.h"
 
@@ -28,6 +29,7 @@ const char NIC_DELIMITER = ';';
 const std::string HOST_TRANSPORT_TYPE = "host#";
 const std::string DEVICE_TRANSPORT_TYPE = "device#";
 const uint32_t HOST_PROTOCOL = HYBM_DOP_TYPE_HOST_TCP | HYBM_DOP_TYPE_HOST_RDMA | HYBM_DOP_TYPE_HOST_URMA;
+const uint32_t NVME_PROTOCOL = HYBM_DOP_TYPE_NVME_TCP | HYBM_DOP_TYPE_NVME_RDMA;
 } // namespace
 
 Result ComposeTransportManager::OpenHostTransport(const TransportOptions &options)
@@ -50,6 +52,17 @@ Result ComposeTransportManager::OpenDeviceTransport(const TransportOptions &opti
     return deviceTransportManager_->OpenDevice(options);
 }
 
+Result ComposeTransportManager::OpenNvmeTransport(const TransportOptions &options)
+{
+    /* the NVMe sub-transport is a process-wide singleton: ctrlr connections and the
+     * SPDK env are shared by every pool of this process (OpenDevice = idempotent
+     * env bring-up, no per-pool state) */
+    if (nvmeTransportManager_ == nullptr) {
+        nvmeTransportManager_ = NvmeTransportManager::GetInstance();
+    }
+    return nvmeTransportManager_->OpenDevice(options);
+}
+
 Result ComposeTransportManager::OpenDevice(const TransportOptions &options)
 {
     options_ = options;
@@ -67,6 +80,15 @@ Result ComposeTransportManager::OpenDevice(const TransportOptions &options)
         ret = OpenDeviceTransport(options);
         if (ret != BM_OK) {
             BM_LOG_ERROR("Failed to open device transport nic: " << options.nic);
+            CloseDevice();
+            return BM_ERROR;
+        }
+    }
+
+    if (options_.protocol & NVME_PROTOCOL) {
+        ret = OpenNvmeTransport(options);
+        if (ret != BM_OK) {
+            BM_LOG_ERROR("Failed to open nvme transport, ret: " << ret);
             CloseDevice();
             return BM_ERROR;
         }
@@ -129,6 +151,19 @@ Result ComposeTransportManager::RegisterMemoryRegion(const TransportMemoryRegion
             return ret;
         }
     }
+    if (nvmeTransportManager_) {
+        /* NVMe MR = zero-copy optimization (spdk_mem_register): NOT_SUPPORTED or a
+         * failure degrades the nvme copies to staging, it never fails the whole
+         * registration -- except on nvme-ONLY pools where this call IS the registration */
+        Result ret = nvmeTransportManager_->RegisterMemoryRegion(mr);
+        if (ret != BM_OK && deviceTransportManager_ == nullptr && hostTransportManager_ == nullptr) {
+            BM_LOG_ERROR("Failed to register nvme memory region " << mr << ", ret: " << ret);
+            return ret;
+        }
+        if (ret != BM_OK) {
+            BM_LOG_WARN("nvme zero-copy register degraded to staging: " << mr << ", ret: " << ret);
+        }
+    }
     ComposeMemoryRegion cmr{mr.addr, mr.size, TT_COMPOSE};
     std::unique_lock<std::mutex> uniqueLock{mrsMutex_};
     mrs_.emplace(mr.addr, cmr);
@@ -158,6 +193,14 @@ Result ComposeTransportManager::UnregisterMemoryRegion(uint64_t addr)
             return ret;
         }
     }
+    if (nvmeTransportManager_) {
+        /* best-effort like register: a failed nvme MR release only degrades, the entry
+         * is dropped below either way (the MR leaks at worst, never a stale hit) */
+        Result ret = nvmeTransportManager_->UnregisterMemoryRegion(addr);
+        if (ret != BM_OK) {
+            BM_LOG_WARN("Failed to unregister nvme mr addr, ret: " << ret);
+        }
+    }
     mrs_.erase(pos);
     return BM_OK;
 }
@@ -172,6 +215,12 @@ bool ComposeTransportManager::QueryHasRegistered(uint64_t addr, uint64_t size)
     }
     if (hostTransportManager_) {
         auto ret = hostTransportManager_->QueryHasRegistered(addr, size);
+        if (ret) {
+            return ret;
+        }
+    }
+    if (nvmeTransportManager_) {
+        auto ret = nvmeTransportManager_->QueryHasRegistered(addr, size);
         if (ret) {
             return ret;
         }

@@ -24,6 +24,8 @@ namespace mf {
 
 bool DlNvmeApi::gLoaded = false;
 bool DlNvmeApi::gSpdkEnvReady = false;
+SpdkMemRegisterFunc DlNvmeApi::gSpdkMemRegister = nullptr;
+SpdkMemUnregisterFunc DlNvmeApi::gSpdkMemUnregister = nullptr;
 std::mutex DlNvmeApi::gMutex;
 void *DlNvmeApi::gEnvHandle = nullptr;
 void *DlNvmeApi::gNvmeHandle = nullptr;
@@ -169,6 +171,10 @@ Result DlNvmeApi::LoadLibrary()
 
     DL_LOAD_SYM(gSpdkDmaMalloc, SpdkDmaMallocFunc, gEnvHandle, "spdk_dma_malloc");
     DL_LOAD_SYM(gSpdkDmaFree, SpdkDmaFreeFunc, gEnvHandle, "spdk_dma_free");
+    /* optional (B3 zero-copy): dynamic memory registration; absent -> zero-copy is
+     * globally disabled and every copy rides the staging path */
+    DL_LOAD_SYM_OPTIONAL(gSpdkMemRegister, SpdkMemRegisterFunc, gEnvHandle, "spdk_mem_register");
+    DL_LOAD_SYM_OPTIONAL(gSpdkMemUnregister, SpdkMemUnregisterFunc, gEnvHandle, "spdk_mem_unregister");
     DL_LOAD_SYM(gSpdkNvmeConnect, SpdkNvmeConnectFunc, gNvmeHandle, "spdk_nvme_connect");
     /* optional: fills the ctrlr opts prefix with library defaults; absent builds
      * fall back to a zero-initialized prefix (only keepAliveTimeoutMs=0 matters) */

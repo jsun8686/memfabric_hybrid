@@ -87,12 +87,19 @@ private:
     Result OpenHostTransport(const TransportOptions &options);
 
     Result OpenDeviceTransport(const TransportOptions &options);
+
+    /* NVMe sub-transport: process-wide SINGLETON (ctrlr connections + SPDK env shared
+     * across pools); OpenDevice is idempotent env bring-up. Its CloseDevice is NOT
+     * chained here -- a pool teardown must not drop connections other pools still use. */
+    Result OpenNvmeTransport(const TransportOptions &options);
+
     void GetHostPrepareOptions(const HybmTransPrepareOptions &param, HybmTransPrepareOptions &hostOptions);
     void GetDevicePrepareOptions(const HybmTransPrepareOptions &param, HybmTransPrepareOptions &DeviceOptions);
 
 private:
     std::shared_ptr<TransportManager> deviceTransportManager_{nullptr};
     std::shared_ptr<TransportManager> hostTransportManager_{nullptr};
+    std::shared_ptr<TransportManager> nvmeTransportManager_{nullptr};
 
     std::string nicInfo_;
     std::mutex mrsMutex_;
