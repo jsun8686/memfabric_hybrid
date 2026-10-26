@@ -154,14 +154,19 @@ H2D/D2H 中转开销，与 host 模式分开解读。host 方向（LOCAL_HOST �
 RDMA busy-poll + SGL 翻译 + malloc 盘的 CPU memcpy 全部跑在 reactor 核上，默认 2 核
 时单 IO reactor 实测封顶 ~7.5GB/s）：
 
-- `--cores N`：reactor 数（默认 2）。扩核是判定实验也是主要杠杆——吞吐随核数升 =
-  tgt CPU 瓶颈实锤（busy-poll 下 reactor 常年 100% 属设计常态，不能单独作证据）；
-- `--io-unit N`：RDMA transport 的 IO 单元（默认 8192 = SPDK 默认，128K max_io ÷ 16
-  SGL）。调大（如 65536）每命令 buffer 数/SGE 翻译/WR 链长 ÷8，且 max_io_size =
-  io-unit×16 相应变大 → initiator 侧 MDTS 分段同步受益（host 端无需改动）；代价是
-  transport buffer pool 内存变大（不足时加大 tgt 的 `-s` 预留）；
-- 两者正交可叠加，改完重启 tgt 重跑 BW 矩阵即可 A/B：
-  `sudo SPDK_ROOT=... bash ./setup_nvmf_tgt.sh 192.168.200.10 --sim --rdma --cores 8 --io-unit 65536`
+- `--cores N`：reactor 数（默认 2）。**实测无效**：2→4 核 16M read 持平（7.41 vs
+  7.2~7.6）——tgt reactor 不是当前瓶颈（busy-poll 下核常年 100% 属设计常态，也不能
+  单独作瓶颈证据，扩核 A/B 才是判定实验）；
+- `--io-unit N`：RDMA transport 的 buffer 粒度（RPC `--io-unit-size`，默认 8192 = SPDK
+  默认）。**它不抬 MDTS**——单独调大到 64K 实测全线慢 20~30%（buffer 粒度粗、池中
+  buffer 数变少），不要单独使用；
+- `--max-io-size N`：transport max I/O（RPC `--max-io-size`，默认 131072）= **tgt 上报
+  的控制器 MDTS，initiator 按它切分命令**。与 `--io-unit`（须 ≤ max-io-size）一起调
+  大——如 `--io-unit 65536 --max-io-size 1048576`——host 端每命令负载 ×8，是压测
+  host 侧单线程命令处理成本的杠杆（host `maxXfer` 日志可确认生效）；代价是 transport
+  pool 内存变大；
+- 注意：transport 参数对**已运行**的 tgt 不重放（create_transport 一次性），改参数必须
+  `pkill nvmf_tgt` 后重跑脚本。
 
 ## 零拷贝预注册（B3，host buffer 可选加速）
 
