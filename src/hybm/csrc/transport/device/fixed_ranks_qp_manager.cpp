@@ -312,39 +312,43 @@ int FixedRanksQpManager::StartClientSide() noexcept
 
 int FixedRanksQpManager::GenerateWhiteList() noexcept
 {
-    if (serverSocketHandle_ == nullptr) {
-        return BM_OK;
-    }
-    /* single WILDCARD whitelist entry (0.0.0.0) instead of one entry per peer: per-peer
-     * entries must land on the listen before that peer's connect fires (the add-vs-connect
-     * race -- staggered dynamic-group joins hit it constantly), while a wildcard entry is
-     * added once at listen time and accepts every peer from then on. The fabric is an
-     * isolated NPU-only RoCE segment, so open acceptance is safe; connLimit covers every
-     * member's lanes on the single entry. Per-peer entries and the incremental adds in
-     * SetRemoteRankInfo are gone together -- the connect workers retry freely instead of
-     * coordinating whitelist timing with the peers. */
-    HccpSocketWhiteListInfo wildcard{};
-    wildcard.remoteIp.addr.s_addr = htonl(INADDR_ANY);
-    wildcard.connLimit = rankCount_ * qpsPerPeer_ * 2U;
-    bzero(wildcard.tag, sizeof(wildcard.tag));
-    auto ret = DlHccpApi::RaSocketWhiteListAdd(serverSocketHandle_, &wildcard, 1);
-    if (ret != 0) {
-        BM_LOG_ERROR("add wildcard whitelist entry failed: " << ret);
-        return BM_ERROR;
-    }
-    BM_LOG_INFO("whitelist: single wildcard entry (0.0.0.0) active, per-peer entries disabled");
-
-    /* channels for the larger-ranked peers known at startup are still created here.
-     * NOTE: peers joining AFTER startup still need an incremental channel/whitelist path
-     * (removed together with the per-peer entries); this trial focuses on validating the
-     * wildcard-acceptance semantics of hccp with example 14 single-client first */
+    std::vector<HccpSocketWhiteListInfo> whitelist;
     for (auto it = currentRanksInfo_.begin(); it != currentRanksInfo_.end(); ++it) {
-        if (it->first > rankId_ &&
-            serverConnections_.find(it->first) == serverConnections_.end()) {
-            serverConnections_.emplace(it->first,
-                                       AiCoreConnChannel{it->second.network.sin_addr, serverSocketHandle_});
+        if (it->first <= rankId_) {
+            continue; // small id as server, large id as client
+        }
+        HccpSocketWhiteListInfo info{};
+        info.remoteIp.addr = it->second.network.sin_addr;
+        info.connLimit = rankCount_;
+        bzero(info.tag, sizeof(info.tag));
+        whitelist.emplace_back(info);
+        serverConnections_.emplace(it->first, AiCoreConnChannel{info.remoteIp.addr, serverSocketHandle_});
+        if (qpsPerPeer_ > 1U) {
+            /* whitelist the peer's tagged lanes up front, before any client connects (same
+             * ordering as HCCL's ConstructWhiteList); the peer is the connecting client, so
+             * the tag derives from the remote rank */
+            for (uint32_t lane = 1; lane < qpsPerPeer_; lane++) {
+                HccpSocketWhiteListInfo extra{};
+                extra.remoteIp.addr = it->second.network.sin_addr;
+                extra.connLimit = rankCount_;
+                MakeLaneTag(extra.tag, sizeof(extra.tag), it->first, lane);
+                whitelist.emplace_back(extra);
+                BM_LOG_INFO("multi-QP server: lane " << lane << " whitelist rank " << it->first
+                                                          << " tag '" << extra.tag << "'");
+            }
         }
     }
+
+    if (whitelist.empty()) {
+        return BM_OK;
+    }
+
+    auto ret = DlHccpApi::RaSocketWhiteListAdd(serverSocketHandle_, whitelist.data(), whitelist.size());
+    if (ret != 0) {
+        BM_LOG_ERROR("socket handle add white list failed: " << ret);
+        return BM_ERROR;
+    }
+
     return BM_OK;
 }
 
