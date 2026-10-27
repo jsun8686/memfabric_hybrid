@@ -350,7 +350,12 @@ Result RdmaTransportManager::Connect()
         return ret;
     }
 
-    return WaitQpReady();
+    /* no WaitQpReady here: this runs on the group-event thread inside hybm_import, where
+     * waiting for QP readiness froze the serial group event queue (the FSDP join deadlock).
+     * The qp workers establish connections in the background and fill the device table
+     * progressively; a data plane that must not overrun the table gates on WaitQpReady at
+     * its own entry instead */
+    return BM_OK;
 }
 
 Result RdmaTransportManager::AsyncConnect()
@@ -429,7 +434,11 @@ Result RdmaTransportManager::UpdateRankOptions(const HybmTransPrepareOptions &op
 
     OptionsToRankMRs(options);
 
-    return WaitQpReady();
+    /* no WaitQpReady here: same rationale as Connect -- this runs on the group-event thread
+     * inside hybm_import, and with the real CheckQpReady the QPs are only ready AFTER the
+     * round's barrier (the peers' whitelists complete there), so waiting here would always
+     * time out and fail the import. The workers retry until established */
+    return BM_OK;
 }
 
 const std::string &RdmaTransportManager::GetNic() const
