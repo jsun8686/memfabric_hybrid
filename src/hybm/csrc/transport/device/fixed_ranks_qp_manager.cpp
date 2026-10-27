@@ -201,7 +201,10 @@ bool FixedRanksQpManager::ClientSideCatchUp(const std::set<uint32_t> &targets) n
             connectInfo.handle = socketHandle;
             connectInfo.remoteIp.addr = infoIt->second.network.sin_addr;
             connectInfo.port = infoIt->second.network.sin_port;
-            bzero(connectInfo.tag, sizeof(connectInfo.tag));
+            /* lane 0 carries a tag too (mf_q2_<myRank>_0): with several peers sharing one IP
+             * (single-node multi-NPU), an untagged connection cannot be attributed to a rank
+             * by the peer -- both ends derive the same string (same scheme as extra lanes) */
+            MakeLaneTag(connectInfo.tag, sizeof(connectInfo.tag), rankId_, 0U);
             connectInfos.emplace_back(connectInfo);
             if (qpsPerPeer_ > 1U) {
                 /* extra tagged lanes ride the SAME (ip, port) endpoint and the SAME local
@@ -290,7 +293,8 @@ bool FixedRanksQpManager::ServerSideCatchUp(const std::set<uint32_t> &targets) n
             HccpSocketWhiteListInfo info{};
             info.remoteIp.addr = infoIt->second.network.sin_addr;
             info.connLimit = rankCount_;
-            bzero(info.tag, sizeof(info.tag));
+            /* lane-0 tag, same derivation as GenerateWhiteList (client rank = the peer) */
+            MakeLaneTag(info.tag, sizeof(info.tag), rank, 0U);
             whitelist.emplace_back(info);
             serverConnections_.emplace(rank, AiCoreConnChannel{info.remoteIp.addr, serverSocketHandle_});
             emplacedRanks.emplace_back(rank);
@@ -692,7 +696,8 @@ int FixedRanksQpManager::GenerateWhiteList() noexcept
         HccpSocketWhiteListInfo info{};
         info.remoteIp.addr = it->second.network.sin_addr;
         info.connLimit = rankCount_;
-        bzero(info.tag, sizeof(info.tag));
+        /* lane-0 tag: the peer is the connecting client, so the tag derives from ITS rank */
+        MakeLaneTag(info.tag, sizeof(info.tag), it->first, 0U);
         whitelist.emplace_back(info);
         serverConnections_.emplace(it->first, AiCoreConnChannel{info.remoteIp.addr, serverSocketHandle_});
         if (qpsPerPeer_ > 1U) {
@@ -725,14 +730,18 @@ int FixedRanksQpManager::GenerateWhiteList() noexcept
 }
 
 int FixedRanksQpManager::CheckReadyConnection(std::unordered_map<uint32_t, AiCoreConnChannel> &connections,
-                                              const std::unordered_map<in_addr_t, uint32_t> addr2index,
+                                              const std::unordered_map<std::string, uint32_t> tag2index,
                                               const HccpSocketInfo &socketInfo) noexcept
 {
-    auto &addr = socketInfo.remoteIp.addr;
-    auto socketInfoPos = addr2index.find(addr.s_addr);
-    if (socketInfoPos == addr2index.end()) {
-        BM_LOG_ERROR("socket ip(" << DescribeIPv4(addr) << ") should exist in address mapping.");
-        return BM_DL_FUNCTION_FAILED;
+    /* attribution by tag: the lane-0 tag is unique per connecting rank, so peers sharing one
+     * IP are told apart (the old IP-keyed lookup collapsed them onto a single rank) */
+    auto socketInfoPos = tag2index.find(socketInfo.tag);
+    if (socketInfoPos == tag2index.end()) {
+        /* a tag we did not query surfaced in the lane-0 polling: an extra lane (>= 1)
+         * connection of a multi-QP peer -- those are fetched by their own tag-scoped queries
+         * in CreateQpWaitingReady; harmless, skip */
+        BM_LOG_INFO("connection with tag '" << socketInfo.tag << "' surfaced in lane-0 polling, skipped");
+        return BM_OK;
     }
 
     auto rankId = socketInfoPos->second;
@@ -743,24 +752,17 @@ int FixedRanksQpManager::CheckReadyConnection(std::unordered_map<uint32_t, AiCor
     }
 
     if (pos->second.socketFd[0] != nullptr) {
-        if (qpsPerPeer_ > 1U) {
-            /* a tagged lane connection surfaced in the empty-tag primary polling; harmless --
-             * lane fds are fetched by their own tag-scoped queries in CreateQpWaitingReady */
-            BM_LOG_INFO("multi-QP: extra accept from rank " << rankId << " surfaced in primary polling, fd: "
-                          << socketInfo.fd << " tag: '" << socketInfo.tag << "'");
-            return BM_OK;
-        }
-        BM_LOG_ERROR("socket ip(" << DescribeIPv4(addr) << ") already get socket fd.");
+        BM_LOG_ERROR("socket tag('" << socketInfo.tag << "') already get socket fd.");
         return BM_DL_FUNCTION_FAILED;
     }
 
     if (pos->second.socketHandle != socketInfo.handle) {
-        BM_LOG_ERROR("socket ip(" << DescribeIPv4(addr) << ") socket handle not match.");
+        BM_LOG_ERROR("socket tag('" << socketInfo.tag << "') socket handle not match.");
         return BM_DL_FUNCTION_FAILED;
     }
 
     pos->second.socketFd[0] = socketInfo.fd;
-    BM_LOG_INFO("connect to (" << rankId << ") ready.");
+    BM_LOG_INFO("connect to (" << rankId << ") ready, tag '" << socketInfo.tag << "'.");
     return BM_OK;
 }
 
@@ -802,7 +804,12 @@ int FixedRanksQpManager::WaitConnectionsReady(std::unordered_map<uint32_t, AiCor
 
         uint32_t successCount = 0;
         std::vector<HccpSocketInfo> socketInfos;
-        std::unordered_map<in_addr_t, uint32_t> addr2index;
+        const bool clientSide = (&connections == &clientConnections_);
+        /* fd attribution is BY TAG, not by IP: peers sharing one IP (single-node multi-NPU)
+         * are indistinguishable on (handle, remoteIp) -- the old IP-keyed map collapsed them
+         * onto one rank and starved the rest. The lane-0 tag mf_q2_<clientRank>_0 is unique
+         * per connecting rank and derived identically on both ends */
+        std::unordered_map<std::string, uint32_t> tag2index;
         for (auto it = connections.begin(); it != connections.end(); ++it) {
             if (it->second.socketFd[0] != nullptr) {
                 continue;
@@ -813,9 +820,11 @@ int FixedRanksQpManager::WaitConnectionsReady(std::unordered_map<uint32_t, AiCor
             info.fd = nullptr;
             info.remoteIp.addr = it->second.remoteIp;
             info.status = 0;
-            bzero(info.tag, sizeof(info.tag));
+            /* client map: WE are the client of these peers; server map: the PEER is the
+             * client -- the tag always derives from the connecting client's rank */
+            MakeLaneTag(info.tag, sizeof(info.tag), clientSide ? rankId_ : it->first, 0U);
             socketInfos.push_back(info);
-            addr2index.emplace(it->second.remoteIp.s_addr, it->first);
+            tag2index.emplace(std::string(info.tag), it->first);
         }
         if (socketInfos.empty()) {
             /* nothing left to query this round (settled by the base count above) */
@@ -823,7 +832,7 @@ int FixedRanksQpManager::WaitConnectionsReady(std::unordered_map<uint32_t, AiCor
         }
 
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        auto role = (&connections == &clientConnections_) ? 1 : 0;
+        auto role = clientSide ? 1U : 0U;
         auto ret = DlHccpApi::RaGetSockets(role, socketInfos.data(), socketInfos.size(), successCount);
         if (ret != 0) {
             if (ret == 128203) {
@@ -839,7 +848,7 @@ int FixedRanksQpManager::WaitConnectionsReady(std::unordered_map<uint32_t, AiCor
         }
 
         for (auto i = 0U; i < successCount; i++) {
-            ret = CheckReadyConnection(connections, addr2index, socketInfos[i]);
+            ret = CheckReadyConnection(connections, tag2index, socketInfos[i]);
             if (ret != BM_OK) {
                 return ret;
             }

@@ -18,6 +18,7 @@
 #include <mutex>
 #include <set>
 #include <shared_mutex>
+#include <string>
 #include <thread>
 #include "device_qp_manager.h"
 
@@ -98,7 +99,7 @@ private:
     int WaitConnectionsReady(std::unordered_map<uint32_t, AiCoreConnChannel> &connections,
                              uint32_t roundBudgetSec) noexcept;
     int CheckReadyConnection(std::unordered_map<uint32_t, AiCoreConnChannel> &connections,
-                             const std::unordered_map<in_addr_t, uint32_t> addr2index,
+                             const std::unordered_map<std::string, uint32_t> tag2index,
                              const HccpSocketInfo &socketInfo) noexcept;
     int CreateQpWaitingReady(std::unordered_map<uint32_t, AiCoreConnChannel> &connections,
                              uint32_t roundBudgetSec) noexcept;
