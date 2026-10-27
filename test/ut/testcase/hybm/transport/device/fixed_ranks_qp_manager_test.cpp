@@ -981,23 +981,22 @@ TEST(FixedRanksQpManagerTestTest, CheckReadyConnectionSuccess)
     void* socketHandle = reinterpret_cast<void*>(0x1234UL);
     connections.emplace(0, FixedRanksQpManagerTest::AiCoreConnChannel(ip, socketHandle));
 
-    std::unordered_map<std::string, uint32_t> tag2index;
-    tag2index["mf_q2_0_0"] = 0;
+    std::unordered_map<in_addr_t, uint32_t> addr2index;
+    addr2index[ip.s_addr] = 0;
 
     HccpSocketInfo socketInfo{};
     socketInfo.handle = socketHandle;
     socketInfo.remoteIp.addr = ip;
     socketInfo.fd = reinterpret_cast<void*>(0x5678UL);
-    std::snprintf(socketInfo.tag, sizeof(socketInfo.tag),"mf_q2_0_0");
 
     // Test success case
-    EXPECT_EQ(manager.CheckReadyConnection(connections, tag2index, socketInfo), BM_OK);
+    EXPECT_EQ(manager.CheckReadyConnection(connections, addr2index, socketInfo), BM_OK);
     auto pos = connections.find(0);
     ASSERT_NE(pos, connections.end());
     EXPECT_EQ(pos->second.socketFd[0], socketInfo.fd);
 }
 
-TEST(FixedRanksQpManagerTestTest, CheckReadyConnectionTagNotInMapSkips)
+TEST(FixedRanksQpManagerTestTest, CheckReadyConnectionIpNotInMap)
 {
     sockaddr_in devNet{};
     inet_aton("127.0.0.1", &devNet.sin_addr);
@@ -1013,20 +1012,18 @@ TEST(FixedRanksQpManagerTestTest, CheckReadyConnectionTagNotInMapSkips)
     void* socketHandle = reinterpret_cast<void*>(0x1234UL);
     connections.emplace(0, FixedRanksQpManagerTest::AiCoreConnChannel(ip1, socketHandle));
 
-    std::unordered_map<std::string, uint32_t> tag2index;
-    // lane-0 tags only; an extra-lane tag is NOT in the map
+    std::unordered_map<in_addr_t, uint32_t> addr2index;
+    // Don't add ip2 to addr2index
 
+    in_addr ip2{};
+    inet_aton("192.168.1.2", &ip2);
     HccpSocketInfo socketInfo{};
     socketInfo.handle = socketHandle;
-    socketInfo.remoteIp.addr = ip1;
+    socketInfo.remoteIp.addr = ip2;
     socketInfo.fd = reinterpret_cast<void*>(0x5678UL);
-    std::snprintf(socketInfo.tag, sizeof(socketInfo.tag),"mf_q2_0_1"); // lane-1 tag
 
-    // Test skip case: a tag we did not query (extra lane surfacing) is skipped, not an error
-    EXPECT_EQ(manager.CheckReadyConnection(connections, tag2index, socketInfo), BM_OK);
-    auto pos = connections.find(0);
-    ASSERT_NE(pos, connections.end());
-    EXPECT_EQ(pos->second.socketFd[0], nullptr);
+    // Test failure case: ip not in addr2index
+    EXPECT_EQ(manager.CheckReadyConnection(connections, addr2index, socketInfo), BM_DL_FUNCTION_FAILED);
 }
 
 TEST(FixedRanksQpManagerTestTest, CheckReadyConnectionRankNotInConnections)
@@ -1044,17 +1041,16 @@ TEST(FixedRanksQpManagerTestTest, CheckReadyConnectionRankNotInConnections)
 
     in_addr ip{};
     inet_aton("192.168.1.1", &ip);
-    std::unordered_map<std::string, uint32_t> tag2index;
-    tag2index["mf_q2_1_0"] = 1;  // Map to rank 1 which is not in connections
+    std::unordered_map<in_addr_t, uint32_t> addr2index;
+    addr2index[ip.s_addr] = 1;  // Map to rank 1 which is not in connections
 
     HccpSocketInfo socketInfo{};
     socketInfo.handle = reinterpret_cast<void*>(0x1234UL);
     socketInfo.remoteIp.addr = ip;
     socketInfo.fd = reinterpret_cast<void*>(0x5678UL);
-    std::snprintf(socketInfo.tag, sizeof(socketInfo.tag),"mf_q2_1_0");
 
     // Test failure case: rank not in connections
-    EXPECT_EQ(manager.CheckReadyConnection(connections, tag2index, socketInfo), BM_DL_FUNCTION_FAILED);
+    EXPECT_EQ(manager.CheckReadyConnection(connections, addr2index, socketInfo), BM_DL_FUNCTION_FAILED);
 }
 
 TEST(FixedRanksQpManagerTestTest, CheckReadyConnectionSocketFdAlreadySet)
@@ -1076,17 +1072,16 @@ TEST(FixedRanksQpManagerTestTest, CheckReadyConnectionSocketFdAlreadySet)
     ASSERT_NE(pos, connections.end());
     pos->second.socketFd[0] = reinterpret_cast<void*>(0x9ABCUL);  // Already set
 
-    std::unordered_map<std::string, uint32_t> tag2index;
-    tag2index["mf_q2_0_0"] = 0;
+    std::unordered_map<in_addr_t, uint32_t> addr2index;
+    addr2index[ip.s_addr] = 0;
 
     HccpSocketInfo socketInfo{};
     socketInfo.handle = socketHandle;
     socketInfo.remoteIp.addr = ip;
     socketInfo.fd = reinterpret_cast<void*>(0x5678UL);
-    std::snprintf(socketInfo.tag, sizeof(socketInfo.tag),"mf_q2_0_0");
 
     // Test failure case: socketFd already set
-    EXPECT_EQ(manager.CheckReadyConnection(connections, tag2index, socketInfo), BM_DL_FUNCTION_FAILED);
+    EXPECT_EQ(manager.CheckReadyConnection(connections, addr2index, socketInfo), BM_DL_FUNCTION_FAILED);
 }
 
 TEST(FixedRanksQpManagerTestTest, CheckReadyConnectionHandleMismatch)
@@ -1105,18 +1100,17 @@ TEST(FixedRanksQpManagerTestTest, CheckReadyConnectionHandleMismatch)
     void* socketHandle1 = reinterpret_cast<void*>(0x1234UL);
     connections.emplace(0, FixedRanksQpManagerTest::AiCoreConnChannel(ip, socketHandle1));
 
-    std::unordered_map<std::string, uint32_t> tag2index;
-    tag2index["mf_q2_0_0"] = 0;
+    std::unordered_map<in_addr_t, uint32_t> addr2index;
+    addr2index[ip.s_addr] = 0;
 
     void* socketHandle2 = reinterpret_cast<void*>(0x5678UL);  // Different handle
     HccpSocketInfo socketInfo{};
     socketInfo.handle = socketHandle2;
     socketInfo.remoteIp.addr = ip;
     socketInfo.fd = reinterpret_cast<void*>(0x9ABCUL);
-    std::snprintf(socketInfo.tag, sizeof(socketInfo.tag),"mf_q2_0_0");
 
     // Test failure case: handle mismatch
-    EXPECT_EQ(manager.CheckReadyConnection(connections, tag2index, socketInfo), BM_DL_FUNCTION_FAILED);
+    EXPECT_EQ(manager.CheckReadyConnection(connections, addr2index, socketInfo), BM_DL_FUNCTION_FAILED);
 }
 
 TEST(FixedRanksQpManagerTestTest, CreateOneQpSuccess)
@@ -1184,7 +1178,7 @@ TEST(FixedRanksQpManagerTestTest, WaitConnectionsReadySuccess)
     void* socketHandle = reinterpret_cast<void*>(0x1234UL);
     connections.emplace(0, FixedRanksQpManagerTest::AiCoreConnChannel(ip, socketHandle));
 
-    EXPECT_EQ(manager.WaitConnectionsReady(connections, 5U), BM_OK);
+    EXPECT_EQ(manager.WaitConnectionsReady(connections), BM_OK);
     auto pos = connections.find(0);
     ASSERT_NE(pos, connections.end());
     EXPECT_NE(pos->second.socketFd[0], nullptr);
@@ -1207,7 +1201,7 @@ TEST(FixedRanksQpManagerTestTest, WaitConnectionsReadyFailWhenRaGetSocketsFail)
     inet_aton("192.168.1.1", &ip);
     connections.emplace(0, FixedRanksQpManagerTest::AiCoreConnChannel(ip, reinterpret_cast<void*>(0x1234UL)));
 
-    EXPECT_EQ(manager.WaitConnectionsReady(connections, 5U), BM_DL_FUNCTION_FAILED);
+    EXPECT_EQ(manager.WaitConnectionsReady(connections), BM_DL_FUNCTION_FAILED);
 }
 
 TEST(FixedRanksQpManagerTestTest, FillQpInfoOnlySelfMrSuccess)
