@@ -97,12 +97,13 @@ bool FixedRanksQpManager::RankMeshReady(uint32_t rankId) const noexcept
     /* fully established = lane 0 socket + QP both present (lanes >0 are best-effort addons
      * riding the same endpoint; CheckQpReady enforces them per lane for the data-plane gate) */
     std::shared_lock<std::shared_mutex> lock(channelsMutex_);
-    const auto *maps = {&clientConnections_, &serverConnections_};
-    for (auto *map : maps) {
-        auto it = map->find(rankId);
-        if (it != map->end()) {
-            return (it->second.socketFd[0] != nullptr) && (it->second.qpHandle[0] != nullptr);
-        }
+    auto cit = clientConnections_.find(rankId);
+    if (cit != clientConnections_.end()) {
+        return (cit->second.socketFd[0] != nullptr) && (cit->second.qpHandle[0] != nullptr);
+    }
+    auto sit = serverConnections_.find(rankId);
+    if (sit != serverConnections_.end()) {
+        return (sit->second.socketFd[0] != nullptr) && (sit->second.qpHandle[0] != nullptr);
     }
     return false;
 }
