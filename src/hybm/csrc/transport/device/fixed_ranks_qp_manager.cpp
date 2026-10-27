@@ -56,13 +56,31 @@ int FixedRanksQpManager::SetRemoteRankInfo(const std::unordered_map<uint32_t, Co
 {
     if (started_.load()) {
         /* dynamic groups (ralloc) import slices/ranks incrementally after startup: merge the new
-         * entries (memKeys grow per slice) instead of rejecting, then refresh the device-side
-         * QP/MR table. Connections stay as-is; a rank not connected yet is filled by the connect
-         * worker's own FillQpInfo once its QP becomes ready, so a refresh failure is not fatal. */
+         * entries (memKeys grow per slice) instead of rejecting, then hand the transport work to
+         * the establishment loops. This callback runs inside the group JoinHandle and MUST NOT
+         * wait on the network: the join round's barrier vote used to block here on connect/QP
+         * readiness, which coupled with the hccp whitelist race into the FSDP deadlock (a late
+         * joiner's round never completed, the version sequence froze, everyone queued behind).
+         * Failures are not possible by design -- ranks stay pending until their channel is up. */
         for (auto it = ranks.begin(); it != ranks.end(); ++it) {
             currentRanksInfo_.insert_or_assign(it->first, it->second);
         }
-        ConnectNewClientRanks();
+        {
+            std::lock_guard<std::mutex> lock(loopMutex_);
+            for (auto it = currentRanksInfo_.begin(); it != currentRanksInfo_.end(); ++it) {
+                if (it->first == rankId_) {
+                    continue;
+                }
+                if (it->first < rankId_) {
+                    if (!RankMeshReady(it->first)) {
+                        pendingClientRanks_.insert(it->first);
+                    }
+                } else if (!RankMeshReady(it->first)) {
+                    pendingServerRanks_.insert(it->first);
+                }
+            }
+        }
+        loopCv_.notify_all();
         DlAclApi::AclrtSetDevice(deviceId_);
         if (FillQpInfo() != BM_OK) {
             BM_LOG_WARN("refresh qp info after rank update failed; deferred to connect worker");
@@ -74,130 +92,247 @@ int FixedRanksQpManager::SetRemoteRankInfo(const std::unordered_map<uint32_t, Co
     return BM_OK;
 }
 
-void FixedRanksQpManager::ConnectNewClientRanks() noexcept
+bool FixedRanksQpManager::RankMeshReady(uint32_t rankId) const noexcept
 {
-    /* dynamic groups may introduce peers AFTER this manager already started: the FAR
-     * contributor's entity only enters the group after the first extend_remote_mem
-     * placement, typically after every NEAR rank finished its own create-join (example 14
-     * dual-client / FSDP multi-rank). Catch up on both directions here:
-     *  - smaller-ranked peers: I am the client, connect out to them now;
-     *  - larger-ranked peers: I am the server, extend the accept whitelist so their
-     *    connect attempt is not rejected.
-     * Synchronous by design: those peers joined before this import reached us, so their
-     * listen side is already up and the batch connect completes in milliseconds. */
+    /* fully established = lane 0 socket + QP both present (lanes >0 are best-effort addons
+     * riding the same endpoint; CheckQpReady enforces them per lane for the data-plane gate) */
+    std::shared_lock<std::shared_mutex> lock(channelsMutex_);
+    const auto *maps = {&clientConnections_, &serverConnections_};
+    for (auto *map : maps) {
+        auto it = map->find(rankId);
+        if (it != map->end()) {
+            return (it->second.socketFd[0] != nullptr) && (it->second.qpHandle[0] != nullptr);
+        }
+    }
+    return false;
+}
+
+void FixedRanksQpManager::ClientRunLoop() noexcept
+{
+    DlAclApi::AclrtSetDevice(deviceId_);
+    while (running_.load()) {
+        std::unique_lock<std::mutex> lock(loopMutex_);
+        loopCv_.wait_for(lock, std::chrono::milliseconds(300));
+        if (pendingClientRanks_.empty() && running_.load()) {
+            /* idle park; any SetRemoteRankInfo notify wakes us immediately */
+            loopCv_.wait_for(lock, std::chrono::seconds(60));
+        }
+        if (!running_.load() || pendingClientRanks_.empty()) {
+            continue;
+        }
+        auto targets = pendingClientRanks_;
+        lock.unlock();
+        ClientSideCatchUp(targets);
+    }
+}
+
+void FixedRanksQpManager::ServerRunLoop() noexcept
+{
+    DlAclApi::AclrtSetDevice(deviceId_);
+    while (running_.load()) {
+        std::unique_lock<std::mutex> lock(loopMutex_);
+        loopCv_.wait_for(lock, std::chrono::milliseconds(300));
+        if (pendingServerRanks_.empty() && running_.load()) {
+            loopCv_.wait_for(lock, std::chrono::seconds(60));
+        }
+        if (!running_.load() || pendingServerRanks_.empty()) {
+            continue;
+        }
+        auto targets = pendingServerRanks_;
+        lock.unlock();
+        ServerSideCatchUp(targets);
+    }
+}
+
+uint32_t FixedRanksQpManager::RoundBudgetSec() noexcept
+{
+    /* one establishment round's wait budget; MF_CONN_ROUND_TIMEOUT (seconds) overrides.
+     * Short by default: rounds RETRY, so a refused/racy connect is re-issued within
+     * seconds instead of being parked behind a minutes-long wait */
+    const uint32_t budget = MfEnvUtil::GetOptionalUintOrDefault("MF_CONN_ROUND_TIMEOUT", 5U);
+    return budget == 0U ? 1U : budget;
+}
+
+void FixedRanksQpManager::ClientSideCatchUp(const std::set<uint32_t> &targets) noexcept
+{
+    /* one establishment round for the pending smaller-ranked peers:
+     *  1. ranks without a channel yet: create the local socket handle + issue the batch
+     *     connect (incl. tagged lanes);
+     *  2. wait for the sockets + build the QPs (whole-map walk, idempotent);
+     *  3. ranks whose socket never arrived (whitelist race lost this round -- the peer's
+     *     server adds our IP microseconds later) are dropped from the map again so the
+     *     NEXT round re-creates the handle and re-issues the connect: that retry is what
+     *     heals the race. Everything stays pending until fully established. */
+    std::vector<std::pair<uint32_t, void *>> freshChannels;
+    {
+        std::shared_lock<std::shared_mutex> lock(channelsMutex_);
+        for (auto rank : targets) {
+            if (clientConnections_.find(rank) == clientConnections_.end()) {
+                auto infoIt = currentRanksInfo_.find(rank);
+                if (infoIt != currentRanksInfo_.end()) {
+                    freshChannels.emplace_back(rank, nullptr);
+                }
+            }
+        }
+    }
+    if (!freshChannels.empty()) {
+        std::vector<HccpSocketConnectInfo> connectInfos;
+        std::vector<void *> createdHandles;
+        for (auto &entry : freshChannels) {
+            auto infoIt = currentRanksInfo_.find(entry.first);
+            auto socketHandle = CreateLocalSocket();
+            if (socketHandle == nullptr) {
+                BM_LOG_WARN("client round: create local socket for rank " << entry.first
+                              << " failed; retrying next round");
+                entry.second = nullptr;
+                continue;
+            }
+            entry.second = socketHandle;
+            createdHandles.emplace_back(socketHandle);
+            HccpSocketConnectInfo connectInfo{};
+            connectInfo.handle = socketHandle;
+            connectInfo.remoteIp.addr = infoIt->second.network.sin_addr;
+            connectInfo.port = infoIt->second.network.sin_port;
+            bzero(connectInfo.tag, sizeof(connectInfo.tag));
+            connectInfos.emplace_back(connectInfo);
+            if (qpsPerPeer_ > 1U) {
+                /* extra tagged lanes ride the SAME (ip, port) endpoint and the SAME local
+                 * handle; the tag derives from our own rank (we are the client) */
+                for (uint32_t lane = 1; lane < qpsPerPeer_; lane++) {
+                    HccpSocketConnectInfo extra = connectInfo;
+                    MakeLaneTag(extra.tag, sizeof(extra.tag), rankId_, lane);
+                    connectInfos.emplace_back(extra);
+                }
+            }
+        }
+        if (connectInfos.empty()) {
+            return;
+        }
+        auto ret = DlHccpApi::RaSocketBatchConnect(connectInfos.data(), connectInfos.size());
+        if (ret != 0) {
+            BM_LOG_WARN("client round: batch connect failed: " << ret << "; retrying next round");
+            for (auto handle : createdHandles) {
+                (void)DlHccpApi::RaSocketDeinit(handle);
+            }
+            return;
+        }
+        {
+            std::unique_lock<std::shared_mutex> lock(channelsMutex_);
+            for (auto &entry : freshChannels) {
+                if (entry.second == nullptr) {
+                    continue;
+                }
+                auto infoIt = currentRanksInfo_.find(entry.first);
+                clientConnections_.emplace(entry.first,
+                                           AiCoreConnChannel{infoIt->second.network.sin_addr, entry.second});
+            }
+        }
+    }
+
+    DlAclApi::AclrtSetDevice(deviceId_);
+    const uint32_t roundBudget = RoundBudgetSec();
+    if (WaitConnectionsReady(clientConnections_, roundBudget) != BM_OK) {
+        BM_LOG_WARN("client round: connections not ready in time; dropping unready channels"
+                    " so the next round re-issues their connects");
+        std::unique_lock<std::shared_mutex> lock(channelsMutex_);
+        for (auto rank : targets) {
+            auto it = clientConnections_.find(rank);
+            if (it != clientConnections_.end() && it->second.socketFd[0] == nullptr) {
+                if (it->second.socketHandle != nullptr) {
+                    (void)DlHccpApi::RaSocketDeinit(it->second.socketHandle);
+                }
+                clientConnections_.erase(it);
+            }
+        }
+        return;
+    }
+    if (CreateQpWaitingReady(clientConnections_, roundBudget) != BM_OK) {
+        BM_LOG_WARN("client round: QP create/wait failed; ranks stay pending for retry");
+        return;
+    }
+    if (FillQpInfo() != BM_OK) {
+        BM_LOG_WARN("client round: refresh qp info failed; deferred to next round");
+    }
+    size_t stillPending = 0;
+    {
+        std::lock_guard<std::mutex> lock(loopMutex_);
+        for (auto rank : targets) {
+            if (RankMeshReady(rank)) {
+                pendingClientRanks_.erase(rank);
+            }
+        }
+        stillPending = pendingClientRanks_.size();
+    }
+    BM_LOG_INFO("client round: connections established, " << stillPending << " peer(s) still pending");
+}
+
+void FixedRanksQpManager::ServerSideCatchUp(const std::set<uint32_t> &targets) noexcept
+{
+    /* one establishment round for the pending larger-ranked peers: whitelist their IPs
+     * (idempotent -- only newly emplaced channels generate whitelist entries), then wait
+     * for their connect + build the server QP halves. A peer whose connect was refused by
+     * the not-yet-updated whitelist retries on ITS side; our whitelist entry persists in
+     * hccp, so the next attempt lands. Ranks stay pending until fully established. */
     std::vector<HccpSocketWhiteListInfo> whitelist;
-    std::vector<std::pair<uint32_t, sockaddr_in>> connectTargets;
-    const bool serverWorkerLive = (serverConnectThread_ != nullptr);
-    for (auto it = currentRanksInfo_.begin(); it != currentRanksInfo_.end(); ++it) {
-        const bool knownClient = clientConnections_.find(it->first) != clientConnections_.end();
-        const bool knownServer = serverConnections_.find(it->first) != serverConnections_.end();
-        if (it->first < rankId_ && !knownClient) {
-            connectTargets.emplace_back(it->first, it->second.network);
-        } else if (it->first > rankId_ && !knownServer && serverSocketHandle_ != nullptr) {
-            if (serverWorkerLive) {
-                /* the first-round server worker is still walking serverConnections_ --
-                 * mutating it now would corrupt its iteration; the next import retries */
+    {
+        std::unique_lock<std::shared_mutex> lock(channelsMutex_);
+        for (auto rank : targets) {
+            if (serverConnections_.find(rank) != serverConnections_.end() || serverSocketHandle_ == nullptr) {
+                continue;
+            }
+            auto infoIt = currentRanksInfo_.find(rank);
+            if (infoIt == currentRanksInfo_.end()) {
                 continue;
             }
             HccpSocketWhiteListInfo info{};
-            info.remoteIp.addr = it->second.network.sin_addr;
+            info.remoteIp.addr = infoIt->second.network.sin_addr;
             info.connLimit = rankCount_;
             bzero(info.tag, sizeof(info.tag));
             whitelist.emplace_back(info);
-            serverConnections_.emplace(it->first, AiCoreConnChannel{info.remoteIp.addr, serverSocketHandle_});
-            for (uint32_t lane = 1; lane < qpsPerPeer_; lane++) {
-                HccpSocketWhiteListInfo extra{};
-                extra.remoteIp.addr = it->second.network.sin_addr;
-                extra.connLimit = rankCount_;
-                MakeLaneTag(extra.tag, sizeof(extra.tag), it->first, lane);
-                whitelist.emplace_back(extra);
+            serverConnections_.emplace(rank, AiCoreConnChannel{info.remoteIp.addr, serverSocketHandle_});
+            if (qpsPerPeer_ > 1U) {
+                for (uint32_t lane = 1; lane < qpsPerPeer_; lane++) {
+                    HccpSocketWhiteListInfo extra{};
+                    extra.remoteIp.addr = infoIt->second.network.sin_addr;
+                    extra.connLimit = rankCount_;
+                    MakeLaneTag(extra.tag, sizeof(extra.tag), rank, lane);
+                    whitelist.emplace_back(extra);
+                }
             }
         }
     }
     if (!whitelist.empty()) {
         auto ret = DlHccpApi::RaSocketWhiteListAdd(serverSocketHandle_, whitelist.data(), whitelist.size());
         if (ret != 0) {
-            BM_LOG_WARN("incremental whitelist add failed: " << ret
-                          << " (the peer's connect will be rejected this round; next import retries)");
+            BM_LOG_WARN("server round: whitelist add failed: " << ret << "; retrying next round");
+            return;
         }
-    }
-    if (connectTargets.empty()) {
-        return;
-    }
-    if (clientConnectThread_ != nullptr) {
-        /* the first-round connect worker is still running (WaitingConnectionReady not called
-         * yet) -- touching clientConnections_ concurrently would corrupt the iteration; the
-         * next import (every UpdateRankOptions round) retries */
-        BM_LOG_WARN("client connect worker still running, deferring incremental connect of "
-                    << connectTargets.size() << " peer(s) to the next import");
-        return;
-    }
-
-    std::vector<HccpSocketConnectInfo> connectInfos;
-    for (auto &target : connectTargets) {
-        auto socketHandle = CreateLocalSocket();
-        if (socketHandle == nullptr) {
-            BM_LOG_WARN("create local socket for rank " << target.first << " failed; next import retries");
-            continue;
-        }
-        clientConnections_.emplace(target.first, AiCoreConnChannel{target.second.sin_addr, socketHandle});
-        HccpSocketConnectInfo connectInfo{};
-        connectInfo.handle = socketHandle;
-        connectInfo.remoteIp.addr = target.second.sin_addr;
-        connectInfo.port = target.second.sin_port;
-        bzero(connectInfo.tag, sizeof(connectInfo.tag));
-        connectInfos.emplace_back(connectInfo);
-        if (qpsPerPeer_ > 1U) {
-            for (uint32_t lane = 1; lane < qpsPerPeer_; lane++) {
-                HccpSocketConnectInfo extra = connectInfo;
-                MakeLaneTag(extra.tag, sizeof(extra.tag), rankId_, lane);
-                connectInfos.emplace_back(extra);
-            }
-        }
-    }
-    if (connectInfos.empty()) {
-        return;
-    }
-
-    auto ret = DlHccpApi::RaSocketBatchConnect(connectInfos.data(), connectInfos.size());
-    if (ret != 0) {
-        /* nothing was established -- drop the half-added entries so the next import retries */
-        for (auto &target : connectTargets) {
-            clientConnections_.erase(target.first);
-        }
-        BM_LOG_WARN("incremental batch connect failed: " << ret << " (next import retries)");
-        return;
     }
 
     DlAclApi::AclrtSetDevice(deviceId_);
-    /* WaitConnectionsReady skips entries that are already ready, and CreateQpWaitingReady
-     * skips lanes whose QP exists, so re-walking the whole map is safe for the old entries */
-    if (WaitConnectionsReady(clientConnections_) != BM_OK) {
-        BM_LOG_WARN("incremental client connections not ready in time; deferred to connect worker");
+    const uint32_t roundBudget = RoundBudgetSec();
+    if (WaitConnectionsReady(serverConnections_, roundBudget) != BM_OK) {
+        BM_LOG_WARN("server round: accepts not ready in time; ranks stay pending for retry");
         return;
     }
-    if (CreateQpWaitingReady(clientConnections_) != BM_OK) {
-        BM_LOG_WARN("create QP for incrementally connected peer(s) failed; WaitQpReady reports");
+    if (CreateQpWaitingReady(serverConnections_, roundBudget) != BM_OK) {
+        BM_LOG_WARN("server round: QP create/wait failed; ranks stay pending for retry");
         return;
     }
-    BM_LOG_INFO("incremental client connections established for " << connectTargets.size() << " peer(s)");
-
-    /* server side: the newly whitelisted larger peers connect TO us; poll their accept
-     * state and build their QPs here too (the first-round server worker already exited
-     * after WaitingConnectionReady, nobody else would). The peer's own incremental client
-     * connect happens on its import round, milliseconds away. */
-    if (!whitelist.empty()) {
-        if (WaitConnectionsReady(serverConnections_) != BM_OK) {
-            BM_LOG_WARN("incremental server accepts not ready in time; deferred to connect worker");
-            return;
-        }
-        if (CreateQpWaitingReady(serverConnections_) != BM_OK) {
-            BM_LOG_WARN("create QP for incrementally accepted peer(s) failed; WaitQpReady reports");
-            return;
-        }
-        BM_LOG_INFO("incremental server connections established for " << whitelist.size() / qpsPerPeer_
-                    << " peer(s)");
+    if (FillQpInfo() != BM_OK) {
+        BM_LOG_WARN("server round: refresh qp info failed; deferred to next round");
     }
+    size_t stillPending = 0;
+    {
+        std::lock_guard<std::mutex> lock(loopMutex_);
+        for (auto rank : targets) {
+            if (RankMeshReady(rank)) {
+                pendingServerRanks_.erase(rank);
+            }
+        }
+        stillPending = pendingServerRanks_.size();
+    }
+    BM_LOG_INFO("server round: connections established, " << stillPending << " peer(s) still pending");
 }
 
 int FixedRanksQpManager::Startup(void *rdma) noexcept
@@ -241,6 +376,10 @@ int FixedRanksQpManager::Startup(void *rdma) noexcept
         }
     }
 
+    /* synchronous part: local resources only (listen socket + initial whitelist + local
+     * socket-handle pre-creation). Every network interaction -- batch connect, accept
+     * waits, QP handshakes -- belongs to the run-loops below, never to this stack (it may
+     * be a dynamic-group JoinHandle, where blocking was the FSDP deadlock's root). */
     auto ret = StartServerSide();
     if (ret != BM_OK) {
         BM_LOG_ERROR("start server side failed: " << ret);
@@ -253,7 +392,15 @@ int FixedRanksQpManager::Startup(void *rdma) noexcept
         return ret;
     }
 
+    running_.store(true);
+    if (rankId_ + 1U != rankCount_) {
+        serverConnectThread_ = std::make_shared<std::thread>([this]() { ServerRunLoop(); });
+    }
+    if (rankId_ != 0U) {
+        clientConnectThread_ = std::make_shared<std::thread>([this]() { ClientRunLoop(); });
+    }
     started_.store(true);
+    loopCv_.notify_all();
     return BM_OK;
 }
 
@@ -265,23 +412,63 @@ void FixedRanksQpManager::Shutdown() noexcept
 
 int FixedRanksQpManager::WaitingConnectionReady() noexcept
 {
-    if (serverConnectThread_ != nullptr) {
-        serverConnectThread_->join();
-        serverConnectThread_ = nullptr;
-    }
-
-    if (clientConnectThread_ != nullptr) {
-        clientConnectThread_->join();
-        clientConnectThread_ = nullptr;
-    }
-
-    if (serverConnectResult == BM_OK && clientConnectResult == BM_OK) {
-        BM_LOG_INFO("client & server connections ready.");
+    /* non-blocking by design (Joinable-model contract): wake the establishment loops and
+     * return. Readiness is gated downstream by RdmaTransportManager::WaitQpReady polling
+     * CheckQpReady (bounded 30s + 100ms/rank), which never runs on a group-event thread
+     * without the pending-set safety net below it. The previous implementation joined the
+     * one-shot worker threads here and blocked the dynamic-group JoinHandle for the whole
+     * connect+QP window -- one edge of the FSDP join-round deadlock. */
+    if (!started_.load()) {
+        BM_LOG_WARN("waiting connection ready called before startup; establishment loops not running");
         return BM_OK;
     }
+    loopCv_.notify_all();
+    size_t clientPending = 0;
+    size_t serverPending = 0;
+    {
+        std::lock_guard<std::mutex> lock(loopMutex_);
+        clientPending = pendingClientRanks_.size();
+        serverPending = pendingServerRanks_.size();
+    }
+    BM_LOG_INFO("connection establishment delegated to background loops"
+                " (client pending: " << clientPending << ", server pending: " << serverPending << ")");
+    return BM_OK;
+}
 
-    BM_LOG_ERROR("background connection thread not started.");
-    return BM_ERROR;
+bool FixedRanksQpManager::CheckQpReady(const std::vector<uint32_t> &rankIds) const noexcept
+{
+    /* data-plane gate polled by RdmaTransportManager::WaitQpReady: a rank counts as ready
+     * only when EVERY lane of its channel reached QP-ready state (status 1); lanes that
+     * were never attempted stay -1 and keep the gate closed */
+    std::shared_lock<std::shared_mutex> lock(channelsMutex_);
+    for (auto rankId : rankIds) {
+        if (rankId == rankId_) {
+            continue;
+        }
+        if (rankId >= rankCount_) {
+            BM_LOG_ERROR("check qp ready got invalid rank id: " << rankId << ", rank count: " << rankCount_);
+            return false;
+        }
+        const AiCoreConnChannel *channel = nullptr;
+        auto cit = clientConnections_.find(rankId);
+        if (cit != clientConnections_.end()) {
+            channel = &cit->second;
+        } else {
+            auto sit = serverConnections_.find(rankId);
+            if (sit != serverConnections_.end()) {
+                channel = &sit->second;
+            }
+        }
+        if (channel == nullptr) {
+            return false;
+        }
+        for (uint32_t lane = 0; lane < qpsPerPeer_; lane++) {
+            if (channel->qpStatus[lane] != 1) {
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 const void *FixedRanksQpManager::GetQpInfoAddress() const noexcept
@@ -346,24 +533,19 @@ int FixedRanksQpManager::StartServerSide() noexcept
         return BM_DL_FUNCTION_FAILED;
     }
 
-    serverConnectThread_ = std::make_shared<std::thread>([this]() {
-        DlAclApi::AclrtSetDevice(deviceId_);
-        auto ret = WaitConnectionsReady(serverConnections_);
-        if (ret != BM_OK) {
-            BM_LOG_ERROR("wait connection ready failed: " << ret);
-            serverConnectResult = ret;
-            return;
+    /* larger ranks known at startup already carry a whitelist entry + channel (GenerateWhiteList);
+     * their accepts and server-side QP halves are served by the persistent server run-loop,
+     * NOT by a one-shot thread that WaitingConnectionReady used to join -- that join was the
+     * group-handler blocking edge of the FSDP join-round deadlock */
+    {
+        std::lock_guard<std::mutex> lock(loopMutex_);
+        for (auto it = currentRanksInfo_.begin(); it != currentRanksInfo_.end(); ++it) {
+            if (it->first > rankId_) {
+                pendingServerRanks_.insert(it->first);
+            }
         }
-        ret = CreateQpWaitingReady(serverConnections_);
-        if (ret != BM_OK) {
-            BM_LOG_ERROR("wait connection AI qp ready failed: " << ret);
-            serverConnectResult = ret;
-            return;
-        }
-
-        serverConnectResult = BM_OK;
-    });
-
+    }
+    serverConnectResult = BM_OK;
     return BM_OK;
 }
 
@@ -375,82 +557,49 @@ int FixedRanksQpManager::StartClientSide() noexcept
         return BM_OK;
     }
 
-    std::vector<HccpSocketConnectInfo> connectInfos;
+    /* pre-create the LOCAL socket handles only -- fail-fast on driver resource errors while
+     * the caller can still propagate them. The batch connect itself is deferred to the
+     * client run-loop: issuing it on this stack (a dynamic-group JoinHandle) is exactly the
+     * whitelist-race pattern that deadlocked multi-client joins on the FSDP cluster (the
+     * peer's whitelist add lands microseconds after our connect fires). */
+    std::vector<std::pair<uint32_t, void *>> created;
     for (auto it = currentRanksInfo_.begin(); it != currentRanksInfo_.end(); ++it) {
         if (it->first >= rankId_) {
             continue; // client connect to small ranks.
         }
-
         auto socketHandle = CreateLocalSocket();
         if (socketHandle == nullptr) {
-            BM_LOG_ERROR("create local socket handle failed");
-            CloseClientConnections();
+            BM_LOG_ERROR("create local socket handle failed.");
+            for (auto &entry : created) {
+                (void)DlHccpApi::RaSocketDeinit(entry.second);
+            }
             return BM_DL_FUNCTION_FAILED;
         }
-
-        clientConnections_.emplace(it->first, AiCoreConnChannel{it->second.network.sin_addr, socketHandle});
-        HccpSocketConnectInfo connectInfo;
-        connectInfo.handle = socketHandle;
-        connectInfo.remoteIp.addr = it->second.network.sin_addr;
-        connectInfo.port = it->second.network.sin_port;
-        bzero(connectInfo.tag, sizeof(connectInfo.tag));
-        BM_LOG_DEBUG("add connecting server " << connectInfo);
-        connectInfos.emplace_back(connectInfo);
-        if (qpsPerPeer_ > 1U) {
-            /* extra tagged lanes ride the SAME (ip, port) endpoint and the SAME local handle:
-             * hccp multiplexes connections by tag (proven by the route-A v5 experiment and
-             * matching HCCL's HcclSocketManager wiring). We are the client, so the tag derives
-             * from our own rank. */
-            for (uint32_t lane = 1; lane < qpsPerPeer_; lane++) {
-                HccpSocketConnectInfo extra = connectInfo;
-                MakeLaneTag(extra.tag, sizeof(extra.tag), rankId_, lane);
-                BM_LOG_INFO("multi-QP client: lane " << lane << " entry to rank " << it->first
-                                                        << " tag '" << extra.tag << "'");
-                connectInfos.emplace_back(extra);
-            }
-        }
+        created.emplace_back(it->first, socketHandle);
     }
-
-    /* An empty connect list is a LEGAL TRANSIENT state in dynamic groups, not an error:
-     * the first transport Prepare can fire while no smaller-ranked peer is in the member
-     * table yet -- the FAR contributor's entity only enters the group after the first
-     * extend_remote_mem placement, so with several NEAR ranks joining back-to-back the
-     * low-ranked one reaches this point with only equal/larger peers visible (observed on
-     * the 33/35 cluster: dual example-14 clients, "servers count = 0" -> hccp 128203 ->
-     * join abort). Defer to the incremental path: ConnectNewClientRanks (driven by later
-     * imports) connects the missing peers once they appear. */
-    if (connectInfos.empty()) {
+    if (created.empty()) {
+        /* no smaller-ranked peer in the member table yet (dynamic groups: we are the lowest
+         * rank so far) -- the run-loop connects them as their imports arrive */
         BM_LOG_INFO("no smaller-ranked peers in the member table yet (rank " << rankId_
-                    << " of " << rankCount_ << "), deferring client connections until they join");
+                    << " of " << rankCount_ << "), client connections deferred to background loop");
         clientConnectResult = BM_OK;
         return BM_OK;
     }
-
-    auto ret = DlHccpApi::RaSocketBatchConnect(connectInfos.data(), connectInfos.size());
-    if (ret != 0) {
-        BM_LOG_ERROR("connect to all servers failed: " << ret << ", servers count = " << connectInfos.size());
-        CloseClientConnections();
-        return BM_DL_FUNCTION_FAILED;
+    {
+        std::unique_lock<std::shared_mutex> lock(channelsMutex_);
+        for (auto &entry : created) {
+            auto infoIt = currentRanksInfo_.find(entry.first);
+            clientConnections_.emplace(entry.first,
+                                       AiCoreConnChannel{infoIt->second.network.sin_addr, entry.second});
+        }
     }
-
-    clientConnectThread_ = std::make_shared<std::thread>([this]() {
-        DlAclApi::AclrtSetDevice(deviceId_);
-        auto ret = WaitConnectionsReady(clientConnections_);
-        if (ret != BM_OK) {
-            BM_LOG_ERROR("client wait connections failed: " << ret);
-            CloseClientConnections();
-            return ret;
+    {
+        std::lock_guard<std::mutex> lock(loopMutex_);
+        for (auto &entry : created) {
+            pendingClientRanks_.insert(entry.first);
         }
-
-        ret = CreateQpWaitingReady(clientConnections_);
-        if (ret != BM_OK) {
-            BM_LOG_ERROR("client create qp for AI CORE failed: " << ret);
-            CloseClientConnections();
-            return ret;
-        }
-        clientConnectResult = BM_OK;
-        return 0;
-    });
+    }
+    clientConnectResult = BM_OK;
     return BM_OK;
 }
 
@@ -536,9 +685,10 @@ int FixedRanksQpManager::CheckReadyConnection(std::unordered_map<uint32_t, AiCor
     return BM_OK;
 }
 
-int FixedRanksQpManager::WaitConnectionsReady(std::unordered_map<uint32_t, AiCoreConnChannel> &connections) noexcept
+int FixedRanksQpManager::WaitConnectionsReady(std::unordered_map<uint32_t, AiCoreConnChannel> &connections,
+                                               uint32_t roundBudgetSec) noexcept
 {
-    /* count entries that are ALREADY settled on entry: incremental rounds (ConnectNewClientRanks)
+    /* count entries that are ALREADY settled on entry: establishment rounds
      * re-walk the whole map, and previously settled connections must satisfy the loop condition
      * from the start. Without this base count the loop never terminates once a mixed map settles,
      * and the next RaGetSockets runs on an EMPTY list, which hccp rejects with 128203 -- the fd
@@ -551,11 +701,12 @@ int FixedRanksQpManager::WaitConnectionsReady(std::unordered_map<uint32_t, AiCor
             totalSuccessCount++;
         }
     }
-    /* configurable via MF_CONN_READY_TIMEOUT (seconds, >0); default keeps the historical 2min.
-     * Same rationale as MF_QP_READY_TIMEOUT: peer entity builds sit inside this wait. */
-    const uint32_t connReadyTimeoutSec = MfEnvUtil::GetOptionalUintOrDefault("MF_CONN_READY_TIMEOUT", 120U);
+    /* per-round budget: the establishment loops call this with a SHORT budget (default 5s,
+     * MF_CONN_ROUND_TIMEOUT) so a lost whitelist race is retried within seconds -- the old
+     * 2-minute default made sense when this ran on the group-handler stack, which it must
+     * never do again (see the class comment). The round budget, not patience, heals races. */
     auto start = std::chrono::steady_clock::now();
-    auto timeout = start + std::chrono::seconds(connReadyTimeoutSec);
+    auto timeout = start + std::chrono::seconds(roundBudgetSec);
     while (totalSuccessCount < connections.size()) {
         if (std::chrono::steady_clock::now() >= timeout) {
             std::string pending;
@@ -564,8 +715,8 @@ int FixedRanksQpManager::WaitConnectionsReady(std::unordered_map<uint32_t, AiCor
                     pending += std::to_string(it->first) + " ";
                 }
             }
-            BM_LOG_ERROR("waiting connection ready timeout after " << connReadyTimeoutSec
-                        << "s (MF_CONN_READY_TIMEOUT), " << (connections.size() - totalSuccessCount)
+            BM_LOG_ERROR("waiting connection ready timeout after " << roundBudgetSec
+                        << "s round budget, " << (connections.size() - totalSuccessCount)
                         << " peer(s) not ready: " << pending);
             return BM_ERROR;
         }
@@ -613,11 +764,12 @@ int FixedRanksQpManager::WaitConnectionsReady(std::unordered_map<uint32_t, AiCor
     return BM_OK;
 }
 
-int FixedRanksQpManager::CreateQpWaitingReady(std::unordered_map<uint32_t, AiCoreConnChannel> &connections) noexcept
+int FixedRanksQpManager::CreateQpWaitingReady(std::unordered_map<uint32_t, AiCoreConnChannel> &connections,
+                                               uint32_t roundBudgetSec) noexcept
 {
     const bool clientSide = (&connections == &clientConnections_);
     /* lane 0: legacy primary connections, one QP per rank; skip entries whose QP already
-     * exists -- incremental rounds (ConnectNewClientRanks) re-walk the whole map */
+     * exists -- establishment rounds re-walk the whole map */
     for (auto it = connections.begin(); it != connections.end(); ++it) {
         if (it->second.qpHandle[0] != nullptr) {
             continue;
@@ -694,14 +846,11 @@ int FixedRanksQpManager::CreateQpWaitingReady(std::unordered_map<uint32_t, AiCor
         }
     }
 
-    /* configurable via MF_QP_READY_TIMEOUT (seconds, >0); default 180s. The old hardcoded
-     * 60s was too tight for multi-FAR pools: the peer's entity build (device init + pool
-     * mmap/first-touch + MR) runs inside this handshake's critical path (~90s for 2x100GB
-     * on the FSDP dual-FAR cluster), so the late joiner's QP wait expired (BM_TIMEOUT=-7)
-     * while the FAR was still building. Mirror of the MF_GROUP_JOIN_MAX_TIMEOUT knob. */
-    const uint32_t qpReadyTimeoutSec = MfEnvUtil::GetOptionalUintOrDefault("MF_QP_READY_TIMEOUT", 180U);
+    /* per-round budget (same semantics as WaitConnectionsReady's): short by default so the
+     * loop retries quickly; the old 60s/180s hard/long waits belonged to the handler-stack
+     * era and only delayed self-healing of the whitelist race */
     auto start = std::chrono::steady_clock::now();
-    auto timeout = start + std::chrono::seconds(qpReadyTimeoutSec);
+    auto timeout = start + std::chrono::seconds(roundBudgetSec);
     while (std::chrono::steady_clock::now() < timeout) {
         int connectingCount = 0;
         for (auto it = connections.begin(); it != connections.end(); ++it) {
@@ -734,8 +883,8 @@ int FixedRanksQpManager::CreateQpWaitingReady(std::unordered_map<uint32_t, AiCor
             }
         }
     }
-    BM_LOG_ERROR("QP ready wait timed out after " << qpReadyTimeoutSec
-                << "s (MF_QP_READY_TIMEOUT), stuck peers [rank:lane=status]: " << stuck);
+    BM_LOG_ERROR("QP ready wait timed out after " << roundBudgetSec
+                << "s round budget, stuck peers [rank:lane=status]: " << stuck);
     return BM_TIMEOUT;
 }
 
@@ -765,6 +914,9 @@ int FixedRanksQpManager::FillQpInfo() noexcept
         BM_LOG_WARN("fill qp info skipped: qp table not reserved yet");
         return BM_ERROR;
     }
+    /* channel maps are structure-mutated by the establishment loops; snapshot-read under the
+     * shared lock. Callers must NOT hold channelsMutex_ (none does) */
+    std::shared_lock<std::shared_mutex> channelsLock(channelsMutex_);
     std::vector<uint8_t> qpInfoBuffer(qpInfoSize_);
     auto copyInfo = (AiQpRMAQueueInfo *)(void *)qpInfoBuffer.data();
     /* count = QP lanes per connection; the sq/rq/scq/rcq arrays are indexed
@@ -888,6 +1040,10 @@ void FixedRanksQpManager::CopyAiCQInfo(struct AiQpRMACQ &dest, const ai_data_pla
 
 void FixedRanksQpManager::CloseServices() noexcept
 {
+    /* stop the establishment loops first so no worker touches the channel maps while we
+     * tear them down; the cv wake shortens the idle park to at most one 300ms tick */
+    running_.store(false);
+    loopCv_.notify_all();
     if (serverConnectThread_ != nullptr) {
         serverConnectThread_->join();
         serverConnectThread_ = nullptr;

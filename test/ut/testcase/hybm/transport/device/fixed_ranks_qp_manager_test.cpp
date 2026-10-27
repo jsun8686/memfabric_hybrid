@@ -1178,7 +1178,7 @@ TEST(FixedRanksQpManagerTestTest, WaitConnectionsReadySuccess)
     void* socketHandle = reinterpret_cast<void*>(0x1234UL);
     connections.emplace(0, FixedRanksQpManagerTest::AiCoreConnChannel(ip, socketHandle));
 
-    EXPECT_EQ(manager.WaitConnectionsReady(connections), BM_OK);
+    EXPECT_EQ(manager.WaitConnectionsReady(connections, 5U), BM_OK);
     auto pos = connections.find(0);
     ASSERT_NE(pos, connections.end());
     EXPECT_NE(pos->second.socketFd[0], nullptr);
@@ -1201,7 +1201,7 @@ TEST(FixedRanksQpManagerTestTest, WaitConnectionsReadyFailWhenRaGetSocketsFail)
     inet_aton("192.168.1.1", &ip);
     connections.emplace(0, FixedRanksQpManagerTest::AiCoreConnChannel(ip, reinterpret_cast<void*>(0x1234UL)));
 
-    EXPECT_EQ(manager.WaitConnectionsReady(connections), BM_DL_FUNCTION_FAILED);
+    EXPECT_EQ(manager.WaitConnectionsReady(connections, 5U), BM_DL_FUNCTION_FAILED);
 }
 
 TEST(FixedRanksQpManagerTestTest, FillQpInfoOnlySelfMrSuccess)
