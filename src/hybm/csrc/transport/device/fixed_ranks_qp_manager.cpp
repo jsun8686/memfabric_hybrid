@@ -12,10 +12,12 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <string>
 #include <vector>
 #include "hybm_logger.h"
 #include "dl_acl_api.h"
 #include "dl_hccp_api.h"
+#include "mf_env_util.h"
 #include "fixed_ranks_qp_manager.h"
 
 namespace ock {
@@ -549,11 +551,22 @@ int FixedRanksQpManager::WaitConnectionsReady(std::unordered_map<uint32_t, AiCor
             totalSuccessCount++;
         }
     }
+    /* configurable via MF_CONN_READY_TIMEOUT (seconds, >0); default keeps the historical 2min.
+     * Same rationale as MF_QP_READY_TIMEOUT: peer entity builds sit inside this wait. */
+    const uint32_t connReadyTimeoutSec = MfEnvUtil::GetOptionalUintOrDefault("MF_CONN_READY_TIMEOUT", 120U);
     auto start = std::chrono::steady_clock::now();
-    auto timeout = start + std::chrono::minutes(2);
+    auto timeout = start + std::chrono::seconds(connReadyTimeoutSec);
     while (totalSuccessCount < connections.size()) {
         if (std::chrono::steady_clock::now() >= timeout) {
-            BM_LOG_ERROR("waiting connection ready timeout.");
+            std::string pending;
+            for (auto it = connections.begin(); it != connections.end(); ++it) {
+                if (it->second.socketFd[0] == nullptr) {
+                    pending += std::to_string(it->first) + " ";
+                }
+            }
+            BM_LOG_ERROR("waiting connection ready timeout after " << connReadyTimeoutSec
+                        << "s (MF_CONN_READY_TIMEOUT), " << (connections.size() - totalSuccessCount)
+                        << " peer(s) not ready: " << pending);
             return BM_ERROR;
         }
 
@@ -681,8 +694,14 @@ int FixedRanksQpManager::CreateQpWaitingReady(std::unordered_map<uint32_t, AiCor
         }
     }
 
+    /* configurable via MF_QP_READY_TIMEOUT (seconds, >0); default 180s. The old hardcoded
+     * 60s was too tight for multi-FAR pools: the peer's entity build (device init + pool
+     * mmap/first-touch + MR) runs inside this handshake's critical path (~90s for 2x100GB
+     * on the FSDP dual-FAR cluster), so the late joiner's QP wait expired (BM_TIMEOUT=-7)
+     * while the FAR was still building. Mirror of the MF_GROUP_JOIN_MAX_TIMEOUT knob. */
+    const uint32_t qpReadyTimeoutSec = MfEnvUtil::GetOptionalUintOrDefault("MF_QP_READY_TIMEOUT", 180U);
     auto start = std::chrono::steady_clock::now();
-    auto timeout = start + std::chrono::minutes(1);
+    auto timeout = start + std::chrono::seconds(qpReadyTimeoutSec);
     while (std::chrono::steady_clock::now() < timeout) {
         int connectingCount = 0;
         for (auto it = connections.begin(); it != connections.end(); ++it) {
@@ -704,6 +723,19 @@ int FixedRanksQpManager::CreateQpWaitingReady(std::unordered_map<uint32_t, AiCor
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
+    /* fail loudly with the stuck peer list: one not-ready lane stalls the whole mesh, and
+     * "which peer" was the missing bit of evidence in the FSDP -7 post-mortem */
+    std::string stuck;
+    for (auto it = connections.begin(); it != connections.end(); ++it) {
+        for (uint32_t lane = 0; lane < qpsPerPeer_; lane++) {
+            if (it->second.qpStatus[lane] != 1) {
+                stuck += std::to_string(it->first) + ":L" + std::to_string(lane) + "=" +
+                         std::to_string(it->second.qpStatus[lane]) + " ";
+            }
+        }
+    }
+    BM_LOG_ERROR("QP ready wait timed out after " << qpReadyTimeoutSec
+                << "s (MF_QP_READY_TIMEOUT), stuck peers [rank:lane=status]: " << stuck);
     return BM_TIMEOUT;
 }
 
