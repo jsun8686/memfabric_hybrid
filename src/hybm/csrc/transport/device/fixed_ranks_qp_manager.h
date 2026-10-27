@@ -55,6 +55,10 @@ private:
     void ReleaseQpInfoSpace() noexcept;
     int StartServerSide() noexcept;
     int StartClientSide() noexcept;
+    /* catch up with peers that joined AFTER Startup: connect out to smaller-ranked ones
+     * (client side) and extend the accept whitelist for larger-ranked ones (server side);
+     * called from the started_ branch of SetRemoteRankInfo on every import round */
+    void ConnectNewClientRanks() noexcept;
     int GenerateWhiteList() noexcept;
     int WaitConnectionsReady(std::unordered_map<uint32_t, AiCoreConnChannel> &connections) noexcept;
     int CheckReadyConnection(std::unordered_map<uint32_t, AiCoreConnChannel> &connections,

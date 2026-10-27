@@ -60,6 +60,7 @@ int FixedRanksQpManager::SetRemoteRankInfo(const std::unordered_map<uint32_t, Co
         for (auto it = ranks.begin(); it != ranks.end(); ++it) {
             currentRanksInfo_.insert_or_assign(it->first, it->second);
         }
+        ConnectNewClientRanks();
         DlAclApi::AclrtSetDevice(deviceId_);
         if (FillQpInfo() != BM_OK) {
             BM_LOG_WARN("refresh qp info after rank update failed; deferred to connect worker");
@@ -69,6 +70,132 @@ int FixedRanksQpManager::SetRemoteRankInfo(const std::unordered_map<uint32_t, Co
 
     currentRanksInfo_ = ranks;
     return BM_OK;
+}
+
+void FixedRanksQpManager::ConnectNewClientRanks() noexcept
+{
+    /* dynamic groups may introduce peers AFTER this manager already started: the FAR
+     * contributor's entity only enters the group after the first extend_remote_mem
+     * placement, typically after every NEAR rank finished its own create-join (example 14
+     * dual-client / FSDP multi-rank). Catch up on both directions here:
+     *  - smaller-ranked peers: I am the client, connect out to them now;
+     *  - larger-ranked peers: I am the server, extend the accept whitelist so their
+     *    connect attempt is not rejected.
+     * Synchronous by design: those peers joined before this import reached us, so their
+     * listen side is already up and the batch connect completes in milliseconds. */
+    std::vector<HccpSocketWhiteListInfo> whitelist;
+    std::vector<std::pair<uint32_t, sockaddr_in>> connectTargets;
+    const bool serverWorkerLive = (serverConnectThread_ != nullptr);
+    for (auto it = currentRanksInfo_.begin(); it != currentRanksInfo_.end(); ++it) {
+        const bool knownClient = clientConnections_.find(it->first) != clientConnections_.end();
+        const bool knownServer = serverConnections_.find(it->first) != serverConnections_.end();
+        if (it->first < rankId_ && !knownClient) {
+            connectTargets.emplace_back(it->first, it->second.network);
+        } else if (it->first > rankId_ && !knownServer && serverSocketHandle_ != nullptr) {
+            if (serverWorkerLive) {
+                /* the first-round server worker is still walking serverConnections_ --
+                 * mutating it now would corrupt its iteration; the next import retries */
+                continue;
+            }
+            HccpSocketWhiteListInfo info{};
+            info.remoteIp.addr = it->second.network.sin_addr;
+            info.connLimit = rankCount_;
+            bzero(info.tag, sizeof(info.tag));
+            whitelist.emplace_back(info);
+            serverConnections_.emplace(it->first, AiCoreConnChannel{info.remoteIp.addr, serverSocketHandle_});
+            for (uint32_t lane = 1; lane < qpsPerPeer_; lane++) {
+                HccpSocketWhiteListInfo extra{};
+                extra.remoteIp.addr = it->second.network.sin_addr;
+                extra.connLimit = rankCount_;
+                MakeLaneTag(extra.tag, sizeof(extra.tag), it->first, lane);
+                whitelist.emplace_back(extra);
+            }
+        }
+    }
+    if (!whitelist.empty()) {
+        auto ret = DlHccpApi::RaSocketWhiteListAdd(serverSocketHandle_, whitelist.data(), whitelist.size());
+        if (ret != 0) {
+            BM_LOG_WARN("incremental whitelist add failed: " << ret
+                          << " (the peer's connect will be rejected this round; next import retries)");
+        }
+    }
+    if (connectTargets.empty()) {
+        return;
+    }
+    if (clientConnectThread_ != nullptr) {
+        /* the first-round connect worker is still running (WaitingConnectionReady not called
+         * yet) -- touching clientConnections_ concurrently would corrupt the iteration; the
+         * next import (every UpdateRankOptions round) retries */
+        BM_LOG_WARN("client connect worker still running, deferring incremental connect of "
+                    << connectTargets.size() << " peer(s) to the next import");
+        return;
+    }
+
+    std::vector<HccpSocketConnectInfo> connectInfos;
+    for (auto &target : connectTargets) {
+        auto socketHandle = CreateLocalSocket();
+        if (socketHandle == nullptr) {
+            BM_LOG_WARN("create local socket for rank " << target.first << " failed; next import retries");
+            continue;
+        }
+        clientConnections_.emplace(target.first, AiCoreConnChannel{target.second.sin_addr, socketHandle});
+        HccpSocketConnectInfo connectInfo{};
+        connectInfo.handle = socketHandle;
+        connectInfo.remoteIp.addr = target.second.sin_addr;
+        connectInfo.port = target.second.sin_port;
+        bzero(connectInfo.tag, sizeof(connectInfo.tag));
+        connectInfos.emplace_back(connectInfo);
+        if (qpsPerPeer_ > 1U) {
+            for (uint32_t lane = 1; lane < qpsPerPeer_; lane++) {
+                HccpSocketConnectInfo extra = connectInfo;
+                MakeLaneTag(extra.tag, sizeof(extra.tag), rankId_, lane);
+                connectInfos.emplace_back(extra);
+            }
+        }
+    }
+    if (connectInfos.empty()) {
+        return;
+    }
+
+    auto ret = DlHccpApi::RaSocketBatchConnect(connectInfos.data(), connectInfos.size());
+    if (ret != 0) {
+        /* nothing was established -- drop the half-added entries so the next import retries */
+        for (auto &target : connectTargets) {
+            clientConnections_.erase(target.first);
+        }
+        BM_LOG_WARN("incremental batch connect failed: " << ret << " (next import retries)");
+        return;
+    }
+
+    DlAclApi::AclrtSetDevice(deviceId_);
+    /* WaitConnectionsReady skips entries that are already ready, and CreateQpWaitingReady
+     * skips lanes whose QP exists, so re-walking the whole map is safe for the old entries */
+    if (WaitConnectionsReady(clientConnections_) != BM_OK) {
+        BM_LOG_WARN("incremental client connections not ready in time; deferred to connect worker");
+        return;
+    }
+    if (CreateQpWaitingReady(clientConnections_) != BM_OK) {
+        BM_LOG_WARN("create QP for incrementally connected peer(s) failed; WaitQpReady reports");
+        return;
+    }
+    BM_LOG_INFO("incremental client connections established for " << connectTargets.size() << " peer(s)");
+
+    /* server side: the newly whitelisted larger peers connect TO us; poll their accept
+     * state and build their QPs here too (the first-round server worker already exited
+     * after WaitingConnectionReady, nobody else would). The peer's own incremental client
+     * connect happens on its import round, milliseconds away. */
+    if (!whitelist.empty()) {
+        if (WaitConnectionsReady(serverConnections_) != BM_OK) {
+            BM_LOG_WARN("incremental server accepts not ready in time; deferred to connect worker");
+            return;
+        }
+        if (CreateQpWaitingReady(serverConnections_) != BM_OK) {
+            BM_LOG_WARN("create QP for incrementally accepted peer(s) failed; WaitQpReady reports");
+            return;
+        }
+        BM_LOG_INFO("incremental server connections established for " << whitelist.size() / qpsPerPeer_
+                    << " peer(s)");
+    }
 }
 
 int FixedRanksQpManager::Startup(void *rdma) noexcept
@@ -282,6 +409,21 @@ int FixedRanksQpManager::StartClientSide() noexcept
         }
     }
 
+    /* An empty connect list is a LEGAL TRANSIENT state in dynamic groups, not an error:
+     * the first transport Prepare can fire while no smaller-ranked peer is in the member
+     * table yet -- the FAR contributor's entity only enters the group after the first
+     * extend_remote_mem placement, so with several NEAR ranks joining back-to-back the
+     * low-ranked one reaches this point with only equal/larger peers visible (observed on
+     * the 33/35 cluster: dual example-14 clients, "servers count = 0" -> hccp 128203 ->
+     * join abort). Defer to the incremental path: ConnectNewClientRanks (driven by later
+     * imports) connects the missing peers once they appear. */
+    if (connectInfos.empty()) {
+        BM_LOG_INFO("no smaller-ranked peers in the member table yet (rank " << rankId_
+                    << " of " << rankCount_ << "), deferring client connections until they join");
+        clientConnectResult = BM_OK;
+        return BM_OK;
+    }
+
     auto ret = DlHccpApi::RaSocketBatchConnect(connectInfos.data(), connectInfos.size());
     if (ret != 0) {
         BM_LOG_ERROR("connect to all servers failed: " << ret << ", servers count = " << connectInfos.size());
@@ -445,8 +587,12 @@ int FixedRanksQpManager::WaitConnectionsReady(std::unordered_map<uint32_t, AiCor
 int FixedRanksQpManager::CreateQpWaitingReady(std::unordered_map<uint32_t, AiCoreConnChannel> &connections) noexcept
 {
     const bool clientSide = (&connections == &clientConnections_);
-    /* lane 0: legacy primary connections, one QP per rank */
+    /* lane 0: legacy primary connections, one QP per rank; skip entries whose QP already
+     * exists -- incremental rounds (ConnectNewClientRanks) re-walk the whole map */
     for (auto it = connections.begin(); it != connections.end(); ++it) {
+        if (it->second.qpHandle[0] != nullptr) {
+            continue;
+        }
         auto ret = CreateOneQp(it->second, 0);
         if (ret != 0) {
             BM_LOG_ERROR("create QP  to " << it->first << " failed: " << ret);
@@ -469,6 +615,9 @@ int FixedRanksQpManager::CreateQpWaitingReady(std::unordered_map<uint32_t, AiCor
             auto &channel = it->second;
             const uint32_t clientRank = clientSide ? rankId_ : it->first;
             for (uint32_t lane = 1; lane < qpsPerPeer_; lane++) {
+                if (channel.qpHandle[lane] != nullptr) {
+                    continue; /* already created by an earlier round (incremental path) */
+                }
                 char tag[64];
                 MakeLaneTag(tag, sizeof(tag), clientRank, lane);
                 void *laneFd = nullptr;
