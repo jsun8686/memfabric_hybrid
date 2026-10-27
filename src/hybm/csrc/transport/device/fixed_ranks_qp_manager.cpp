@@ -536,7 +536,19 @@ int FixedRanksQpManager::CheckReadyConnection(std::unordered_map<uint32_t, AiCor
 
 int FixedRanksQpManager::WaitConnectionsReady(std::unordered_map<uint32_t, AiCoreConnChannel> &connections) noexcept
 {
+    /* count entries that are ALREADY settled on entry: incremental rounds (ConnectNewClientRanks)
+     * re-walk the whole map, and previously settled connections must satisfy the loop condition
+     * from the start. Without this base count the loop never terminates once a mixed map settles,
+     * and the next RaGetSockets runs on an EMPTY list, which hccp rejects with 128203 -- the fd
+     * WAS ready but the caller treated it as failure and skipped QP creation, deadlocking the
+     * whole join barrier (observed on the dual-client run: peer connect to (0) ready followed
+     * by role(1) get sockets failed: 128203). */
     uint32_t totalSuccessCount = 0;
+    for (auto it = connections.begin(); it != connections.end(); ++it) {
+        if (it->second.socketFd[0] != nullptr) {
+            totalSuccessCount++;
+        }
+    }
     auto start = std::chrono::steady_clock::now();
     auto timeout = start + std::chrono::minutes(2);
     while (totalSuccessCount < connections.size()) {
@@ -561,6 +573,10 @@ int FixedRanksQpManager::WaitConnectionsReady(std::unordered_map<uint32_t, AiCor
             bzero(info.tag, sizeof(info.tag));
             socketInfos.push_back(info);
             addr2index.emplace(it->second.remoteIp.s_addr, it->first);
+        }
+        if (socketInfos.empty()) {
+            /* nothing left to query this round (settled by the base count above) */
+            continue;
         }
 
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
