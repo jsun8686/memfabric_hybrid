@@ -83,8 +83,14 @@ private:
      * pending so the next round retries -- this is what heals the whitelist race */
     void ClientRunLoop() noexcept;
     void ServerRunLoop() noexcept;
-    void ClientSideCatchUp(const std::set<uint32_t> &targets) noexcept;
-    void ServerSideCatchUp(const std::set<uint32_t> &targets) noexcept;
+    /* one establishment round; returns true when every target rank's channel completed.
+     * false = failed round: the caller backs off and retries (ranks stay pending) */
+    bool ClientSideCatchUp(const std::set<uint32_t> &targets) noexcept;
+    bool ServerSideCatchUp(const std::set<uint32_t> &targets) noexcept;
+    /* full teardown of half-built/broken channels of the targets: destroy lane QPs, close
+     * their fds, deinit the client-side connect handle, erase the entries -- the next round
+     * rebuilds from scratch. Keeps fully-established channels untouched */
+    void RecycleChannels(const std::set<uint32_t> &targets, bool serverSide) noexcept;
     bool RankMeshReady(uint32_t rankId) const noexcept;
     /* roundBudgetSec bounds one establishment round (see ClientSideCatchUp): short waits +
      * retries heal races, long handler-stack waits deadlocked the group protocol */

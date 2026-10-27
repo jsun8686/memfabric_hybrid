@@ -123,7 +123,11 @@ void FixedRanksQpManager::ClientRunLoop() noexcept
         }
         auto targets = pendingClientRanks_;
         lock.unlock();
-        ClientSideCatchUp(targets);
+        if (!ClientSideCatchUp(targets)) {
+            /* failed round: back off briefly so a persistent failure (peer down / driver
+             * error) does not turn into a 300ms log storm; the pending set still retries */
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
     }
 }
 
@@ -141,7 +145,10 @@ void FixedRanksQpManager::ServerRunLoop() noexcept
         }
         auto targets = pendingServerRanks_;
         lock.unlock();
-        ServerSideCatchUp(targets);
+        if (!ServerSideCatchUp(targets)) {
+            /* failed round: back off (same rationale as the client loop) */
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
     }
 }
 
@@ -154,7 +161,7 @@ uint32_t FixedRanksQpManager::RoundBudgetSec() noexcept
     return budget == 0U ? 1U : budget;
 }
 
-void FixedRanksQpManager::ClientSideCatchUp(const std::set<uint32_t> &targets) noexcept
+bool FixedRanksQpManager::ClientSideCatchUp(const std::set<uint32_t> &targets) noexcept
 {
     /* one establishment round for the pending smaller-ranked peers:
      *  1. ranks without a channel yet: create the local socket handle + issue the batch
@@ -207,7 +214,7 @@ void FixedRanksQpManager::ClientSideCatchUp(const std::set<uint32_t> &targets) n
             }
         }
         if (connectInfos.empty()) {
-            return;
+            return false;
         }
         auto ret = DlHccpApi::RaSocketBatchConnect(connectInfos.data(), connectInfos.size());
         if (ret != 0) {
@@ -215,7 +222,7 @@ void FixedRanksQpManager::ClientSideCatchUp(const std::set<uint32_t> &targets) n
             for (auto handle : createdHandles) {
                 (void)DlHccpApi::RaSocketDeinit(handle);
             }
-            return;
+            return false;
         }
         {
             std::unique_lock<std::shared_mutex> lock(channelsMutex_);
@@ -233,23 +240,16 @@ void FixedRanksQpManager::ClientSideCatchUp(const std::set<uint32_t> &targets) n
     DlAclApi::AclrtSetDevice(deviceId_);
     const uint32_t roundBudget = RoundBudgetSec();
     if (WaitConnectionsReady(clientConnections_, roundBudget) != BM_OK) {
-        BM_LOG_WARN("client round: connections not ready in time; dropping unready channels"
-                    " so the next round re-issues their connects");
-        std::unique_lock<std::shared_mutex> lock(channelsMutex_);
-        for (auto rank : targets) {
-            auto it = clientConnections_.find(rank);
-            if (it != clientConnections_.end() && it->second.socketFd[0] == nullptr) {
-                if (it->second.socketHandle != nullptr) {
-                    (void)DlHccpApi::RaSocketDeinit(it->second.socketHandle);
-                }
-                clientConnections_.erase(it);
-            }
-        }
-        return;
+        BM_LOG_WARN("client round: connections not ready in time; recycling half-built channels"
+                    " so the next round re-issues fresh connects");
+        RecycleChannels(targets, false);
+        return false;
     }
     if (CreateQpWaitingReady(clientConnections_, roundBudget) != BM_OK) {
-        BM_LOG_WARN("client round: QP create/wait failed; ranks stay pending for retry");
-        return;
+        BM_LOG_WARN("client round: QP create/wait failed; recycling half-built channels for a"
+                    " fresh rebuild (a broken QP handle must not survive the round)");
+        RecycleChannels(targets, false);
+        return false;
     }
     if (FillQpInfo() != BM_OK) {
         BM_LOG_WARN("client round: refresh qp info failed; deferred to next round");
@@ -265,9 +265,10 @@ void FixedRanksQpManager::ClientSideCatchUp(const std::set<uint32_t> &targets) n
         stillPending = pendingClientRanks_.size();
     }
     BM_LOG_INFO("client round: connections established, " << stillPending << " peer(s) still pending");
+    return true;
 }
 
-void FixedRanksQpManager::ServerSideCatchUp(const std::set<uint32_t> &targets) noexcept
+bool FixedRanksQpManager::ServerSideCatchUp(const std::set<uint32_t> &targets) noexcept
 {
     /* one establishment round for the pending larger-ranked peers: whitelist their IPs
      * (idempotent -- only newly emplaced channels generate whitelist entries), then wait
@@ -275,6 +276,7 @@ void FixedRanksQpManager::ServerSideCatchUp(const std::set<uint32_t> &targets) n
      * the not-yet-updated whitelist retries on ITS side; our whitelist entry persists in
      * hccp, so the next attempt lands. Ranks stay pending until fully established. */
     std::vector<HccpSocketWhiteListInfo> whitelist;
+    std::vector<uint32_t> emplacedRanks;
     {
         std::unique_lock<std::shared_mutex> lock(channelsMutex_);
         for (auto rank : targets) {
@@ -291,6 +293,7 @@ void FixedRanksQpManager::ServerSideCatchUp(const std::set<uint32_t> &targets) n
             bzero(info.tag, sizeof(info.tag));
             whitelist.emplace_back(info);
             serverConnections_.emplace(rank, AiCoreConnChannel{info.remoteIp.addr, serverSocketHandle_});
+            emplacedRanks.emplace_back(rank);
             if (qpsPerPeer_ > 1U) {
                 for (uint32_t lane = 1; lane < qpsPerPeer_; lane++) {
                     HccpSocketWhiteListInfo extra{};
@@ -305,8 +308,15 @@ void FixedRanksQpManager::ServerSideCatchUp(const std::set<uint32_t> &targets) n
     if (!whitelist.empty()) {
         auto ret = DlHccpApi::RaSocketWhiteListAdd(serverSocketHandle_, whitelist.data(), whitelist.size());
         if (ret != 0) {
-            BM_LOG_WARN("server round: whitelist add failed: " << ret << "; retrying next round");
-            return;
+            /* roll the freshly emplaced channels back: a channel whose whitelist entry never
+             * landed would be skipped by every later round (map hit) and never accept */
+            BM_LOG_WARN("server round: whitelist add failed: " << ret << "; rolling back this round's"
+                        " channels so the next round retries them together with the whitelist");
+            std::unique_lock<std::shared_mutex> lock(channelsMutex_);
+            for (auto rank : emplacedRanks) {
+                serverConnections_.erase(rank);
+            }
+            return false;
         }
     }
 
@@ -314,11 +324,12 @@ void FixedRanksQpManager::ServerSideCatchUp(const std::set<uint32_t> &targets) n
     const uint32_t roundBudget = RoundBudgetSec();
     if (WaitConnectionsReady(serverConnections_, roundBudget) != BM_OK) {
         BM_LOG_WARN("server round: accepts not ready in time; ranks stay pending for retry");
-        return;
+        return false;
     }
     if (CreateQpWaitingReady(serverConnections_, roundBudget) != BM_OK) {
-        BM_LOG_WARN("server round: QP create/wait failed; ranks stay pending for retry");
-        return;
+        BM_LOG_WARN("server round: QP create/wait failed; recycling half-built channels for rebuild");
+        RecycleChannels(targets, true);
+        return false;
     }
     if (FillQpInfo() != BM_OK) {
         BM_LOG_WARN("server round: refresh qp info failed; deferred to next round");
@@ -334,6 +345,73 @@ void FixedRanksQpManager::ServerSideCatchUp(const std::set<uint32_t> &targets) n
         stillPending = pendingServerRanks_.size();
     }
     BM_LOG_INFO("server round: connections established, " << stillPending << " peer(s) still pending");
+    return true;
+}
+
+void FixedRanksQpManager::RecycleChannels(const std::set<uint32_t> &targets, bool serverSide) noexcept
+{
+    /* full teardown of the targets' half-built/broken channels: destroy lane QPs, close their
+     * fds, deinit the client-owned connect handle, erase the entries -- the next round then
+     * rebuilds them from scratch (fresh handle -> fresh connect -> fresh QP). Anything less
+     * leaves a poisoned handle that every later round trips over: observed on the FSDP run as
+     * "connect AI QP failed: 228102" followed by an endless "get AI QP status failed: 328107"
+     * retry loop, because re-walks skip entries whose qpHandle is non-null. Fully
+     * established channels (fd + QP + ready status) are kept untouched. */
+    auto &connections = serverSide ? serverConnections_ : clientConnections_;
+    std::vector<HccpSocketCloseInfo> closeInfos;
+    uint32_t recycled = 0;
+    {
+        std::unique_lock<std::shared_mutex> lock(channelsMutex_);
+        for (auto rank : targets) {
+            auto it = connections.find(rank);
+            if (it == connections.end()) {
+                continue;
+            }
+            if (it->second.socketFd[0] != nullptr && it->second.qpHandle[0] != nullptr &&
+                it->second.qpStatus[0] == 1) {
+                continue; /* working channel: keep it */
+            }
+            for (uint32_t lane = 0; lane < qpsPerPeer_; lane++) {
+                if (it->second.qpHandle[lane] != nullptr) {
+                    auto ret = DlHccpApi::RaQpDestroy(it->second.qpHandle[lane]);
+                    if (ret != 0) {
+                        BM_LOG_WARN("recycle: destroy QP lane " << lane << " to rank " << rank
+                                    << " failed: " << ret);
+                    }
+                    it->second.qpHandle[lane] = nullptr;
+                    it->second.qpStatus[lane] = -1;
+                }
+                if (it->second.socketFd[lane] != nullptr) {
+                    HccpSocketCloseInfo info;
+                    info.handle = it->second.socketHandle;
+                    info.fd = it->second.socketFd[lane];
+                    info.linger = 0;
+                    closeInfos.push_back(info);
+                    it->second.socketFd[lane] = nullptr;
+                }
+            }
+            /* same ownership rule as CloseConnections: server channels borrow the shared
+             * listen handle owned by DestroyServerSocket and must not be deinit-ed here */
+            if (it->second.socketHandle != nullptr && it->second.socketHandle != serverSocketHandle_) {
+                auto ret = DlHccpApi::RaSocketDeinit(it->second.socketHandle);
+                if (ret != 0) {
+                    BM_LOG_WARN("recycle: deinit client socket to rank " << rank << " return: " << ret);
+                }
+            }
+            connections.erase(it);
+            recycled++;
+        }
+    }
+    if (!closeInfos.empty()) {
+        auto ret = DlHccpApi::RaSocketBatchClose(closeInfos.data(), closeInfos.size());
+        if (ret != 0) {
+            BM_LOG_INFO("recycle: batch close sockets return: " << ret);
+        }
+    }
+    if (recycled > 0) {
+        BM_LOG_INFO((serverSide ? "server" : "client") << " round: recycled " << recycled
+                    << " half-built channel(s) for a fresh rebuild");
+    }
 }
 
 int FixedRanksQpManager::Startup(void *rdma) noexcept
@@ -748,8 +826,16 @@ int FixedRanksQpManager::WaitConnectionsReady(std::unordered_map<uint32_t, AiCor
         auto role = (&connections == &clientConnections_) ? 1 : 0;
         auto ret = DlHccpApi::RaGetSockets(role, socketInfos.data(), socketInfos.size(), successCount);
         if (ret != 0) {
-            BM_LOG_ERROR("role(" << role << ") side get sockets failed: " << ret);
-            return BM_DL_FUNCTION_FAILED;
+            if (ret == 128203) {
+                /* hccp reports "no completed connection to hand out yet" as this code on the
+                 * server side; in the round model that is ordinary "no progress this poll",
+                 * not an error -- keep polling within the budget (a 300ms WARN storm was
+                 * observed otherwise) */
+                successCount = 0;
+            } else {
+                BM_LOG_ERROR("role(" << role << ") side get sockets failed: " << ret);
+                return BM_DL_FUNCTION_FAILED;
+            }
         }
 
         for (auto i = 0U; i < successCount; i++) {
@@ -778,12 +864,19 @@ int FixedRanksQpManager::CreateQpWaitingReady(std::unordered_map<uint32_t, AiCor
         auto ret = CreateOneQp(it->second, 0);
         if (ret != 0) {
             BM_LOG_ERROR("create QP  to " << it->first << " failed: " << ret);
+            /* a failed create must not leave a stale handle the next round's re-walk
+             * would skip over */
+            it->second.qpHandle[0] = nullptr;
             return BM_DL_FUNCTION_FAILED;
         }
 
         ret = DlHccpApi::RaQpConnectAsync(it->second.qpHandle[0], it->second.socketFd[0]);
         if (ret != 0) {
             BM_LOG_ERROR("connect AI QP to " << it->first << " failed: " << ret);
+            /* destroy on the spot: keeping a connect-failed QP poisons every later poll
+             * (observed: endless get-QP-status 328107 after connect 228102) */
+            (void)DlHccpApi::RaQpDestroy(it->second.qpHandle[0]);
+            it->second.qpHandle[0] = nullptr;
             return BM_DL_FUNCTION_FAILED;
         }
     }
@@ -834,11 +927,14 @@ int FixedRanksQpManager::CreateQpWaitingReady(std::unordered_map<uint32_t, AiCor
                 auto ret = CreateOneQp(channel, lane);
                 if (ret != 0) {
                     BM_LOG_ERROR("create lane " << lane << " QP to " << it->first << " failed: " << ret);
+                    channel.qpHandle[lane] = nullptr; /* same stale-handle rule as lane 0 */
                     return BM_DL_FUNCTION_FAILED;
                 }
                 ret = DlHccpApi::RaQpConnectAsync(channel.qpHandle[lane], laneFd);
                 if (ret != 0) {
                     BM_LOG_ERROR("connect lane " << lane << " QP to " << it->first << " failed: " << ret);
+                    (void)DlHccpApi::RaQpDestroy(channel.qpHandle[lane]);
+                    channel.qpHandle[lane] = nullptr;
                     return BM_DL_FUNCTION_FAILED;
                 }
                 BM_LOG_INFO("multi-QP " << (clientSide ? "client" : "server") << " rank " << it->first
@@ -859,7 +955,13 @@ int FixedRanksQpManager::CreateQpWaitingReady(std::unordered_map<uint32_t, AiCor
                 int status = 0;
                 auto ret = DlHccpApi::RaGetQpStatus(it->second.qpHandle[lane], status);
                 if (ret != 0) {
-                    BM_LOG_ERROR("get AI QP status to " << it->first << " lane " << lane << " failed: " << ret);
+                    BM_LOG_ERROR("get AI QP status to " << it->first << " lane " << lane << " failed: " << ret
+                                << "; dropping the broken QP so the round can recycle the channel");
+                    if (it->second.qpHandle[lane] != nullptr) {
+                        (void)DlHccpApi::RaQpDestroy(it->second.qpHandle[lane]);
+                        it->second.qpHandle[lane] = nullptr;
+                        it->second.qpStatus[lane] = -1;
+                    }
                     return BM_DL_FUNCTION_FAILED;
                 }
                 it->second.qpStatus[lane] = status;
