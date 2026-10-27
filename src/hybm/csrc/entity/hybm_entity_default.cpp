@@ -1202,6 +1202,11 @@ int MemEntityDefault::UpdateHybmDeviceInfo(uint32_t extCtxSize) noexcept
         return BM_OK;
     }
 
+    /* also reached from executor rpc threads (OnJoinAlloc -> ExtendLocalMem -> AllocLocalMemory)
+     * that never bound a device context; AclrtMemcpy fails with 107002 there (multi-client
+     * second+ slice allocation). per-thread one-time bind, same as the other call sites */
+    BM_ASSERT_RETURN(SetThreadAclDevice() == BM_OK, BM_ERROR);
+
     HybmDeviceMeta info;
     auto addr = HYBM_DEVICE_META_ADDR + HYBM_DEVICE_GLOBAL_META_SIZE + id_ * HYBM_DEVICE_PRE_META_SIZE;
 
