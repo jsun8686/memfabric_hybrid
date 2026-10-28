@@ -230,7 +230,7 @@ static void DoPrepareDevice(uint32_t devid, const char *localIp)
         printf("[prepare] RaRdevGetHandle ret=%d handle=%p\n", reuse, rdmaHandle);
     }
     if (rdmaHandle == nullptr) {
-        auto ret = gRaRdevInitV2(info, rdev, rdmaHandle);
+        auto ret = gRaRdevInitV2(info, rdev, &rdmaHandle);
         printf("[prepare] RaRdevInitV2 ret=%d handle=%p\n", ret, rdmaHandle);
         if (ret != 0) {
             Die("RaRdevInitV2 failed (leftover daemon/HCCL holding the device? pkill them first)");
