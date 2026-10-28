@@ -1202,6 +1202,11 @@ int MemEntityDefault::UpdateHybmDeviceInfo(uint32_t extCtxSize) noexcept
         return BM_OK;
     }
 
+    /* rpc worker threads (e.g. an extend handler that only ran AllocLocalMemory on this
+     * thread) land here without a device context and the memcpy below fails with 107002;
+     * bind lazily -- SetThreadAclDevice is thread_local and a no-op after the first call */
+    BM_ASSERT_LOG_AND_RETURN(SetThreadAclDevice() == BM_OK, "Failed to set thread acl device.", BM_ERROR);
+
     HybmDeviceMeta info;
     auto addr = HYBM_DEVICE_META_ADDR + HYBM_DEVICE_GLOBAL_META_SIZE + id_ * HYBM_DEVICE_PRE_META_SIZE;
 

@@ -583,19 +583,20 @@ TEST(RdmaTransportManagerTest, WaitForConnectedNullQpManagerAndErrorAndOk)
 TEST(RdmaTransportManagerTest, WaitQpReadyNullQpManagerAndOkPath)
 {
     RdmaTransportManager mgr;
-    // 功能：在连接建立后检查 qp 是否 ready（带超时循环）。
+    // 功能：连接建立后的 QP 就绪门（委托给 qpManager_->WaitingConnectionReady() 的组门语义）。
     // 使用：Connect()/UpdateRankOptions() 最终都要 WaitQpReady()。
 
     // 1) qpManager_ 为空：BM_MALLOC_FAILED
     EXPECT_EQ(mgr.WaitQpReady(), BM_MALLOC_FAILED);
 
-    // 2) qpManager_->CheckQpReady == true：立即返回 BM_OK（不需要等待超时）
+    // 2) 门的 WaitingConnectionReady 返回 OK（默认 fake 值）：立即返回 BM_OK
     auto qp = std::make_shared<FakeQpManager>();
-    qp->checkQpReadyRet = true;
     mgr.qpManager_ = qp;
-    mgr.rankCount_ = 1;
-    mgr.ranksMRs_.resize(1);  // 供循环安全访问
     EXPECT_EQ(mgr.WaitQpReady(), BM_OK);
+
+    // 3) 门的 WaitingConnectionReady 返回错误：透传
+    qp->waitingReadyRet = BM_TIMEOUT;
+    EXPECT_EQ(mgr.WaitQpReady(), BM_TIMEOUT);
 }
 
 TEST(RdmaTransportManagerTest, UpdateRankOptionsNullQpManagerInvalidNicAndSetRemoteFailAndOk)

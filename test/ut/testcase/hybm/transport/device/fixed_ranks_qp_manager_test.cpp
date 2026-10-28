@@ -324,7 +324,6 @@ public:
     using FixedRanksQpManager::ReserveQpInfoSpace;
     using FixedRanksQpManager::ReleaseQpInfoSpace;
     using FixedRanksQpManager::StartServerSide;
-    using FixedRanksQpManager::StartClientSide;
     using FixedRanksQpManager::GenerateWhiteList;
     using FixedRanksQpManager::WaitConnectionsReady;
     using FixedRanksQpManager::CheckReadyConnection;
@@ -354,13 +353,11 @@ TEST(FixedRanksQpManagerTestTest, ConstructorAndDestructor)
     EXPECT_EQ(manager.rankId_, 0U);
     EXPECT_EQ(manager.rankCount_, 1U);
     EXPECT_FALSE(manager.started_.load());
-    EXPECT_EQ(manager.serverConnectResult, -1);
-    EXPECT_EQ(manager.clientConnectResult, -1);
     EXPECT_EQ(manager.qpInfoSize_, 0U);
     EXPECT_EQ(manager.rdmaHandle_, nullptr);
     EXPECT_EQ(manager.qpInfo_, nullptr);
-    EXPECT_EQ(manager.clientConnectThread_, nullptr);
-    EXPECT_EQ(manager.serverConnectThread_, nullptr);
+    EXPECT_EQ(manager.buildThread_, nullptr);
+    EXPECT_EQ(manager.buildState_, FixedRanksQpManagerTest::BuildState::Idle);
 }
 
 TEST(FixedRanksQpManagerTestTest, SetRemoteRankInfoSuccess)
@@ -399,7 +396,9 @@ TEST(FixedRanksQpManagerTestTest, SetRemoteRankInfoWhenStartedMergesAndRefreshes
     devNet.sin_port = htons(12345);
     devNet.sin_family = AF_INET;
 
-    FixedRanksQpManagerTest manager(0, 0, 2, devNet);
+    /* rankCount=3 (members 0+1 out of 3): the merge branch runs but the group is NOT full,
+     * so SetRemoteRankInfo must NOT spawn the build-once worker (no hccp stubs needed) */
+    FixedRanksQpManagerTest manager(0, 0, 3, devNet);
     /* started without Startup: the qp table is not reserved yet, so the refresh inside the
      * started branch hits the not-reserved guard (benign skip) instead of a null write */
     manager.started_.store(true);
@@ -426,6 +425,8 @@ TEST(FixedRanksQpManagerTestTest, SetRemoteRankInfoWhenStartedMergesAndRefreshes
     /* dynamic-group semantics: already started no longer rejects -- merge + refresh + BM_OK */
     EXPECT_EQ(manager.SetRemoteRankInfo(ranks), BM_OK);
     EXPECT_EQ(manager.currentRanksInfo_.size(), 2U);
+    /* group not full (2/3): no build-once worker may have been spawned */
+    EXPECT_EQ(manager.buildThread_, nullptr);
 }
 
 TEST(FixedRanksQpManagerTestTest, ReserveQpInfoSpaceSuccess)
@@ -703,40 +704,55 @@ TEST(FixedRanksQpManagerTestTest, StartupStartServerSideFailPropagates)
     EXPECT_EQ(manager.Startup(&dummy), BM_DL_FUNCTION_FAILED);
 }
 
-TEST(FixedRanksQpManagerTestTest, StartupStartClientSideFailPropagates)
+TEST(FixedRanksQpManagerTestTest, WaitingConnectionReadyBeforeStartupReturnsError)
 {
     sockaddr_in devNet{};
     inet_aton("127.0.0.1", &devNet.sin_addr);
     devNet.sin_port = htons(12345);
     devNet.sin_family = AF_INET;
 
-    // rankId=1, rankCount=2 -> StartServerSide early returns OK, StartClientSide will try CreateLocalSocket()
-    FixedRanksQpManagerTest manager(0, 1, 2, devNet);
+    FixedRanksQpManagerTest manager(0, 0, 1, devNet);
+    EXPECT_EQ(manager.WaitingConnectionReady(), BM_ERROR);
+}
+
+TEST(FixedRanksQpManagerTestTest, WaitingConnectionReadyPassesThroughWhenGroupNotFull)
+{
+    sockaddr_in devNet{};
+    inet_aton("127.0.0.1", &devNet.sin_addr);
+    devNet.sin_port = htons(12345);
+    devNet.sin_family = AF_INET;
+
+    /* rankId=0/rankCount=2 with only rank 0 present: the group is not full, the gate must
+     * return immediately (non-blocking -- the import chain runs on the group-event thread)
+     * and must NOT have spawned a build worker. StartServerSide needs listen stubs */
+    FixedRanksQpManagerTest manager(0, 0, 2, devNet);
 
     DlAclApiFnGuard aclGuard;
     DlAclApi::pAclrtMalloc = &FakeAclrtMallocOk;
     DlAclApi::pAclrtFree = &FakeAclrtFreeOk;
+    DlAclApi::pAclrtMemcpy = &FakeAclrtMemcpyOk;
 
     DlHccpApiFnGuard hccpGuard;
-    DlHccpApi::gRaSocketInit = &FakeRaSocketInitFail;
+    DlHccpApi::gRaSocketInit = &FakeRaSocketInitOk;
+    DlHccpApi::gRaSocketListenStart = &FakeRaSocketListenStartOk;
+    DlHccpApi::gRaSocketListenStop = &FakeRaSocketListenStopOk;
+    DlHccpApi::gRaSocketDeinit = &FakeRaSocketDeinitOk;
 
     std::unordered_map<uint32_t, ConnectRankInfo> ranks;
-    in_addr ip1, ip2;
-    inet_aton("192.168.1.1", &ip1);
-    inet_aton("192.168.1.2", &ip2);
-    sockaddr_in net1, net2;
-    net1.sin_addr = ip1;
-    net1.sin_port = htons(12345);
-    net1.sin_family = AF_INET;
-    net2.sin_addr = ip2;
-    net2.sin_port = htons(12346);
-    net2.sin_family = AF_INET;
-    ranks.emplace(0, ConnectRankInfo(HYBM_ROLE_PEER, net1, std::vector<TransportMemoryKey>{}));
-    ranks.emplace(1, ConnectRankInfo(HYBM_ROLE_PEER, net2, std::vector<TransportMemoryKey>{}));
+    in_addr ip;
+    inet_aton("192.168.1.1", &ip);
+    sockaddr_in net;
+    net.sin_addr = ip;
+    net.sin_port = htons(12345);
+    net.sin_family = AF_INET;
+    ranks.emplace(0, ConnectRankInfo(HYBM_ROLE_PEER, net, std::vector<TransportMemoryKey>{}));
     ASSERT_EQ(manager.SetRemoteRankInfo(ranks), BM_OK);
 
     int dummy = 0;
-    EXPECT_EQ(manager.Startup(&dummy), BM_DL_FUNCTION_FAILED);
+    ASSERT_EQ(manager.Startup(&dummy), BM_OK);
+    EXPECT_EQ(manager.WaitingConnectionReady(), BM_OK);
+    EXPECT_EQ(manager.buildThread_, nullptr);
+    manager.Shutdown();
 }
 
 TEST(FixedRanksQpManagerTestTest, StartupSuccessSetsStartedAndHandle)
@@ -746,12 +762,14 @@ TEST(FixedRanksQpManagerTestTest, StartupSuccessSetsStartedAndHandle)
     devNet.sin_port = htons(12345);
     devNet.sin_family = AF_INET;
 
-    // rankCount=1 ensures StartServerSide/StartClientSide both early return.
+    // rankCount=1 ensures StartServerSide early returns; the full group (1/1) makes Startup
+    // tail-trigger the build-once worker, whose empty-group path calls FillQpInfo -> memcpy.
     FixedRanksQpManagerTest manager(0, 0, 1, devNet);
 
     DlAclApiFnGuard guard;
     DlAclApi::pAclrtMalloc = &FakeAclrtMallocOk;
     DlAclApi::pAclrtFree = &FakeAclrtFreeOk;
+    DlAclApi::pAclrtMemcpy = &FakeAclrtMemcpyOk;
 
     std::unordered_map<uint32_t, ConnectRankInfo> ranks;
     in_addr ip;
@@ -767,6 +785,10 @@ TEST(FixedRanksQpManagerTestTest, StartupSuccessSetsStartedAndHandle)
     EXPECT_EQ(manager.Startup(&dummy), BM_OK);
     EXPECT_TRUE(manager.started_.load());
     EXPECT_EQ(manager.rdmaHandle_, &dummy);
+    /* join the (async) build worker while the stubs are still installed: the worker's
+     * 1s warm-up sleep is bounded, Shutdown's started_=false makes it bail out */
+    manager.Shutdown();
+    EXPECT_EQ(manager.buildThread_, nullptr);
 }
 
 TEST(FixedRanksQpManagerTestTest, CopyAiWQInfo)
@@ -1525,6 +1547,6 @@ TEST(FixedRanksQpManagerTestTest, CloseServices)
     manager.CloseServices();
     EXPECT_TRUE(manager.clientConnections_.empty());
     EXPECT_TRUE(manager.serverConnections_.empty());
-    EXPECT_EQ(manager.clientConnectThread_, nullptr);
-    EXPECT_EQ(manager.serverConnectThread_, nullptr);
+    EXPECT_EQ(manager.buildThread_, nullptr);
+    EXPECT_FALSE(manager.started_.load());
 }

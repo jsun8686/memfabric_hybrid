@@ -14,6 +14,9 @@
 #define MF_HYBRID_FIXED_RANKS_QP_MANAGER_H
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <thread>
 #include "device_qp_manager.h"
 
@@ -54,8 +57,16 @@ private:
     bool ReserveQpInfoSpace() noexcept;
     void ReleaseQpInfoSpace() noexcept;
     int StartServerSide() noexcept;
-    int StartClientSide() noexcept;
     int GenerateWhiteList() noexcept;
+    /* build-once model: establishment is deferred to the "group full" point (member count ==
+     * rankCount_), the last joiner's group event observed by every member. MaybeTriggerBuild
+     * runs on the group-event thread (microseconds, never waits); BuildOnce owns whitelist ->
+     * warm-up -> connect -> QP -> fill for the WHOLE member table in one background thread,
+     * at most 3 rounds; WaitingConnectionReady gates user threads on the result */
+    void MaybeTriggerBuild() noexcept;
+    void BuildOnce() noexcept;
+    bool LaunchClientConnects() noexcept;
+    void CleanupRound() noexcept;
     int WaitConnectionsReady(std::unordered_map<uint32_t, AiCoreConnChannel> &connections) noexcept;
     int CheckReadyConnection(std::unordered_map<uint32_t, AiCoreConnChannel> &connections,
                              const std::unordered_map<in_addr_t, uint32_t> addr2index,
@@ -71,17 +82,25 @@ private:
     void CloseConnections(std::unordered_map<uint32_t, AiCoreConnChannel> &connections) noexcept;
 
 private:
+    enum class BuildState { Idle, Building, Done, Failed };
+
     std::atomic<bool> started_{false};
-    std::atomic<int> serverConnectResult{-1};
-    std::atomic<int> clientConnectResult{-1};
+    /* guards the STRUCTURE of currentRanksInfo_ and both connection maps across the
+     * group-event thread (SetRemoteRankInfo / FillQpInfo) and the BuildOnce thread. The
+     * BuildOnce wait/QP walks run lock-free: while building it is the only writer of the
+     * connection maps; structural edits (emplace/erase) take the lock */
+    mutable std::mutex mapsMutex_;
     uint32_t qpInfoSize_{0};
     uint32_t qpsPerPeer_{1};
     void *rdmaHandle_{nullptr};
     std::unordered_map<uint32_t, ConnectRankInfo> currentRanksInfo_;
     MemoryRegionMap currentLocalMrs_;
     AiQpRMAQueueInfo *qpInfo_{nullptr};
-    std::shared_ptr<std::thread> clientConnectThread_;
-    std::shared_ptr<std::thread> serverConnectThread_;
+    std::mutex stateMutex_;
+    std::condition_variable stateCv_;
+    BuildState buildState_{BuildState::Idle};
+    std::chrono::steady_clock::time_point lastBuildFailSteady_{};
+    std::shared_ptr<std::thread> buildThread_;
     std::unordered_map<uint32_t, AiCoreConnChannel> clientConnections_;
     std::unordered_map<uint32_t, AiCoreConnChannel> serverConnections_;
 };

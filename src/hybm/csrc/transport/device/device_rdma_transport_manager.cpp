@@ -377,6 +377,18 @@ Result RdmaTransportManager::WaitForConnected(int64_t timeoutNs)
 Result RdmaTransportManager::WaitQpReady()
 {
     BM_ASSERT_RETURN(qpManager_ != nullptr, BM_MALLOC_FAILED);
+    /* gate first: group-full semantics for FixedRanks (pass-through before the group is
+     * full, bounded wait for the one-shot build once full); the base-class default is a
+     * no-op OK for the other managers. Blocking here is safe: this runs on a user thread
+     * (extend / first remote IO), never on the group-event thread */
+    auto gret = qpManager_->WaitingConnectionReady();
+    if (gret != BM_OK) {
+        BM_LOG_ERROR("wait qp ready (group gate) failed: " << gret);
+        return gret;
+    }
+
+    /* then the per-manager readiness poll: a real check for the host plane
+     * (JoinableRanks), immediate for managers without a CheckQpReady override */
     std::vector<uint32_t> rankIds;
     {
         ReadGuard lockGuard(lock_);
