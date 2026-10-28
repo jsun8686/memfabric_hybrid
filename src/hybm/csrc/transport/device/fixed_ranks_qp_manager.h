@@ -70,6 +70,9 @@ private:
                              const HccpSocketInfo &socketInfo) noexcept;
     int CreateQpWaitingReady(std::unordered_map<uint32_t, AiCoreConnChannel> &connections) noexcept;
     int CreateOneQp(AiCoreConnChannel &channel, uint32_t lane) noexcept;
+    /* number of lanes with a ready QP: lets the workers refresh the device table only when
+     * a round actually established something new instead of re-copying it every poll */
+    uint32_t CountReadyLanes(const std::unordered_map<uint32_t, AiCoreConnChannel> &connections) const noexcept;
     int FillQpInfo() noexcept;
     void CopyAiWQInfo(struct AiQpRMAWQ &dest, const struct ai_data_plane_wq &src, DBMode dbMode, uint32_t sl) noexcept;
     void CopyAiCQInfo(struct AiQpRMACQ &dest, const ai_data_plane_cq &source, DBMode dbMode) noexcept;
