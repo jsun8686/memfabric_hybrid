@@ -14,7 +14,6 @@
 #define MF_HYBRID_FIXED_RANKS_QP_MANAGER_H
 
 #include <atomic>
-#include <mutex>
 #include <thread>
 #include "device_qp_manager.h"
 
@@ -32,7 +31,6 @@ public:
     int Startup(void *rdma) noexcept override;
     void Shutdown() noexcept override;
     int WaitingConnectionReady() noexcept override;
-    bool CheckQpReady(const std::vector<uint32_t> &rankIds) const noexcept override;
     const void *GetQpInfoAddress() const noexcept override;
     UserQpInfo *GetQpHandleWithRankId(uint32_t rankId) noexcept override;
     void PutQpHandle(UserQpInfo *qp) const noexcept override;
@@ -57,12 +55,6 @@ private:
     void ReleaseQpInfoSpace() noexcept;
     int StartServerSide() noexcept;
     int StartClientSide() noexcept;
-    /* persistent establishment workers: retry (connect -> wait -> QP) until established or
-     * Shutdown, with short 15s budgets per attempt. The whitelist race means a first connect
-     * can be refused while the peer's incremental whitelist entry is still landing; the retry
-     * lands on the second attempt (whitelists are persistent in hccp) */
-    void ServerWorkerLoop() noexcept;
-    void ClientWorkerLoop() noexcept;
     int GenerateWhiteList() noexcept;
     int WaitConnectionsReady(std::unordered_map<uint32_t, AiCoreConnChannel> &connections) noexcept;
     int CheckReadyConnection(std::unordered_map<uint32_t, AiCoreConnChannel> &connections,
@@ -70,9 +62,6 @@ private:
                              const HccpSocketInfo &socketInfo) noexcept;
     int CreateQpWaitingReady(std::unordered_map<uint32_t, AiCoreConnChannel> &connections) noexcept;
     int CreateOneQp(AiCoreConnChannel &channel, uint32_t lane) noexcept;
-    /* number of lanes with a ready QP: lets the workers refresh the device table only when
-     * a round actually established something new instead of re-copying it every poll */
-    uint32_t CountReadyLanes(const std::unordered_map<uint32_t, AiCoreConnChannel> &connections) const noexcept;
     int FillQpInfo() noexcept;
     void CopyAiWQInfo(struct AiQpRMAWQ &dest, const struct ai_data_plane_wq &src, DBMode dbMode, uint32_t sl) noexcept;
     void CopyAiCQInfo(struct AiQpRMACQ &dest, const ai_data_plane_cq &source, DBMode dbMode) noexcept;
@@ -83,14 +72,8 @@ private:
 
 private:
     std::atomic<bool> started_{false};
-    std::atomic<bool> workersRunning_{false};
     std::atomic<int> serverConnectResult{-1};
     std::atomic<int> clientConnectResult{-1};
-    /* guards the STRUCTURE of currentRanksInfo_ and both connection maps across the
-     * group-event thread (SetRemoteRankInfo / FillQpInfo) and the two workers. A worker's
-     * own wait/QP walks run lock-free: while a worker is alive it is the only writer of its
-     * map (SetRemoteRankInfo only extends the maps when the corresponding worker has exited) */
-    mutable std::mutex mapsMutex_;
     uint32_t qpInfoSize_{0};
     uint32_t qpsPerPeer_{1};
     void *rdmaHandle_{nullptr};

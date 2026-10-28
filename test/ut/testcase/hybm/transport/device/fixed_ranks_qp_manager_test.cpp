@@ -703,6 +703,42 @@ TEST(FixedRanksQpManagerTestTest, StartupStartServerSideFailPropagates)
     EXPECT_EQ(manager.Startup(&dummy), BM_DL_FUNCTION_FAILED);
 }
 
+TEST(FixedRanksQpManagerTestTest, StartupStartClientSideFailPropagates)
+{
+    sockaddr_in devNet{};
+    inet_aton("127.0.0.1", &devNet.sin_addr);
+    devNet.sin_port = htons(12345);
+    devNet.sin_family = AF_INET;
+
+    // rankId=1, rankCount=2 -> StartServerSide early returns OK, StartClientSide will try CreateLocalSocket()
+    FixedRanksQpManagerTest manager(0, 1, 2, devNet);
+
+    DlAclApiFnGuard aclGuard;
+    DlAclApi::pAclrtMalloc = &FakeAclrtMallocOk;
+    DlAclApi::pAclrtFree = &FakeAclrtFreeOk;
+
+    DlHccpApiFnGuard hccpGuard;
+    DlHccpApi::gRaSocketInit = &FakeRaSocketInitFail;
+
+    std::unordered_map<uint32_t, ConnectRankInfo> ranks;
+    in_addr ip1, ip2;
+    inet_aton("192.168.1.1", &ip1);
+    inet_aton("192.168.1.2", &ip2);
+    sockaddr_in net1, net2;
+    net1.sin_addr = ip1;
+    net1.sin_port = htons(12345);
+    net1.sin_family = AF_INET;
+    net2.sin_addr = ip2;
+    net2.sin_port = htons(12346);
+    net2.sin_family = AF_INET;
+    ranks.emplace(0, ConnectRankInfo(HYBM_ROLE_PEER, net1, std::vector<TransportMemoryKey>{}));
+    ranks.emplace(1, ConnectRankInfo(HYBM_ROLE_PEER, net2, std::vector<TransportMemoryKey>{}));
+    ASSERT_EQ(manager.SetRemoteRankInfo(ranks), BM_OK);
+
+    int dummy = 0;
+    EXPECT_EQ(manager.Startup(&dummy), BM_DL_FUNCTION_FAILED);
+}
+
 TEST(FixedRanksQpManagerTestTest, StartupSuccessSetsStartedAndHandle)
 {
     sockaddr_in devNet{};
