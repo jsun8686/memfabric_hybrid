@@ -300,7 +300,7 @@ int main(int argc, char **argv)
             HccpSocketInfoT info{};
             info.handle = sock;
             info.fd = nullptr;
-            info.remoteIp.addr = conn.remoteIp.addr.s_addr;
+            info.remoteIp.addr = conn.remoteIp.addr;
             info.status = 0;
             uint32_t cnt = 0;
             auto gret = gRaGetSockets(1 /* role=1 client side */, &info, 1, &cnt);
