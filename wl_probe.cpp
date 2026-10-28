@@ -104,6 +104,7 @@ static int (*gRaSocketBatchConnect)(HccpSocketConnectInfoT *, uint32_t) = nullpt
 static int (*gRaGetSockets)(uint32_t, HccpSocketInfoT *, uint32_t, uint32_t *) = nullptr;
 static int (*gRaSetWhiteListStatus)(uint32_t) = nullptr;
 static int (*gRaGetWhiteListStatus)(uint32_t *) = nullptr;
+static void *gTsd = nullptr;
 static uint32_t (*gTsdOpen)(uint32_t, uint32_t) = nullptr;
 static int (*gRaRdevGetHandle)(uint32_t, void **) = nullptr;
 static int (*gRaRdevInitV2)(HccpRdevInitInfoT, HccpRdevT, void **) = nullptr;
@@ -149,13 +150,21 @@ static void LoadLibra()
         (int (*)(uint32_t, HccpSocketInfoT *, uint32_t, uint32_t *))Sym("RaGetSockets", "ra_get_sockets");
     gRaSetWhiteListStatus = (int (*)(uint32_t))Sym("RaSocketSetWhiteListStatus", "ra_socket_set_white_list_status");
     gRaGetWhiteListStatus = (int (*)(uint32_t *))Sym("RaSocketGetWhiteListStatus", "ra_socket_get_white_list_status");
-    gTsdOpen = (uint32_t (*)(uint32_t, uint32_t))Sym("TsdOpen", "tsd_open");
     gRaRdevGetHandle = (int (*)(uint32_t, void **))Sym("RaRdevGetHandle", "ra_rdev_get_handle");
     gRaRdevInitV2 = (int (*)(HccpRdevInitInfoT, HccpRdevT, void **))Sym("RaRdevInitV2", "ra_rdev_init_v2");
 
+    /* TsdOpen lives in a SEPARATE library (product: dlopen("libtsdclient.so")),
+     * not in libra.so -- resolve it from there; absence is a warning, not fatal:
+     * whether RaInit really needs it is exactly one of the things under test */
+    gTsd = dlopen("libtsdclient.so", RTLD_NOW);
+    if (gTsd != nullptr) {
+        gTsdOpen = (uint32_t (*)(uint32_t, uint32_t))dlsym(gTsd, "TsdOpen");
+    }
+    printf("[probe] libtsdclient.so: %s  TsdOpen: %s\n", gTsd != nullptr ? "loaded" : "NOT FOUND",
+           gTsdOpen != nullptr ? "FOUND" : "MISSING");
+
     if (gRaInit == nullptr || gRaSocketInit == nullptr || gRaSocketListenStart == nullptr ||
-        gRaSocketBatchConnect == nullptr || gRaGetSockets == nullptr || gTsdOpen == nullptr ||
-        gRaRdevInitV2 == nullptr) {
+        gRaSocketBatchConnect == nullptr || gRaGetSockets == nullptr || gRaRdevInitV2 == nullptr) {
         Die("required socket symbols missing in libra");
     }
     printf("[probe] libra loaded: %s\n", lib);
@@ -188,10 +197,13 @@ static void SwitchOff(const char *when)
 static void DoPrepareDevice(uint32_t devid, const char *localIp)
 {
     /* full product sequence (RdmaTransportManager::PrepareOpenDevice):
-     * TsdOpen -> RaInit -> RaRdevInitV2. Skipping TsdOpen was why the first
-     * probe run died with RaInit ret=128000. */
-    auto tsd = gTsdOpen(devid, 2 /* rankCount: client+server world */);
-    printf("[prepare] TsdOpen(devid=%u, rankSize=2) ret=%u\n", devid, tsd);
+     * TsdOpen -> RaInit -> RaRdevInitV2. */
+    if (gTsdOpen != nullptr) {
+        auto tsd = gTsdOpen(devid, 2 /* rankCount: client+server world */);
+        printf("[prepare] TsdOpen(devid=%u, rankSize=2) ret=%u\n", devid, tsd);
+    } else {
+        printf("[prepare] TsdOpen unavailable (libtsdclient.so missing?) -- skipped\n");
+    }
 
     bool raOk = false;
     for (int attempt = 1; attempt <= 2 && !raOk; attempt++) {
