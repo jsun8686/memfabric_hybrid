@@ -1299,6 +1299,45 @@ TEST(FixedRanksQpManagerTestTest, FillQpInfoMissingConnectionForRemoteMr)
     EXPECT_EQ(manager.FillQpInfo(), BM_ERROR);
 }
 
+TEST(FixedRanksQpManagerTestTest, FillQpInfoRefreshSkipsMissingConnection)
+{
+    sockaddr_in devNet{};
+    inet_aton("127.0.0.1", &devNet.sin_addr);
+    devNet.sin_port = htons(12345);
+    devNet.sin_family = AF_INET;
+
+    FixedRanksQpManagerTest manager(0, 0, 2, devNet);
+
+    DlAclApiFnGuard aclGuard;
+    DlAclApi::pAclrtMalloc = &FakeAclrtMallocOk;
+    DlAclApi::pAclrtMemcpy = &FakeAclrtMemcpyOk;
+
+    EXPECT_TRUE(manager.ReserveQpInfoSpace());
+
+    // rank1(remote): non-empty memoryMap but no connection -> refresh path (strict=false) skips
+    // its QP slots, fills the rest and still succeeds.
+    std::unordered_map<uint32_t, ConnectRankInfo> ranks;
+    sockaddr_in net0{};
+    inet_aton("192.168.1.1", &net0.sin_addr);
+    net0.sin_port = htons(12345);
+    net0.sin_family = AF_INET;
+    RegMemKeyUnion key0{};
+    key0.deviceKey = RegMemResult(0x1000, 0x100, nullptr, 11, 22);
+    ranks.emplace(0, ConnectRankInfo(HYBM_ROLE_PEER, net0, key0.commonKey));
+
+    sockaddr_in net1{};
+    inet_aton("192.168.1.2", &net1.sin_addr);
+    net1.sin_port = htons(12346);
+    net1.sin_family = AF_INET;
+    RegMemKeyUnion key1{};
+    key1.deviceKey = RegMemResult(0x2000, 0x100, nullptr, 33, 44);
+    ranks.emplace(1, ConnectRankInfo(HYBM_ROLE_PEER, net1, key1.commonKey));
+
+    manager.currentRanksInfo_ = ranks;
+
+    EXPECT_EQ(manager.FillQpInfo(false), BM_OK);
+}
+
 TEST(FixedRanksQpManagerTestTest, FillQpInfoMultiMrSlotsSuccess)
 {
     sockaddr_in devNet{};

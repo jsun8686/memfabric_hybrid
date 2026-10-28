@@ -64,7 +64,7 @@ int FixedRanksQpManager::SetRemoteRankInfo(const std::unordered_map<uint32_t, Co
             }
         }
         DlAclApi::AclrtSetDevice(deviceId_);
-        if (FillQpInfo() != BM_OK) {
+        if (FillQpInfo(false) != BM_OK) {
             BM_LOG_WARN("refresh qp info after rank update failed; deferred to build worker");
         }
         MaybeTriggerBuild();
@@ -749,7 +749,7 @@ int FixedRanksQpManager::CreateOneQp(AiCoreConnChannel &channel, uint32_t lane) 
     return ret;
 }
 
-int FixedRanksQpManager::FillQpInfo() noexcept
+int FixedRanksQpManager::FillQpInfo(bool strict) noexcept
 {
     if (qpInfoSize_ == 0U || qpInfo_ == nullptr) {
         /* reachable when a rank update arrives while the table is not reserved yet (e.g. tests
@@ -812,8 +812,15 @@ int FixedRanksQpManager::FillQpInfo() noexcept
 
             auto pos = connections->find(it->first);
             if (pos == connections->end()) {
-                BM_LOG_ERROR("missing for remote: " << it->first);
-                return BM_ERROR;
+                if (strict) {
+                    BM_LOG_ERROR("missing for remote: " << it->first);
+                    return BM_ERROR;
+                }
+                /* refresh path: the member's MR slots above are already filled; its QP slots
+                 * stay stale zeros until the build-once worker establishes the connection */
+                BM_LOG_INFO("qp entries not established for rank " << it->first
+                            << " yet (refresh deferred)");
+                continue;
             }
 
             for (uint32_t lane = 0; lane < qpsPerPeer_; lane++) {

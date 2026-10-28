@@ -73,7 +73,10 @@ private:
                              const HccpSocketInfo &socketInfo) noexcept;
     int CreateQpWaitingReady(std::unordered_map<uint32_t, AiCoreConnChannel> &connections) noexcept;
     int CreateOneQp(AiCoreConnChannel &channel, uint32_t lane) noexcept;
-    int FillQpInfo() noexcept;
+    /* strict=true (build-once path): a member without a connection is a real failure (ERROR +
+     * abort). strict=false (SetRemoteRankInfo refresh): absent connections are the expected
+     * pre-build transient -- log INFO, skip that rank's QP slots and keep filling the rest */
+    int FillQpInfo(bool strict = true) noexcept;
     void CopyAiWQInfo(struct AiQpRMAWQ &dest, const struct ai_data_plane_wq &src, DBMode dbMode, uint32_t sl) noexcept;
     void CopyAiCQInfo(struct AiQpRMACQ &dest, const ai_data_plane_cq &source, DBMode dbMode) noexcept;
     void CloseServices() noexcept;
