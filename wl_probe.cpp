@@ -14,14 +14,19 @@
  *     off-before -- RaSocketSetWhiteListStatus(0) BEFORE anything (TsdOpen/RaInit/...)
  *     off-after  -- RaSocketSetWhiteListStatus(0) AFTER the full device prepare
  *                   (TsdOpen + RaInit + RaRdevInitV2), BEFORE ListenStart
+ *     wl-on-add  -- SetWhiteListStatus(1) + one white-list entry (product path,
+ *                   calibration: MUST connect, else the probe is broken)
+ *     wl-off-add -- SetWhiteListStatus(0) + one white-list entry (verdict quadrant)
+ *     restore    -- SetWhiteListStatus(1) and exit (clean persistent driver state)
  *
- * Verdict matrix (server never adds any white-list entry):
- *   default    rejected  -> probe valid
- *   off-before accepted  -> consistent with "must be before RaInit"
- *   off-after  accepted  -> switch is live post-init: integration point can be
- *                           anywhere before the first connect (product-friendly)
- *   off-after  rejected  -> strict pre-RaInit constraint: on FSDP NEAR nodes
- *                           torch_npu/HCCL has already RaInit-ed, needs more study
+ * NOTE: the switch is PERSISTENT driver state -- it survives process exit (a v1
+ * probe run left enable=0 behind and a later default run read it back).
+ *
+ * Verdict matrix (server adds a white-list entry only in wl-*-add):
+ *   wl-on-add  accepted -> probe calibrated; rejected -> probe connect layer broken
+ *   wl-off-add accepted -> enable=0 did NOT disable the check (semantics inverted
+ *                          or unrelated to per-connection admission)
+ *   wl-off-add rejected -> check stays enforced at enable=0 (or cross-check above)
  *
  * Build (on the cluster, aarch64):
  *   g++ -O0 -g -std=c++11 wl_probe.cpp -o wl_probe -ldl
@@ -92,6 +97,12 @@ struct HccpSocketInfoT {
     char tag[HCCP_SOCK_CONN_TAG_SIZE];
 };
 
+struct HccpSocketWhiteListInfoT {
+    HccpIpAddrT remoteIp;               /* IP of the allowed remote */
+    uint32_t connLimit;                 /* same as product: rankCount */
+    char tag[HCCP_SOCK_CONN_TAG_SIZE];  /* empty tag = primary lane */
+};
+
 /* ---- libra symbols ---- */
 static void *gRa = nullptr;
 static int (*gRaInit)(const HccpRaInitConfigT *) = nullptr;
@@ -104,6 +115,7 @@ static int (*gRaSocketBatchConnect)(HccpSocketConnectInfoT *, uint32_t) = nullpt
 static int (*gRaGetSockets)(uint32_t, HccpSocketInfoT *, uint32_t, uint32_t *) = nullptr;
 static int (*gRaSetWhiteListStatus)(uint32_t) = nullptr;
 static int (*gRaGetWhiteListStatus)(uint32_t *) = nullptr;
+static int (*gRaSocketWhiteListAdd)(void *, const HccpSocketWhiteListInfoT[], uint32_t) = nullptr;
 static void *gTsd = nullptr;
 static uint32_t (*gTsdOpen)(uint32_t, uint32_t) = nullptr;
 static int (*gRaRdevGetHandle)(uint32_t, void **) = nullptr;
@@ -150,6 +162,8 @@ static void LoadLibra()
         (int (*)(uint32_t, HccpSocketInfoT *, uint32_t, uint32_t *))Sym("RaGetSockets", "ra_get_sockets");
     gRaSetWhiteListStatus = (int (*)(uint32_t))Sym("RaSocketSetWhiteListStatus", "ra_socket_set_white_list_status");
     gRaGetWhiteListStatus = (int (*)(uint32_t *))Sym("RaSocketGetWhiteListStatus", "ra_socket_get_white_list_status");
+    gRaSocketWhiteListAdd = (int (*)(void *, const HccpSocketWhiteListInfoT[], uint32_t))Sym(
+        "RaSocketWhiteListAdd", "ra_socket_white_list_add");
     gRaRdevGetHandle = (int (*)(uint32_t, void **))Sym("RaRdevGetHandle", "ra_rdev_get_handle");
     gRaRdevInitV2 = (int (*)(HccpRdevInitInfoT, HccpRdevT, void **))Sym("RaRdevInitV2", "ra_rdev_init_v2");
 
@@ -192,6 +206,36 @@ static void SwitchOff(const char *when)
     auto ret = gRaSetWhiteListStatus(0);
     printf("[switch:%s] SetWhiteListStatus(0) ret=%d\n", when, ret);
     ReportSwitch(when);
+}
+
+static void SwitchOn(const char *when)
+{
+    if (gRaSetWhiteListStatus == nullptr) {
+        Die("RaSocketSetWhiteListStatus missing in this libra");
+    }
+    auto ret = gRaSetWhiteListStatus(1);
+    printf("[switch:%s] SetWhiteListStatus(1) ret=%d\n", when, ret);
+    ReportSwitch(when);
+}
+
+/* add ONE white-list entry allowing clientIp, same fill as the product's
+ * GenerateWhiteList: empty tag, connLimit = rankCount */
+static void AddWhiteListEntry(void *sock, const char *clientIp)
+{
+    if (gRaSocketWhiteListAdd == nullptr) {
+        Die("RaSocketWhiteListAdd missing in this libra");
+    }
+    HccpSocketWhiteListInfoT entry{};
+    if (inet_pton(AF_INET, clientIp, &entry.remoteIp.addr) != 1) {
+        Die("invalid client RoCE ip for the white-list entry");
+    }
+    entry.connLimit = 2; /* rankCount of this probe world */
+    memset(entry.tag, 0, sizeof(entry.tag));
+    auto ret = gRaSocketWhiteListAdd(sock, &entry, 1);
+    printf("[whitelist] WhiteListAdd(%s) ret=%d\n", clientIp, ret);
+    if (ret != 0) {
+        Die("RaSocketWhiteListAdd failed");
+    }
 }
 
 static void DoPrepareDevice(uint32_t devid, const char *localIp)
@@ -272,26 +316,49 @@ int main(int argc, char **argv)
     if (argc < 6) {
         fprintf(stderr,
                 "usage:\n"
-                "  server: %s server <devid> <localRoceIp> <port> <default|off-before|off-after>\n"
-                "  client: %s client <devid> <localRoceIp> <serverRoceIp> <port> <mode>\n",
+                "  server: %s server <devid> <localRoceIp> <port> <mode> [clientRoceIp]\n"
+                "  client: %s client <devid> <localRoceIp> <serverRoceIp> <port> <mode>\n"
+                "  mode: default | off-before | off-after | wl-on-add | wl-off-add | restore\n"
+                "    wl-on-add  : SetWhiteListStatus(1) + add a white-list entry for clientRoceIp\n"
+                "                 (product-equivalent path; MUST connect -- calibrates the probe)\n"
+                "    wl-off-add : SetWhiteListStatus(0) + add a white-list entry\n"
+                "                 (verdict quadrant: connects -> enable=0 did NOT disable the check;\n"
+                "                  no connection -> the check stays ON with enable=0, or the probe's\n"
+                "                  connect layer is broken -- cross-check with wl-on-add)\n"
+                "    restore    : SetWhiteListStatus(1) only, exit -- clean the persistent driver state\n",
                 argv[0], argv[0]);
         return 1;
     }
     std::string role = argv[1];
     uint32_t devid = (uint32_t)atoi(argv[2]);
     const char *localIp = argv[3];
-    /* argv[4]: server->port, client->serverRoceIp */
-    const char *mode = argv[argc - 1];
+    /* server: argv[4]=port, argv[5]=mode, argv[6]=clientIp(optional)
+     * client: argv[4]=serverRoceIp, argv[5]=port, argv[6]=mode */
+    const char *mode = (role == "client") ? argv[argc - 1] : argv[5];
+    const char *clientIp = (role == "server" && argc >= 7) ? argv[6] : nullptr;
     bool offBefore = (strcmp(mode, "off-before") == 0);
     bool offAfter = (strcmp(mode, "off-after") == 0);
-    if (!offBefore && !offAfter && strcmp(mode, "default") != 0) {
-        Die("mode must be default | off-before | off-after");
+    bool wlOnAdd = (strcmp(mode, "wl-on-add") == 0);
+    bool wlOffAdd = (strcmp(mode, "wl-off-add") == 0);
+    bool restore = (strcmp(mode, "restore") == 0);
+    if (!offBefore && !offAfter && !wlOnAdd && !wlOffAdd && !restore && strcmp(mode, "default") != 0) {
+        Die("mode must be default | off-before | off-after | wl-on-add | wl-off-add | restore");
     }
 
     printf("[probe] role=%s devid=%u localIp=%s mode=%s\n", role.c_str(), devid, localIp, mode);
     LoadLibra();
 
-    if (offBefore) {
+    if (restore) {
+        SwitchOn("restore-default");
+        printf("[probe] driver white-list switch restored to enable=1, exiting\n");
+        return 0;
+    }
+
+    if (wlOnAdd) {
+        SwitchOn("before-anything");
+    } else if (wlOffAdd) {
+        SwitchOff("before-anything");
+    } else if (offBefore) {
         SwitchOff("before-anything");
     }
     DoPrepareDevice(devid, localIp);
@@ -309,6 +376,13 @@ int main(int argc, char **argv)
         printf("[server] ListenStart(port=%u) ret=%d\n", port, ret);
         if (ret != 0) {
             Die("listen failed");
+        }
+        if (wlOnAdd || wlOffAdd) {
+            if (clientIp == nullptr) {
+                Die("wl-*-add modes need the client RoCE ip as the last argument");
+            }
+            /* same order as the product: listen first, then whitelist */
+            AddWhiteListEntry(sock, clientIp);
         }
         if (offAfter) {
             /* also probe the strictest reading: switch off AFTER listen */
