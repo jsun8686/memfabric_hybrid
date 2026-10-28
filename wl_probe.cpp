@@ -11,8 +11,9 @@
  *   mode:
  *     default    -- never touch the switch (control run: expect REJECTED,
  *                   proving the probe itself is meaningful)
- *     off-before -- RaSocketSetWhiteListStatus(0) BEFORE RaInit
- *     off-after  -- RaSocketSetWhiteListStatus(0) AFTER RaInit, BEFORE ListenStart
+ *     off-before -- RaSocketSetWhiteListStatus(0) BEFORE anything (TsdOpen/RaInit/...)
+ *     off-after  -- RaSocketSetWhiteListStatus(0) AFTER the full device prepare
+ *                   (TsdOpen + RaInit + RaRdevInitV2), BEFORE ListenStart
  *
  * Verdict matrix (server never adds any white-list entry):
  *   default    rejected  -> probe valid
@@ -61,6 +62,14 @@ struct HccpRdevT {
     HccpIpAddrT localIp;
 };
 
+struct HccpRdevInitInfoT {
+    int mode;               /* NETWORK_OFFLINE == 1 */
+    uint32_t notifyType;    /* NOTIFY == 1 */
+    bool enabled910aLite;
+    bool disabledLiteThread;
+    bool enabled2mbLite;    /* product sets true: support 64k os */
+};
+
 struct HccpSocketListenInfoT {
     void *handle;
     unsigned int port;
@@ -95,6 +104,9 @@ static int (*gRaSocketBatchConnect)(HccpSocketConnectInfoT *, uint32_t) = nullpt
 static int (*gRaGetSockets)(uint32_t, HccpSocketInfoT *, uint32_t, uint32_t *) = nullptr;
 static int (*gRaSetWhiteListStatus)(uint32_t) = nullptr;
 static int (*gRaGetWhiteListStatus)(uint32_t *) = nullptr;
+static uint32_t (*gTsdOpen)(uint32_t, uint32_t) = nullptr;
+static int (*gRaRdevGetHandle)(uint32_t, void **) = nullptr;
+static int (*gRaRdevInitV2)(HccpRdevInitInfoT, HccpRdevT, void **) = nullptr;
 
 static void Die(const char *msg)
 {
@@ -137,9 +149,13 @@ static void LoadLibra()
         (int (*)(uint32_t, HccpSocketInfoT *, uint32_t, uint32_t *))Sym("RaGetSockets", "ra_get_sockets");
     gRaSetWhiteListStatus = (int (*)(uint32_t))Sym("RaSocketSetWhiteListStatus", "ra_socket_set_white_list_status");
     gRaGetWhiteListStatus = (int (*)(uint32_t *))Sym("RaSocketGetWhiteListStatus", "ra_socket_get_white_list_status");
+    gTsdOpen = (uint32_t (*)(uint32_t, uint32_t))Sym("TsdOpen", "tsd_open");
+    gRaRdevGetHandle = (int (*)(uint32_t, void **))Sym("RaRdevGetHandle", "ra_rdev_get_handle");
+    gRaRdevInitV2 = (int (*)(HccpRdevInitInfoT, HccpRdevT, void **))Sym("RaRdevInitV2", "ra_rdev_init_v2");
 
     if (gRaInit == nullptr || gRaSocketInit == nullptr || gRaSocketListenStart == nullptr ||
-        gRaSocketBatchConnect == nullptr || gRaGetSockets == nullptr) {
+        gRaSocketBatchConnect == nullptr || gRaGetSockets == nullptr || gTsdOpen == nullptr ||
+        gRaRdevInitV2 == nullptr) {
         Die("required socket symbols missing in libra");
     }
     printf("[probe] libra loaded: %s\n", lib);
@@ -169,24 +185,57 @@ static void SwitchOff(const char *when)
     ReportSwitch(when);
 }
 
-static void DoRaInit(uint32_t devid)
+static void DoPrepareDevice(uint32_t devid, const char *localIp)
 {
-    /* same shape as RdmaTransportManager::RaInit: sleep 3s first (avoid hccl
-     * init conflict), retry once */
-    for (int attempt = 1; attempt <= 2; attempt++) {
-        std::this_thread::sleep_for(std::chrono::seconds(3));
+    /* full product sequence (RdmaTransportManager::PrepareOpenDevice):
+     * TsdOpen -> RaInit -> RaRdevInitV2. Skipping TsdOpen was why the first
+     * probe run died with RaInit ret=128000. */
+    auto tsd = gTsdOpen(devid, 2 /* rankCount: client+server world */);
+    printf("[prepare] TsdOpen(devid=%u, rankSize=2) ret=%u\n", devid, tsd);
+
+    bool raOk = false;
+    for (int attempt = 1; attempt <= 2 && !raOk; attempt++) {
+        std::this_thread::sleep_for(std::chrono::seconds(3)); /* same as product: avoid hccl conflict */
         HccpRaInitConfigT cfg{};
         cfg.phyId = devid;
         cfg.nicPosition = 1; /* NETWORK_OFFLINE */
         cfg.hdcType = 6;     /* HDC_SERVICE_TYPE_RDMA */
         cfg.enableHdcAsync = false;
         auto ret = gRaInit(&cfg);
-        printf("[rainit] attempt %d ret=%d (phyId=%u)\n", attempt, ret, devid);
-        if (ret == 0) {
-            return;
+        printf("[prepare] RaInit attempt %d ret=%d (phyId=%u)\n", attempt, ret, devid);
+        raOk = (ret == 0);
+    }
+    if (!raOk) {
+        /* 328000-range: another RA user (leftover daemon / HCCL) holds the device --
+         * the product would fall back to an hccl-owned handle; the probe has none, but
+         * RaRdevInitV2 below may still succeed, so continue and report */
+        printf("[prepare] NOTE: RaInit failed, continuing to RaRdevInitV2 (pkill leftover memfabric/HCCL users?)\n");
+    }
+
+    HccpRdevInitInfoT info{};
+    info.mode = 1;               /* NETWORK_OFFLINE */
+    info.notifyType = 1;         /* NOTIFY */
+    info.enabled910aLite = false;
+    info.disabledLiteThread = false;
+    info.enabled2mbLite = true;  /* same as product */
+    HccpRdevT rdev{};
+    rdev.phyId = devid;
+    rdev.family = AF_INET;
+    if (inet_pton(AF_INET, localIp, &rdev.localIp.addr) != 1) {
+        Die("invalid local RoCE ip");
+    }
+    void *rdmaHandle = nullptr;
+    if (gRaRdevGetHandle != nullptr) {
+        auto reuse = gRaRdevGetHandle(devid, &rdmaHandle);
+        printf("[prepare] RaRdevGetHandle ret=%d handle=%p\n", reuse, rdmaHandle);
+    }
+    if (rdmaHandle == nullptr) {
+        auto ret = gRaRdevInitV2(info, rdev, rdmaHandle);
+        printf("[prepare] RaRdevInitV2 ret=%d handle=%p\n", ret, rdmaHandle);
+        if (ret != 0) {
+            Die("RaRdevInitV2 failed (leftover daemon/HCCL holding the device? pkill them first)");
         }
     }
-    Die("RaInit failed twice (is another RA user, e.g. HCCL, holding it? run on an idle devid)");
 }
 
 static void *MakeSocket(uint32_t devid, const char *localIp)
@@ -231,11 +280,11 @@ int main(int argc, char **argv)
     LoadLibra();
 
     if (offBefore) {
-        SwitchOff("before-RaInit");
+        SwitchOff("before-anything");
     }
-    DoRaInit(devid);
+    DoPrepareDevice(devid, localIp);
     if (offAfter) {
-        SwitchOff("after-RaInit");
+        SwitchOff("after-RaRdevInit");
     }
 
     if (role == "server") {
